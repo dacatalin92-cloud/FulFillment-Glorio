@@ -103,6 +103,21 @@ function recordScan(awb, nowIso, packWindowMs) {
   return { found: true, row: getAwb(awb), kind: 'reset' };
 }
 
+// Called when Sameday's status shows the parcel has already left our
+// warehouse (picked up / in transit / delivered) — if we never got a manual
+// pack-confirmation scan for it, mark it packed anyway so it doesn't sit in
+// the picking list forever, and so a later accidental re-scan shows "already
+// packed" instead of trying to pack it a second time.
+function markPackedFromCourier(awb, whenIso) {
+  const row = getAwb(awb);
+  if (!row || row.packed) return row;
+  db.prepare(`
+    UPDATE awbs SET packed = 1, packed_at = ?, first_scan_at = COALESCE(first_scan_at, ?)
+    WHERE awb = ?
+  `).run(whenIso, whenIso, awb);
+  return getAwb(awb);
+}
+
 function setNote(awb, note) {
   db.prepare('UPDATE awbs SET note = ? WHERE awb = ?').run(note, awb);
   return getAwb(awb);
@@ -120,4 +135,4 @@ function findByCode(code) {
   return row || null;
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, recordScan, setNote, findByCode };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, recordScan, setNote, findByCode };
