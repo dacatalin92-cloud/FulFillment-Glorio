@@ -36,6 +36,7 @@
   .right-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; min-height:0; }
 
   .picklist{ flex:1 1 50%; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .picklist.full-height{ flex:1 1 100%; border-bottom:none; }
   .picklist-head{ display:flex; align-items:center; justify-content:space-between; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
   .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
   .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
@@ -93,6 +94,7 @@
   .status-banner.cancelled{ background:var(--red-soft); color:var(--red); font-weight:700; }
 
   .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .registry.hidden{ display:none; }
   .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
   .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
   .registry-stats{ display:flex; gap:0.5rem; font-family:"IBM Plex Mono", monospace; font-size:0.76rem; }
@@ -224,8 +226,24 @@
   }
 
   // ---- Registry --------------------------------------------------------
+  // Only useful while the warehouse is actually staffed — outside 08:00-18:00
+  // (Bucharest time) we hide it and let the picking list use the full column,
+  // instead of re-rendering a table nobody is looking at.
+  const registryPanel = document.querySelector('.registry');
+  const picklistPanel = document.querySelector('.picklist');
+  function isWorkHours(){
+    const h = Number(new Date().toLocaleString('en-US', { timeZone: tz, hour12:false, hour:'2-digit' }));
+    return h >= 8 && h < 18;
+  }
   const registryBody = document.getElementById('registryBody');
   function renderRegistry(){
+    if (!isWorkHours()){
+      registryPanel.classList.add('hidden');
+      picklistPanel.classList.add('full-height');
+      return;
+    }
+    registryPanel.classList.remove('hidden');
+    picklistPanel.classList.remove('full-height');
     const now = Date.now();
     const scanned = Object.values(rows)
       .filter(r => r.first_scan_at)
