@@ -37,7 +37,7 @@
 
   .picklist{ flex:1 1 50%; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .picklist.full-height{ flex:1 1 100%; border-bottom:none; }
-  .picklist-head{ display:flex; align-items:center; justify-content:space-between; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
+  .picklist-head{ display:flex; align-items:center; justify-content:space-between; gap:0.6rem; flex-wrap:wrap; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
   .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
   .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
   table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
@@ -117,6 +117,26 @@
   .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
   .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
 
+  .needs-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; white-space:nowrap; }
+
+  .needs-modal{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; padding:0; }
+  .needs-modal.open{ display:flex; }
+  .needs-panel{ background:var(--surface); width:100%; height:100%; max-width:100%; display:flex; flex-direction:column; }
+  @media (min-width:640px){
+    .needs-panel{ width:min(560px, 92vw); height:min(88vh, 820px); border-radius:16px; box-shadow:var(--shadow); overflow:hidden; }
+  }
+  .needs-header{ flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:0.6rem; padding:1rem 1.1rem; border-bottom:1px solid var(--border); background:var(--surface); }
+  .needs-header h3{ font-family:"Fraunces", serif; font-size:1.05rem; font-weight:600; margin:0; }
+  .needs-close{ flex:0 0 auto; font-family:inherit; font-size:1.3rem; line-height:1; padding:0.4rem 0.65rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); cursor:pointer; }
+  .needs-list{ flex:1 1 auto; overflow-y:auto; padding:0.6rem; }
+  .needs-row{ display:flex; align-items:center; gap:0.9rem; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:0.7rem; margin-bottom:0.6rem; }
+  .needs-row img{ width:56px; height:56px; object-fit:cover; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
+  .needs-row .img-placeholder{ width:56px; height:56px; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
+  .needs-row .needs-title{ flex:1 1 auto; min-width:0; font-size:0.92rem; line-height:1.3; }
+  .needs-row .needs-qty{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:10px; padding:0.4rem 0.8rem; min-width:48px; }
+  .needs-row .needs-qty .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.3rem; line-height:1; }
+  .needs-row .needs-qty .lbl{ font-size:0.6rem; text-transform:uppercase; letter-spacing:0.05em; margin-top:0.1rem; }
+
   .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .registry.hidden{ display:none; }
   .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
@@ -157,6 +177,7 @@
     <div class="picklist">
       <div class="picklist-head">
         <h3>De pregătit pentru curier</h3>
+        <button type="button" class="needs-btn" id="needsBtn">📋 Necesar produse</button>
         <span class="count-pill" id="picklistCount">0 comenzi</span>
       </div>
       <div class="picklist-scroll">
@@ -200,6 +221,16 @@
         <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
       </div>
     </main>
+  </div>
+</div>
+
+<div class="needs-modal" id="needsModal">
+  <div class="needs-panel">
+    <div class="needs-header">
+      <h3>📋 Necesar produse — <span id="needsSubcount">0</span> comenzi neîmpachetate</h3>
+      <button type="button" class="needs-close" id="needsCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="needs-list" id="needsList"></div>
   </div>
 </div>
 
@@ -367,6 +398,56 @@
     }
   });
 
+  // ---- Product needs (aggregated across all unpacked orders) --------------
+  // Same base set as the picking list (isPickable) — everything still owed
+  // to a customer that hasn't left the warehouse yet — summed by product so
+  // whoever is picking stock can grab it all in one pass instead of walking
+  // the shelves once per order.
+  const needsModal = document.getElementById('needsModal');
+  const needsList = document.getElementById('needsList');
+  const needsSubcount = document.getElementById('needsSubcount');
+  function computeProductNeeds(){
+    const list = Object.values(rows).filter(isPickable);
+    const agg = new Map(); // key -> { title, img, qty }
+    list.forEach(row => {
+      const items = JSON.parse(row.items_json || '[]');
+      items.forEach(it => {
+        const key = (it.sku && it.sku.trim()) || it.title;
+        const existing = agg.get(key);
+        if (existing) {
+          existing.qty += it.qty;
+          if (!existing.img && it.img) existing.img = it.img;
+        } else {
+          agg.set(key, { title: it.title, img: it.img || null, qty: it.qty });
+        }
+      });
+    });
+    return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
+  }
+  function renderNeeds(){
+    const { orderCount, items } = computeProductNeeds();
+    needsSubcount.textContent = orderCount;
+    if (!items.length){
+      needsList.innerHTML = '<div class="empty-row">Nimic de pregătit — toate comenzile sunt împachetate sau ridicate. 🎉</div>';
+      return;
+    }
+    needsList.innerHTML = items.map(it => `
+      <div class="needs-row">
+        ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
+        <div class="needs-title">${escapeHtml(it.title)}</div>
+        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+      </div>
+    `).join('');
+  }
+  document.getElementById('needsBtn').addEventListener('click', () => {
+    renderNeeds();
+    needsModal.classList.add('open');
+  });
+  document.getElementById('needsCloseBtn').addEventListener('click', () => {
+    needsModal.classList.remove('open');
+  });
+  needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
+
   // ---- Registry --------------------------------------------------------
   // Only useful while the warehouse is actually staffed — outside 08:00-18:00
   // (Bucharest time) we hide it and let the picking list use the full column,
@@ -416,6 +497,7 @@
     document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi azi';
     renderPicklist();
     renderRegistry();
+    if (needsModal.classList.contains('open')) renderNeeds();
   }
 
   // ---- Notes: change/Enter → POST /api/note ------------------------------
@@ -445,9 +527,9 @@
   const main = document.getElementById('main');
   const idleState = document.getElementById('idleState');
   function keepFocus(){ input.focus(); }
-  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input')) keepFocus(); });
+  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal')) keepFocus(); });
   window.addEventListener('load', keepFocus);
-  setInterval(() => { if (document.activeElement !== input) input.focus(); }, 1500);
+  setInterval(() => { if (!needsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
     const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned' }[kind] || 'first';
