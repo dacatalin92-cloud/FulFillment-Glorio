@@ -33,7 +33,7 @@ app.post(
   async (req, res) => {
     try {
       const hmac = req.get('X-Shopify-Hmac-Sha256');
-      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_WEBHOOK_SECRET);
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
       if (!ok) return res.status(401).send('invalid signature');
       res.status(200).send('ok'); // ack immediately, Shopify retries on timeout/non-2xx
 
@@ -194,11 +194,11 @@ async function backfillToday() {
   return added;
 }
 
-if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_ADMIN_TOKEN) {
+if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
   backfillToday().catch((err) => console.error('[backfill] startup run failed', err));
   setInterval(() => backfillToday().catch((err) => console.error('[backfill] error', err)), BACKFILL_INTERVAL_MS);
 } else {
-  console.warn('[backfill] SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN not set — skipping Shopify backfill (webhook-only mode)');
+  console.warn('[backfill] SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set — skipping Shopify backfill (webhook-only mode)');
 }
 
 server.listen(PORT, () => {
