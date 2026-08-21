@@ -47,6 +47,21 @@ for (const stmt of [
 }
 db.exec('CREATE INDEX IF NOT EXISTS idx_awbs_order_id ON awbs(order_id)');
 
+// A physical return can arrive at the warehouse for a code that isn't in
+// `awbs` at all (not a Sameday AWB we ever tracked, a typo, a return from
+// another channel). Those need a flag of their own so they don't just
+// disappear as a silent 404 — logged here for manual follow-up.
+db.exec(`
+CREATE TABLE IF NOT EXISTS unknown_returns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,
+  scanned_at TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  resolved INTEGER NOT NULL DEFAULT 0,
+  resolved_at TEXT
+);
+`);
+
 function bucharestDay(isoString) {
   // en-CA locale formats as YYYY-MM-DD, which is exactly the sortable key we want.
   return new Date(isoString).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
@@ -84,6 +99,11 @@ const stmts = {
   // haven't yet confirmed as physically back in the warehouse.
   listPendingReturns: db.prepare("SELECT * FROM awbs WHERE return_received = 0 AND LOWER(sameday_status) LIKE '%retur%' ORDER BY sameday_checked_at DESC"),
   setReturnReceived: db.prepare('UPDATE awbs SET return_received = 1, return_received_at = ? WHERE awb = ?'),
+  insertUnknownReturn: db.prepare('INSERT INTO unknown_returns (code, scanned_at) VALUES (?, ?)'),
+  getUnknownReturn: db.prepare('SELECT * FROM unknown_returns WHERE id = ?'),
+  listUnknownReturns: db.prepare('SELECT * FROM unknown_returns WHERE resolved = 0 ORDER BY scanned_at DESC'),
+  setUnknownReturnNote: db.prepare('UPDATE unknown_returns SET note = ? WHERE id = ?'),
+  resolveUnknownReturn: db.prepare('UPDATE unknown_returns SET resolved = 1, resolved_at = ? WHERE id = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -212,4 +232,29 @@ function markReturnReceived(awb, whenIso) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived };
+// Logged when a return-mode scan doesn't match any known AWB — a physical
+// box arrived at the warehouse for a code the system has no record of at
+// all (different courier, older order, typo, damaged label). Kept separate
+// from `awbs` since there's no order to attach it to.
+function logUnknownReturn(code, whenIso) {
+  const info = stmts.insertUnknownReturn.run(code, whenIso);
+  return stmts.getUnknownReturn.get(info.lastInsertRowid);
+}
+
+function listUnknownReturns() {
+  return stmts.listUnknownReturns.all();
+}
+
+function setUnknownReturnNote(id, note) {
+  stmts.setUnknownReturnNote.run(note, id);
+  return stmts.getUnknownReturn.get(id);
+}
+
+// Marks an unknown-return entry as handled (matched manually, resolved,
+// discarded) so it drops off the alert list.
+function resolveUnknownReturn(id, whenIso) {
+  stmts.resolveUnknownReturn.run(whenIso, id);
+  return stmts.getUnknownReturn.get(id);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn };
