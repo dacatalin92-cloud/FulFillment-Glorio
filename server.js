@@ -45,7 +45,7 @@ function samedayIndicatesPickedUp(status) {
 // broadcasts the final state once.
 function applySamedayUpdate(awb, result) {
   let row = db.updateSameday(awb, result);
-  if (row && !row.packed && samedayIndicatesPickedUp(row.sameday_status)) {
+  if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
     row = db.markPackedFromCourier(awb, row.sameday_checked_at || new Date().toISOString());
     console.log(`[sameday] ${awb} marked packed automatically (courier status: ${row.sameday_status})`);
   }
@@ -94,6 +94,7 @@ async function handleFulfillmentPayload(payload) {
     total: order.total,
     currency: order.currency,
     items: order.items,
+    order_id: payload.order_id,
   });
   broadcast({ type: 'awb:new', awb: row });
   console.log(`[webhook] new AWB ${awb} for ${order.name}`);
@@ -111,28 +112,67 @@ async function handleFulfillmentPayload(payload) {
   }
 }
 
-// --- One-time setup: register the fulfillments/create webhook -----------
-// Registers this server's own /webhooks/fulfillments-create URL with Shopify,
-// authenticated as THIS app (via the same client_credentials exchange used
-// for the Admin API), so the webhook ends up signed with SHOPIFY_CLIENT_SECRET
-// — the secret this server actually verifies against. Guarded by that same
-// secret as a query param so it can be triggered once from a browser.
+// --- Shopify webhook: orders/cancelled -----------------------------------
+// Sameday does NOT auto-cancel the AWB when the Shopify order is cancelled,
+// so this is our own signal to pull a cancelled order out of the packing
+// flow. A cancelled order can (rarely) have more than one AWB — markOrderCancelled
+// handles all of them and we broadcast an update for each.
+app.post(
+  '/webhooks/orders-cancelled',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    try {
+      const hmac = req.get('X-Shopify-Hmac-Sha256');
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
+      if (!ok) return res.status(401).send('invalid signature');
+      res.status(200).send('ok');
+
+      const payload = JSON.parse(req.body.toString('utf8'));
+      const orderId = String(payload.id);
+      const updatedRows = db.markOrderCancelled(orderId);
+      updatedRows.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+      if (updatedRows.length) {
+        console.log(`[webhook] order ${orderId} cancelled — ${updatedRows.length} AWB(s) taken out of the packing flow`);
+      }
+    } catch (err) {
+      console.error('[webhook] orders-cancelled processing error', err);
+      if (!res.headersSent) res.status(500).send('error');
+    }
+  }
+);
+
+// --- One-time setup: register Shopify webhooks ---------------------------
+// Registers this server's own webhook URLs with Shopify, authenticated as
+// THIS app (via the same client_credentials exchange used for the Admin
+// API), so webhooks end up signed with SHOPIFY_CLIENT_SECRET — the secret
+// this server actually verifies against. Guarded by that same secret as a
+// query param so it can be triggered once from a browser. Safe to call again
+// later (e.g. after adding a new webhook here) — Shopify just reports a
+// userError for any topic/URI combo that's already registered.
+const WEBHOOKS_TO_REGISTER = [
+  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/fulfillments-create' },
+  { topic: 'ORDERS_CANCELLED', path: '/webhooks/orders-cancelled' },
+];
 app.get('/admin/setup-webhook', async (req, res) => {
   if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
     return res.status(403).send('forbidden');
   }
   try {
-    const uri = `https://${req.get('host')}/webhooks/fulfillments-create`;
-    const data = await shopify.shopifyGraphql(
-      `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
-        webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
-          webhookSubscription { id topic uri }
-          userErrors { field message }
-        }
-      }`,
-      { topic: 'FULFILLMENTS_CREATE', sub: { uri, format: 'JSON' } }
-    );
-    res.json(data.webhookSubscriptionCreate);
+    const results = [];
+    for (const w of WEBHOOKS_TO_REGISTER) {
+      const uri = `https://${req.get('host')}${w.path}`;
+      const data = await shopify.shopifyGraphql(
+        `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+            webhookSubscription { id topic uri }
+            userErrors { field message }
+          }
+        }`,
+        { topic: w.topic, sub: { uri, format: 'JSON' } }
+      );
+      results.push({ topic: w.topic, ...data.webhookSubscriptionCreate });
+    }
+    res.json(results);
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
@@ -267,7 +307,7 @@ async function backfillToday() {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            name createdAt updatedAt
+            id name createdAt updatedAt
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
@@ -296,6 +336,7 @@ async function backfillToday() {
           awb_created_at: f.createdAt,
           total: parseFloat(o.totalPriceSet.shopMoney.amount),
           currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
@@ -330,7 +371,7 @@ async function backfillRange(daysBack, debug) {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            name createdAt updatedAt
+            id name createdAt updatedAt
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
@@ -362,6 +403,7 @@ async function backfillRange(daysBack, debug) {
           awb_created_at: f.createdAt,
           total: parseFloat(o.totalPriceSet.shopMoney.amount),
           currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
