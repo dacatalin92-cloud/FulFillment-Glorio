@@ -32,21 +32,35 @@ CREATE TABLE IF NOT EXISTS awbs (
 CREATE INDEX IF NOT EXISTS idx_awbs_day ON awbs(day);
 `);
 
+// Migration: add columns for order-cancellation tracking to a database that
+// may already exist on disk (Railway volume persists across deploys, and
+// CREATE TABLE IF NOT EXISTS above won't add new columns to it). Sameday
+// does NOT auto-cancel the AWB when the Shopify order is cancelled, so we
+// track this ourselves from the orders/cancelled webhook.
+for (const stmt of [
+  'ALTER TABLE awbs ADD COLUMN order_id TEXT',
+  'ALTER TABLE awbs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0',
+]) {
+  try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_awbs_order_id ON awbs(order_id)');
+
 function bucharestDay(isoString) {
   // en-CA locale formats as YYYY-MM-DD, which is exactly the sortable key we want.
   return new Date(isoString).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
 }
 
 const upsertStmt = db.prepare(`
-INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json)
-VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json)
+INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id)
+VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id)
 ON CONFLICT(awb) DO UPDATE SET
   order_name = excluded.order_name,
   order_created_at = excluded.order_created_at,
   awb_created_at = excluded.awb_created_at,
   total = excluded.total,
   currency = excluded.currency,
-  items_json = excluded.items_json
+  items_json = excluded.items_json,
+  order_id = COALESCE(excluded.order_id, awbs.order_id)
 `);
 
 function upsertAwb(rec) {
@@ -59,6 +73,7 @@ function upsertAwb(rec) {
     total: rec.total ?? null,
     currency: rec.currency || 'RON',
     items_json: JSON.stringify(rec.items || []),
+    order_id: rec.order_id ? String(rec.order_id) : null,
   });
   return getAwb(rec.awb);
 }
@@ -87,6 +102,9 @@ function updateSameday(awb, { status, statusLabel, state, cod, error }) {
 function recordScan(awb, nowIso, packWindowMs) {
   const row = getAwb(awb);
   if (!row) return { found: false };
+  if (row.cancelled) {
+    return { found: true, row, kind: 'cancelled' };
+  }
   if (row.packed) {
     return { found: true, row, kind: 'already', };
   }
@@ -118,6 +136,17 @@ function markPackedFromCourier(awb, whenIso) {
   return getAwb(awb);
 }
 
+// Called from the orders/cancelled webhook. One order can (rarely) have more
+// than one AWB (split fulfillments), so this cancels all of them and returns
+// the updated rows for broadcasting. Sameday does NOT auto-cancel the AWB
+// itself — this is purely our own "take it out of the packing flow" flag.
+function markOrderCancelled(orderId) {
+  const affected = db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0').all(orderId).map((r) => r.awb);
+  if (!affected.length) return [];
+  db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?').run(orderId);
+  return affected.map((awb) => getAwb(awb));
+}
+
 function setNote(awb, note) {
   db.prepare('UPDATE awbs SET note = ? WHERE awb = ?').run(note, awb);
   return getAwb(awb);
@@ -135,4 +164,4 @@ function findByCode(code) {
   return row || null;
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, recordScan, setNote, findByCode };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode };
