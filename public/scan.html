@@ -31,7 +31,11 @@
   .conn-dot{ width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; margin-right:0.4rem; background:var(--red); }
   .conn-dot.live{ background:var(--green); }
 
-  .picklist{ flex:0 0 auto; border-bottom:1px solid var(--border); background:var(--surface); max-height:30vh; display:flex; flex-direction:column; }
+  .layout{ flex:1 1 auto; display:flex; min-height:0; }
+  .left-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--border); min-height:0; }
+  .right-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; min-height:0; }
+
+  .picklist{ flex:1 1 50%; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .picklist-head{ display:flex; align-items:center; justify-content:space-between; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
   .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
   .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
@@ -86,8 +90,9 @@
   .status-banner.first{ background:var(--amber-soft); color:var(--amber); }
   .status-banner.already{ background:var(--accent-soft); color:var(--accent); }
   .status-banner.reset{ background:var(--red-soft); color:var(--red); }
+  .status-banner.cancelled{ background:var(--red-soft); color:var(--red); font-weight:700; }
 
-  .registry{ flex:0 0 auto; border-top:1px solid var(--border); background:var(--surface); max-height:30vh; display:flex; flex-direction:column; }
+  .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
   .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
   .registry-stats{ display:flex; gap:0.5rem; font-family:"IBM Plex Mono", monospace; font-size:0.76rem; }
@@ -107,45 +112,51 @@
   <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi azi</span></div>
 </div>
 
-<div class="picklist">
-  <div class="picklist-head">
-    <h3>De pregătit pentru curier</h3>
-    <span class="count-pill" id="picklistCount">0 comenzi</span>
-  </div>
-  <div class="picklist-scroll">
-    <table>
-      <thead><tr><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
-      <tbody id="picklistBody"></tbody>
-    </table>
-  </div>
-</div>
+<div class="layout">
+  <div class="left-panel">
+    <div class="picklist">
+      <div class="picklist-head">
+        <h3>De pregătit pentru curier</h3>
+        <span class="count-pill" id="picklistCount">0 comenzi</span>
+      </div>
+      <div class="picklist-scroll">
+        <table>
+          <thead><tr><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
+          <tbody id="picklistBody"></tbody>
+        </table>
+      </div>
+    </div>
 
-<div class="scan-input-wrap">
-  <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
-    placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
-</div>
-
-<main id="main">
-  <div class="idle" id="idleState">
-    <div class="glyph">📦</div>
-    <h2>Gata de scanare</h2>
-    <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
-  </div>
-</main>
-
-<div class="registry">
-  <div class="registry-head">
-    <h3>Registru scanare — azi</h3>
-    <div class="registry-stats">
-      <span class="pill packed" id="packedCount">0 împachetate</span>
-      <span class="pill pending" id="pendingCount">0 în așteptare</span>
+    <div class="registry">
+      <div class="registry-head">
+        <h3>Registru scanare — azi</h3>
+        <div class="registry-stats">
+          <span class="pill packed" id="packedCount">0 împachetate</span>
+          <span class="pill pending" id="pendingCount">0 în așteptare</span>
+        </div>
+      </div>
+      <div class="registry-scroll">
+        <table>
+          <thead><tr><th>AWB</th><th>Comandă</th><th>Prima scanare</th><th>Status</th><th>Confirmat la</th><th>Notițe</th></tr></thead>
+          <tbody id="registryBody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
-  <div class="registry-scroll">
-    <table>
-      <thead><tr><th>AWB</th><th>Comandă</th><th>Prima scanare</th><th>Status</th><th>Confirmat la</th><th>Notițe</th></tr></thead>
-      <tbody id="registryBody"></tbody>
-    </table>
+
+  <div class="right-panel">
+    <div class="scan-input-wrap">
+      <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
+        placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
+    </div>
+
+    <main id="main">
+      <div class="idle" id="idleState">
+        <div class="glyph">📦</div>
+        <h2>Gata de scanare</h2>
+        <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
+      </div>
+    </main>
   </div>
 </div>
 
@@ -188,6 +199,7 @@
   // ---- Picking list --------------------------------------------------
   const picklistBody = document.getElementById('picklistBody');
   function isPickable(row){
+    if (row.cancelled) return false;
     if (row.packed) return false;
     const tone = samedayTone(row.sameday_status, row.sameday_error);
     if (tone === 'ok') return false;
@@ -275,7 +287,7 @@
   setInterval(() => { if (document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
-    const cls = { packed:'packed', first:'first', already:'already', reset:'reset' }[kind] || 'first';
+    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled' }[kind] || 'first';
     return `<div class="status-banner ${cls}">${text}</div>`;
   }
   function renderFound(row, bannerHtml){
@@ -335,6 +347,8 @@
         renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.`));
       } else if (data.kind === 'reset'){
         renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.'));
+      } else if (data.kind === 'cancelled'){
+        renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
       }
     } catch (err) {
       console.error('scan failed', err);
