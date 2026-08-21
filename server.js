@@ -123,6 +123,20 @@ app.get('/admin/whoami', async (req, res) => {
   }
 });
 
+// TEMPORARY diagnostic: shows a masked preview + length of the secret this
+// server actually has configured, so it can be visually compared against
+// what's pasted into a URL — without ever printing the full value. Remove
+// this route once the /admin/backfill-old 403 mismatch is resolved.
+app.get('/admin/secret-debug', (req, res) => {
+  const s = process.env.SHOPIFY_CLIENT_SECRET || '';
+  if (!s) return res.json({ configured: false });
+  res.json({
+    configured: true,
+    length: s.length,
+    preview: s.length > 8 ? `${s.slice(0, 4)}...${s.slice(-4)}` : '(too short to preview safely)',
+  });
+});
+
 // One-time (or occasional) manual pull of older AWBs — the automatic
 // backfillToday() only ever looks at today. This brings AWBs from the last
 // N days into the new system, e.g. so anything still unpacked from before
