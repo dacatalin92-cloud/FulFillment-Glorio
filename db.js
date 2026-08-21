@@ -40,6 +40,8 @@ CREATE INDEX IF NOT EXISTS idx_awbs_day ON awbs(day);
 for (const stmt of [
   'ALTER TABLE awbs ADD COLUMN order_id TEXT',
   'ALTER TABLE awbs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE awbs ADD COLUMN return_received INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE awbs ADD COLUMN return_received_at TEXT',
 ]) {
   try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
 }
@@ -77,6 +79,11 @@ const stmts = {
   cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
   setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
   findByCodeFuzzy: db.prepare("SELECT * FROM awbs WHERE ? LIKE awb || '%' OR awb LIKE ? || '%' LIMIT 1"),
+  // Anything Sameday has flagged as a return in progress (status text
+  // contains "retur" — covers "Retur", "Returnat", "Returnata" etc.) that we
+  // haven't yet confirmed as physically back in the warehouse.
+  listPendingReturns: db.prepare("SELECT * FROM awbs WHERE return_received = 0 AND LOWER(sameday_status) LIKE '%retur%' ORDER BY sameday_checked_at DESC"),
+  setReturnReceived: db.prepare('UPDATE awbs SET return_received = 1, return_received_at = ? WHERE awb = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -186,4 +193,23 @@ function findByCode(code) {
   return row || null;
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode };
+// All AWBs Sameday currently shows as "in return" (courier is bringing it
+// back to us) that nobody has confirmed as physically received yet. Not
+// scoped to a single day — a return can come back well after the AWB's
+// original creation day.
+function listPendingReturns() {
+  return stmts.listPendingReturns.all();
+}
+
+// Manual confirmation that a returned parcel physically arrived back at the
+// warehouse — separate from anything Sameday reports, since Sameday's own
+// "return" status doesn't tell us it's actually back in our hands.
+function markReturnReceived(awb, whenIso) {
+  const row = getAwb(awb);
+  if (!row) return null;
+  if (row.return_received) return row;
+  stmts.setReturnReceived.run(whenIso, awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived };
