@@ -103,6 +103,16 @@
   .returns-row .status-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
   .mark-received-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; }
 
+  .unknown-returns-bar{ flex:0 0 auto; background:var(--red-soft); border-bottom:1px solid var(--border); }
+  .unknown-returns-bar.hidden{ display:none; }
+  .unknown-returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--red); font-weight:600; font-size:0.88rem; }
+  .unknown-returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:220px; overflow-y:auto; }
+  .unknown-returns-row{ display:flex; align-items:center; gap:0.6rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .unknown-returns-row .awb-cell{ flex:0 0 auto; }
+  .unknown-returns-row .scanned-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
+  .unknown-returns-row .note-input{ flex:1 1 auto; }
+  .resolve-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--green); background:var(--green-soft); color:var(--green); cursor:pointer; }
+
   .scan-mode-row{ display:flex; gap:0.6rem; align-items:center; }
   .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
   .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -133,6 +143,13 @@
     <span>🔄 <span id="returnsCount">0</span> retur(uri) de gestionat — click pentru listă</span>
   </div>
   <div class="returns-list" id="returnsList" style="display:none;"></div>
+</div>
+
+<div class="unknown-returns-bar hidden" id="unknownReturnsBar">
+  <div class="unknown-returns-bar-head" id="unknownReturnsBarHead">
+    <span>⚠️ <span id="unknownReturnsCount">0</span> retur(uri) neidentificate (nu sunt în sistem) — click pentru listă</span>
+  </div>
+  <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
 </div>
 
 <div class="layout">
@@ -191,6 +208,7 @@
   const REGISTRY_HIDE_AFTER_MS = 60000;
   let rows = {}; // awb -> row object, current in-memory state
   let returnRows = {}; // awb -> row object, AWBs Sameday shows as "in return" and not yet confirmed received
+  let unknownReturns = {}; // id -> entry, return-mode scans that matched no known AWB at all
   let returnMode = false; // when true, the scan input confirms return receipt instead of packing
 
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
@@ -300,6 +318,55 @@
     }
   });
 
+  // ---- Unknown returns ---------------------------------------------------
+  // Return-mode scans that matched no AWB in the system at all — a box from
+  // another channel, a much older order, a typo, a damaged label. These
+  // can't be tied to an order, so they're tracked separately and need a
+  // human to go figure out what they actually are.
+  const unknownReturnsBar = document.getElementById('unknownReturnsBar');
+  const unknownReturnsList = document.getElementById('unknownReturnsList');
+  async function loadUnknownReturns(){
+    const res = await fetch('/api/unknown-returns');
+    const data = await res.json();
+    unknownReturns = {};
+    data.rows.forEach(r => { unknownReturns[r.id] = r; });
+    renderUnknownReturnsBar();
+  }
+  function renderUnknownReturnsBar(){
+    const list = Object.values(unknownReturns).sort((a,b) => b.scanned_at.localeCompare(a.scanned_at));
+    document.getElementById('unknownReturnsCount').textContent = list.length;
+    unknownReturnsBar.classList.toggle('hidden', list.length === 0);
+    unknownReturnsList.innerHTML = list.map(entry => `
+      <div class="unknown-returns-row" data-id="${entry.id}">
+        <span class="awb-cell">${escapeHtml(entry.code)}</span>
+        <span class="scanned-at">${fmtTime(entry.scanned_at)}</span>
+        <input type="text" class="note-input" data-unknown-id="${entry.id}" placeholder="Ce e coletul ăsta?…" value="${escapeAttr(entry.note || '')}">
+        <button type="button" class="resolve-btn" data-id="${entry.id}">✅ Rezolvat</button>
+      </div>
+    `).join('');
+  }
+  document.getElementById('unknownReturnsBarHead').addEventListener('click', () => {
+    unknownReturnsList.style.display = unknownReturnsList.style.display === 'none' ? 'flex' : 'none';
+  });
+  document.addEventListener('change', async e => {
+    if (e.target.dataset.unknownId){
+      const id = e.target.dataset.unknownId;
+      try {
+        await fetch(`/api/unknown-returns/${id}/note`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ note: e.target.value }) });
+      } catch (err) { console.error('unknown-return note save failed', err); }
+    }
+  });
+  document.addEventListener('click', async e => {
+    if (e.target.classList.contains('resolve-btn')){
+      const id = e.target.dataset.id;
+      try {
+        await fetch(`/api/unknown-returns/${id}/resolve`, { method:'POST' });
+        delete unknownReturns[id];
+        renderUnknownReturnsBar();
+      } catch (err) { console.error('resolve unknown return failed', err); }
+    }
+  });
+
   // ---- Registry --------------------------------------------------------
   // Only useful while the warehouse is actually staffed — outside 08:00-18:00
   // (Bucharest time) we hide it and let the picking list use the full column,
@@ -352,11 +419,14 @@
   }
 
   // ---- Notes: change/Enter → POST /api/note ------------------------------
+  // Guarded against unknown-return note inputs, which share the same
+  // .note-input styling class but are handled by their own listener above
+  // (they POST to /api/unknown-returns/:id/note, not /api/note).
   document.addEventListener('change', e => {
-    if (e.target.classList.contains('note-input')) commitNote(e.target);
+    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId) commitNote(e.target);
   });
   document.addEventListener('keydown', e => {
-    if (e.target.classList.contains('note-input') && e.key === 'Enter'){
+    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId && e.key === 'Enter'){
       e.preventDefault();
       commitNote(e.target);
       e.target.blur();
@@ -441,11 +511,23 @@
     if (returnMode){
       try {
         const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-        if (res.status === 404){ renderNotFound(code); return; }
         const data = await res.json();
-        delete returnRows[data.row.awb];
-        renderReturnsBar();
-        renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
+        if (data.found){
+          delete returnRows[data.row.awb];
+          renderReturnsBar();
+          renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
+        } else if (data.logged){
+          unknownReturns[data.entry.id] = data.entry;
+          renderUnknownReturnsBar();
+          idleState.style.display = 'none';
+          main.innerHTML = `
+            <div class="not-found">
+              <div class="glyph">⚠️</div>
+              <h2>Retur neidentificat</h2>
+              <p>Codul <code>${escapeHtml(code)}</code> nu există în sistem — a fost adăugat în lista de retururi neidentificate, jos, pentru verificare manuală.</p>
+            </div>
+          `;
+        }
       } catch (err) {
         console.error('return scan failed', err);
       }
@@ -504,15 +586,23 @@
           returnRows[msg.awb.awb] = msg.awb;
           renderReturnsBar();
         }
+      } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update'){
+        unknownReturns[msg.entry.id] = msg.entry;
+        renderUnknownReturnsBar();
+      } else if (msg.type === 'unknown-return:resolved'){
+        delete unknownReturns[msg.entry.id];
+        renderUnknownReturnsBar();
       } else if (msg.type === 'refresh'){
         loadToday();
         loadReturns();
+        loadUnknownReturns();
       }
     };
   }
 
   loadToday();
   loadReturns();
+  loadUnknownReturns();
   connectWs();
 </script>
 </body>
