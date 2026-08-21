@@ -195,7 +195,7 @@
 
   // ---- Stats -------------------------------------------------------------
   function renderStats(){
-    const list = Object.values(rows);
+    const list = Object.values(rows).filter(r => !r.cancelled);
     const now = Date.now();
     const lastHour = list.filter(r => now - new Date(r.awb_created_at).getTime() <= 3600000).length;
     const unpacked = list.filter(r => !r.packed).length;
@@ -251,8 +251,8 @@
       return;
     }
     tableBody.innerHTML = list.map(row => `
-      <tr>
-        <td>${escapeHtml(row.order_name)}</td>
+      <tr${row.cancelled ? ' style="opacity:0.55"' : ''}>
+        <td>${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}</td>
         <td class="num">${fmtTime(row.order_created_at)}</td>
         <td class="num">${fmtTime(row.awb_created_at)}</td>
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
