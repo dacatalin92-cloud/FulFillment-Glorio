@@ -293,6 +293,13 @@ app.get('/api/returns', (req, res) => {
   res.json({ rows: db.listPendingReturns() });
 });
 
+// History: returns already confirmed as physically received (most recent
+// first, capped at 200) — separate from /api/returns above, which only
+// lists the ones still waiting for confirmation.
+app.get('/api/returns/history', (req, res) => {
+  res.json({ rows: db.listReturnHistory() });
+});
+
 // Manual confirmation scan: the box physically arrived back at the
 // warehouse. Deliberately separate from /api/scan's pack-confirmation flow
 // — scanning a returned AWB here never touches `packed`, only `return_received`.
@@ -331,6 +338,12 @@ app.post('/api/unknown-returns/:id/resolve', (req, res) => {
   const entry = db.resolveUnknownReturn(Number(req.params.id), new Date().toISOString());
   broadcast({ type: 'unknown-return:resolved', entry });
   res.json({ entry });
+});
+
+// History: unknown-return entries already resolved (most recent first,
+// capped at 200).
+app.get('/api/unknown-returns/history', (req, res) => {
+  res.json({ rows: db.listResolvedUnknownReturns() });
 });
 
 // --- Sameday polling (courier status for open AWBs) ----------------------
