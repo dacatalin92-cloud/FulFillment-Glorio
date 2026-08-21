@@ -2,6 +2,8 @@
 // Same integration as the previous Claude-based pipeline: authenticate once,
 // re-authenticate lazily on 401, and always send a real browser User-Agent
 // because Sameday sits behind Cloudflare and blocks bare requests (403 / error 1010).
+// Per Sameday's official API docs (v3.4): the /api/authenticate limit is
+// 12 requests/IP/minute — the cooldown below keeps us far under that.
 const fetch = require('node-fetch');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -17,22 +19,27 @@ const AUTH_FAILURE_COOLDOWN_MS = 60 * 1000;
 
 async function authenticate() {
   try {
-    const res = await fetch(`${BASE}/api/authenticate`, {
+    // Per Sameday's official API docs: remember_me is a query param with
+    // value 1 (extends the token to 30 days instead of the 12h default),
+    // and auth happens via the X-Auth-* headers — no request body needed.
+    const res = await fetch(`${BASE}/api/authenticate?remember_me=1`, {
       method: 'POST',
       headers: {
         'X-Auth-Username': process.env.SAMEDAY_USERNAME,
         'X-Auth-Password': process.env.SAMEDAY_PASSWORD,
-        'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent': UA,
         Accept: 'application/json',
       },
-      body: 'remember_me=true',
     });
     if (!res.ok) throw new Error(`Sameday auth failed: HTTP ${res.status}`);
     const body = await res.json();
     token = body.token;
-    // Token is valid ~2 weeks; refresh a bit early to be safe.
-    tokenExpiresAt = Date.now() + 12 * 24 * 3600 * 1000;
+    // Docs: with remember_me=1 the token is valid 14 days. Trust their
+    // expire_at_utc if present (refreshed a bit early); otherwise fall back
+    // to the documented 14-day lifetime, refreshed 2 days early.
+    tokenExpiresAt = body.expire_at_utc
+      ? new Date(body.expire_at_utc.replace(' ', 'T') + 'Z').getTime() - 6 * 3600 * 1000
+      : Date.now() + 12 * 24 * 3600 * 1000;
     lastAuthFailureAt = 0;
     return token;
   } catch (err) {
