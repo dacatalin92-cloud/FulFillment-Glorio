@@ -25,6 +25,29 @@ function broadcast(msg) {
   });
 }
 
+// Same "has it clearly left our warehouse?" read as the picking-list filter
+// in scan.html (samedayTone) — kept in sync deliberately: cancelled/returned
+// parcels are excluded on purpose (a cancellation doesn't mean it shipped).
+function samedayIndicatesPickedUp(status) {
+  const t = (status || '').toLowerCase();
+  if (!t) return false;
+  if (t.includes('anulat') || t.includes('retur')) return false;
+  return t.includes('ridicat') || t.includes('tranzit') || t.includes('livrat') || t.includes('predat');
+}
+
+// Applies a fresh Sameday status to a row, auto-marking it packed if the
+// status shows the courier already has it (see markPackedFromCourier), then
+// broadcasts the final state once.
+function applySamedayUpdate(awb, result) {
+  let row = db.updateSameday(awb, result);
+  if (row && !row.packed && samedayIndicatesPickedUp(row.sameday_status)) {
+    row = db.markPackedFromCourier(awb, row.sameday_checked_at || new Date().toISOString());
+    console.log(`[sameday] ${awb} marked packed automatically (courier status: ${row.sameday_status})`);
+  }
+  broadcast({ type: 'awb:update', awb: row });
+  return row;
+}
+
 // --- Shopify webhook: fulfillments/create -----------------------------
 // Needs the raw body for HMAC verification, so this route uses its own
 // raw-body parser instead of the app-wide express.json().
@@ -76,8 +99,7 @@ async function handleFulfillmentPayload(payload) {
   if (process.env.SAMEDAY_POLL_ENABLED !== 'false') {
     try {
       const status = await sameday.getStatus(awb);
-      const updated = db.updateSameday(awb, status);
-      broadcast({ type: 'awb:update', awb: updated });
+      applySamedayUpdate(awb, status);
     } catch (err) {
       console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
     }
@@ -222,10 +244,7 @@ if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
 } else {
   sameday.startPoller(
     db,
-    (awb, result) => {
-      const row = db.updateSameday(awb, result);
-      broadcast({ type: 'awb:update', awb: row });
-    },
+    (awb, result) => applySamedayUpdate(awb, result),
     SAMEDAY_POLL_MS
   );
 }
