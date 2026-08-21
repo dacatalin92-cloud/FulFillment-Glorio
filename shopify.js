@@ -47,7 +47,11 @@ async function ensureAdminToken() {
   return adminToken;
 }
 
-async function shopifyGraphql(query, variables) {
+function isThrottled(body) {
+  return Array.isArray(body.errors) && body.errors.some((e) => e.extensions && e.extensions.code === 'THROTTLED');
+}
+
+async function shopifyGraphqlOnce(query, variables) {
   const shop = process.env.SHOPIFY_SHOP; // e.g. glorio-ro.myshopify.com
   const token = await ensureAdminToken();
   let res = await fetch(`https://${shop}/admin/api/2024-10/graphql.json`, {
@@ -70,9 +74,27 @@ async function shopifyGraphql(query, variables) {
       body: JSON.stringify({ query, variables }),
     });
   }
-  const body = await res.json();
-  if (body.errors) throw new Error('Shopify GraphQL error: ' + JSON.stringify(body.errors));
-  return body.data;
+  return res.json();
+}
+
+// Shopify's GraphQL Admin API is cost-based rate limited (a shared bucket
+// that refills over time) — a big manual backfill can burn through it faster
+// than it refills. Retry with backoff instead of failing the whole run.
+async function shopifyGraphql(query, variables) {
+  const MAX_ATTEMPTS = 6;
+  let lastBody;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const body = await shopifyGraphqlOnce(query, variables);
+    if (!isThrottled(body)) {
+      if (body.errors) throw new Error('Shopify GraphQL error: ' + JSON.stringify(body.errors));
+      return body.data;
+    }
+    lastBody = body;
+    const waitMs = 1000 * attempt; // 1s, 2s, 3s, ... backing off as the bucket refills
+    console.warn(`[shopify] throttled, retrying in ${waitMs}ms (attempt ${attempt}/${MAX_ATTEMPTS})`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  throw new Error('Shopify GraphQL error: ' + JSON.stringify(lastBody.errors));
 }
 
 const ORDER_QUERY = `
