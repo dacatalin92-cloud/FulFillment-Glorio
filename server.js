@@ -158,10 +158,12 @@ app.get('/admin/backfill-old', async (req, res) => {
     return res.status(403).send('forbidden');
   }
   const days = Math.max(1, Math.min(60, parseInt(req.query.days, 10) || 7));
+  const debug = req.query.debug === '1';
   try {
-    const added = await backfillRange(days);
+    const result = await backfillRange(days, debug);
+    const added = debug ? result.added : result;
     if (added) broadcast({ type: 'refresh' });
-    res.json({ added, days });
+    res.json(debug ? { ...result, days } : { added, days });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
@@ -293,11 +295,13 @@ async function backfillToday() {
 // Same crawl as backfillToday(), but over the last `daysBack` days instead of
 // just today, and without the "must be Sameday-created today" restriction —
 // used for the one-time manual catch-up via /admin/backfill-old.
-async function backfillRange(daysBack) {
+async function backfillRange(daysBack, debug) {
   const cutoffMs = Date.now() - daysBack * 24 * 3600 * 1000;
   let cursor = null;
   let added = 0;
+  const stats = { ordersScanned: 0, fulfillmentsSuccess: 0, samedayMatches: 0, alreadyInDb: 0, pages: 0 };
   for (let page = 0; page < 60; page++) {
+    stats.pages++;
     const data = await shopify.shopifyGraphql(
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
@@ -316,14 +320,17 @@ async function backfillRange(daysBack) {
     if (!edges.length) break;
     let sawOld = false;
     for (const { node: o } of edges) {
+      stats.ordersScanned++;
       if (new Date(o.updatedAt).getTime() < cutoffMs) { sawOld = true; continue; }
       for (const f of o.fulfillments) {
         if (f.status !== 'SUCCESS') continue;
         if (new Date(f.createdAt).getTime() < cutoffMs) continue;
+        stats.fulfillmentsSuccess++;
         const tracking = f.trackingInfo[0];
         if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        stats.samedayMatches++;
         const existing = db.getAwb(tracking.number);
-        if (existing) continue;
+        if (existing) { stats.alreadyInDb++; continue; }
         db.upsertAwb({
           awb: tracking.number,
           order_name: o.name,
@@ -345,7 +352,7 @@ async function backfillRange(daysBack) {
     cursor = data.orders.pageInfo.endCursor;
   }
   if (added) console.log(`[backfill-old] added ${added} AWB(s) from the last ${daysBack} day(s)`);
-  return added;
+  return debug ? { added, stats } : added;
 }
 
 if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
