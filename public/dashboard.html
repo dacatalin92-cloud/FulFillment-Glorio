@@ -121,13 +121,19 @@
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
   function fmtMoney(n, cur){ if (n === null || n === undefined) return '—'; return n.toFixed(2) + ' ' + (cur || 'RON'); }
 
+  // Sameday's real statuses only have two "still sitting with us" states:
+  // "Alocata pentru ridicare" and "Ridicare ulterioara". Anything past that
+  // (Iesire din hub, Ridicata de la client, tranzit, livrat, etc.) means the
+  // courier already has it. Cancelled is the one exception — it doesn't
+  // imply the parcel ever left.
+  const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
   function samedayTone(status, err){
     if (err) return null;
     const t = (status || '').toLowerCase();
     if (!t) return null;
-    if (t.includes('anulat') || t.includes('retur')) return 'crit';
-    if (t.includes('ridicat') || t.includes('tranzit') || t.includes('livrat') || t.includes('predat')) return 'ok';
-    return 'warn';
+    if (t.includes('anulat')) return 'crit';
+    if (PENDING_PICKUP_PHRASES.some(p => t.includes(p))) return 'warn';
+    return 'ok';
   }
   function isPickedUp(row){ return samedayTone(row.sameday_status, row.sameday_error) === 'ok'; }
   function samedayChip(row){
