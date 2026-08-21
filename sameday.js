@@ -104,16 +104,22 @@ function isSettled(row) {
 async function pollOnce(db, onUpdate) {
   const days = db.listDays().slice(0, 2); // today + yesterday is plenty for pickup lag
   const rows = days.flatMap((d) => db.listForDay(d)).filter((r) => !isSettled(r));
+  let ok = 0;
+  let failed = 0;
+  let lastError = null;
   for (const row of rows) {
     try {
       const result = await getStatus(row.awb);
       onUpdate(row.awb, result);
+      ok++;
     } catch (err) {
-      onUpdate(row.awb, { error: String(err.message || err) });
+      lastError = String(err.message || err);
+      onUpdate(row.awb, { error: lastError });
+      failed++;
     }
     await new Promise((r) => setTimeout(r, 200));
   }
-  return rows.length;
+  return { total: rows.length, ok, failed, lastError };
 }
 
 function startPoller(db, onUpdate, intervalMs) {
@@ -122,8 +128,8 @@ function startPoller(db, onUpdate, intervalMs) {
     if (running) return;
     running = true;
     try {
-      const n = await pollOnce(db, onUpdate);
-      console.log(`[sameday] polled ${n} AWB(s)`);
+      const { total, ok, failed, lastError } = await pollOnce(db, onUpdate);
+      console.log(`[sameday] polled ${total} AWB(s) — ${ok} ok, ${failed} failed${lastError ? ` (last error: ${lastError})` : ''}`);
     } catch (err) {
       console.error('[sameday] poll error', err);
     } finally {
