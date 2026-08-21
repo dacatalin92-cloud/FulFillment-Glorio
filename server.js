@@ -69,13 +69,17 @@ async function handleFulfillmentPayload(payload) {
   broadcast({ type: 'awb:new', awb: row });
   console.log(`[webhook] new AWB ${awb} for ${order.name}`);
 
-  // Get a first real status right away instead of waiting for the next poll tick.
-  try {
-    const status = await sameday.getStatus(awb);
-    const updated = db.updateSameday(awb, status);
-    broadcast({ type: 'awb:update', awb: updated });
-  } catch (err) {
-    console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
+  // Get a first real status right away instead of waiting for the next poll tick
+  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), in which
+  // case skip this too rather than sneaking in auth attempts another way.
+  if (process.env.SAMEDAY_POLL_ENABLED !== 'false') {
+    try {
+      const status = await sameday.getStatus(awb);
+      const updated = db.updateSameday(awb, status);
+      broadcast({ type: 'awb:update', awb: updated });
+    } catch (err) {
+      console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
+    }
   }
 }
 
@@ -150,14 +154,22 @@ app.post('/api/note', (req, res) => {
 });
 
 // --- Sameday polling (courier status for open AWBs) ----------------------
-sameday.startPoller(
-  db,
-  (awb, result) => {
-    const row = db.updateSameday(awb, result);
-    broadcast({ type: 'awb:update', awb: row });
-  },
-  SAMEDAY_POLL_MS
-);
+// Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
+// entirely (e.g. while investigating a block/lockout on the Sameday side)
+// without touching anything else — AWB tracking via the Shopify webhook
+// keeps working either way, this only feeds the courier-status column.
+if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
+  console.warn('[sameday] polling disabled via SAMEDAY_POLL_ENABLED=false');
+} else {
+  sameday.startPoller(
+    db,
+    (awb, result) => {
+      const row = db.updateSameday(awb, result);
+      broadcast({ type: 'awb:update', awb: row });
+    },
+    SAMEDAY_POLL_MS
+  );
+}
 
 // --- Shopify backfill safety net -----------------------------------------
 // Webhooks are the primary path (seconds of latency); this just guards
