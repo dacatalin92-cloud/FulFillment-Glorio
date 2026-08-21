@@ -99,11 +99,16 @@ const stmts = {
   // haven't yet confirmed as physically back in the warehouse.
   listPendingReturns: db.prepare("SELECT * FROM awbs WHERE return_received = 0 AND LOWER(sameday_status) LIKE '%retur%' ORDER BY sameday_checked_at DESC"),
   setReturnReceived: db.prepare('UPDATE awbs SET return_received = 1, return_received_at = ? WHERE awb = ?'),
+  // History: returns already confirmed received, most recent first. Capped at
+  // 200 — this is a "recent history" view, not a full archive browser.
+  listReturnHistory: db.prepare('SELECT * FROM awbs WHERE return_received = 1 ORDER BY return_received_at DESC LIMIT 200'),
   insertUnknownReturn: db.prepare('INSERT INTO unknown_returns (code, scanned_at) VALUES (?, ?)'),
   getUnknownReturn: db.prepare('SELECT * FROM unknown_returns WHERE id = ?'),
   listUnknownReturns: db.prepare('SELECT * FROM unknown_returns WHERE resolved = 0 ORDER BY scanned_at DESC'),
   setUnknownReturnNote: db.prepare('UPDATE unknown_returns SET note = ? WHERE id = ?'),
   resolveUnknownReturn: db.prepare('UPDATE unknown_returns SET resolved = 1, resolved_at = ? WHERE id = ?'),
+  // History: unknown-return entries already resolved, most recent first.
+  listResolvedUnknownReturns: db.prepare('SELECT * FROM unknown_returns WHERE resolved = 1 ORDER BY resolved_at DESC LIMIT 200'),
 };
 
 const upsertStmt = db.prepare(`
@@ -232,6 +237,13 @@ function markReturnReceived(awb, whenIso) {
   return getAwb(awb);
 }
 
+// History view: AWBs already confirmed as physically received back,
+// most recent first — separate from listPendingReturns() which only shows
+// ones still waiting for confirmation.
+function listReturnHistory() {
+  return stmts.listReturnHistory.all();
+}
+
 // Logged when a return-mode scan doesn't match any known AWB — a physical
 // box arrived at the warehouse for a code the system has no record of at
 // all (different courier, older order, typo, damaged label). Kept separate
@@ -257,4 +269,9 @@ function resolveUnknownReturn(id, whenIso) {
   return stmts.getUnknownReturn.get(id);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn };
+// History view: unknown-return entries already resolved, most recent first.
+function listResolvedUnknownReturns() {
+  return stmts.listResolvedUnknownReturns.all();
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns };
