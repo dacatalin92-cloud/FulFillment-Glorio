@@ -11,7 +11,15 @@ const shopify = require('./shopify');
 
 const PORT = process.env.PORT || 3000;
 const PACK_WINDOW_MS = 30000;
-const SAMEDAY_POLL_MS = 2 * 60 * 1000; // 2 minutes — real courier status, not the bottleneck anymore
+// 5 seconds, per explicit request. In practice a full cycle (one request per
+// active AWB, 200ms apart, inside sameday.js) takes much longer than 5s once
+// there are dozens of AWBs — the `running` guard in startPoller() means a new
+// cycle only starts right after the previous one finishes, so this ends up
+// polling Sameday continuously rather than literally every 5 seconds. That's
+// intentional and safe from an overlap standpoint (never two cycles at once),
+// but it is much heavier load on Sameday's API than before. If the 403 block
+// resurfaces, the first thing to try is raising this back up.
+const SAMEDAY_POLL_MS = 5 * 1000;
 const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
 
 const app = express();
