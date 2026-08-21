@@ -92,6 +92,20 @@
   .status-banner.already{ background:var(--accent-soft); color:var(--accent); }
   .status-banner.reset{ background:var(--red-soft); color:var(--red); }
   .status-banner.cancelled{ background:var(--red-soft); color:var(--red); font-weight:700; }
+  .status-banner.returned{ background:var(--accent-soft); color:var(--accent); font-weight:700; }
+
+  .returns-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
+  .returns-bar.hidden{ display:none; }
+  .returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--amber); font-weight:600; font-size:0.88rem; }
+  .returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:180px; overflow-y:auto; }
+  .returns-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .returns-row .order-name{ flex:0 0 auto; font-weight:500; }
+  .returns-row .status-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
+  .mark-received-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; }
+
+  .scan-mode-row{ display:flex; gap:0.6rem; align-items:center; }
+  .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
 
   .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .registry.hidden{ display:none; }
@@ -112,6 +126,13 @@
     <span class="eyebrow">Stație scanare</span>
   </div>
   <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi azi</span></div>
+</div>
+
+<div class="returns-bar hidden" id="returnsBar">
+  <div class="returns-bar-head" id="returnsBarHead">
+    <span>🔄 <span id="returnsCount">0</span> retur(uri) de gestionat — click pentru listă</span>
+  </div>
+  <div class="returns-list" id="returnsList" style="display:none;"></div>
 </div>
 
 <div class="layout">
@@ -148,8 +169,11 @@
 
   <div class="right-panel">
     <div class="scan-input-wrap">
-      <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
-        placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
+      <div class="scan-mode-row">
+        <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
+          placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
+        <button type="button" class="mode-toggle" id="returnModeBtn">🔄 Scanează retur primit</button>
+      </div>
     </div>
 
     <main id="main">
@@ -166,6 +190,8 @@
   const tz = 'Europe/Bucharest';
   const REGISTRY_HIDE_AFTER_MS = 60000;
   let rows = {}; // awb -> row object, current in-memory state
+  let returnRows = {}; // awb -> row object, AWBs Sameday shows as "in return" and not yet confirmed received
+  let returnMode = false; // when true, the scan input confirms return receipt instead of packing
 
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
   function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -184,6 +210,10 @@
     if (t.includes('anulat')) return 'crit';
     if (PENDING_PICKUP_PHRASES.some(p => t.includes(p))) return 'warn';
     return 'ok';
+  }
+
+  function isReturnStatus(status){
+    return (status || '').toLowerCase().includes('retur');
   }
 
   function samedayChip(row){
@@ -224,6 +254,51 @@
       </tr>
     `).join('');
   }
+
+  // ---- Returns ---------------------------------------------------------
+  // Loaded separately from `rows` (which only ever holds today's AWBs) —
+  // a return can land days after the AWB was originally created, so this
+  // tracks its own state across the full history, kept in sync via
+  // /api/returns on load/refresh and updated incrementally from WebSocket
+  // awb:update messages (see connectWs below).
+  const returnsBar = document.getElementById('returnsBar');
+  const returnsList = document.getElementById('returnsList');
+  async function loadReturns(){
+    const res = await fetch('/api/returns');
+    const data = await res.json();
+    returnRows = {};
+    data.rows.forEach(r => { returnRows[r.awb] = r; });
+    renderReturnsBar();
+  }
+  function renderReturnsBar(){
+    const list = Object.values(returnRows);
+    document.getElementById('returnsCount').textContent = list.length;
+    returnsBar.classList.toggle('hidden', list.length === 0);
+    returnsList.innerHTML = list.map(row => `
+      <div class="returns-row">
+        <span class="awb-cell">${escapeHtml(row.awb)}</span>
+        <span class="order-name">${escapeHtml(row.order_name)}</span>
+        <span class="status-txt">${escapeHtml(row.sameday_status || '')}</span>
+        <button type="button" class="mark-received-btn" data-awb="${escapeAttr(row.awb)}">✅ Am primit-o</button>
+      </div>
+    `).join('');
+  }
+  document.getElementById('returnsBarHead').addEventListener('click', () => {
+    returnsList.style.display = returnsList.style.display === 'none' ? 'flex' : 'none';
+  });
+  document.addEventListener('click', async (e) => {
+    if (e.target.classList.contains('mark-received-btn')){
+      const awb = e.target.dataset.awb;
+      try {
+        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code: awb }) });
+        const data = await res.json();
+        if (data.found){
+          delete returnRows[awb];
+          renderReturnsBar();
+        }
+      } catch (err) { console.error('mark return received failed', err); }
+    }
+  });
 
   // ---- Registry --------------------------------------------------------
   // Only useful while the warehouse is actually staffed — outside 08:00-18:00
@@ -305,9 +380,21 @@
   setInterval(() => { if (document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
-    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled' }[kind] || 'first';
+    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned' }[kind] || 'first';
     return `<div class="status-banner ${cls}">${text}</div>`;
   }
+
+  // ---- Return-receipt scan mode ------------------------------------------
+  // Toggled on when a returned box physically arrives — scanning it then
+  // only confirms return_received, completely separate from the normal
+  // pack-confirmation flow (never touches `packed`).
+  const returnModeBtn = document.getElementById('returnModeBtn');
+  returnModeBtn.addEventListener('click', () => {
+    returnMode = !returnMode;
+    returnModeBtn.classList.toggle('active', returnMode);
+    returnModeBtn.textContent = returnMode ? '🔄 Mod retur ACTIV' : '🔄 Scanează retur primit';
+    input.placeholder = returnMode ? 'Scanează AWB-ul returnat…' : 'Scanează AWB-ul de pe etichetă…';
+  });
   function renderFound(row, bannerHtml){
     idleState.style.display = 'none';
     const items = JSON.parse(row.items_json || '[]');
@@ -351,6 +438,19 @@
     const code = raw.trim();
     if (!code) return;
     input.value = '';
+    if (returnMode){
+      try {
+        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+        if (res.status === 404){ renderNotFound(code); return; }
+        const data = await res.json();
+        delete returnRows[data.row.awb];
+        renderReturnsBar();
+        renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
+      } catch (err) {
+        console.error('return scan failed', err);
+      }
+      return;
+    }
     try {
       const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
       if (res.status === 404){ renderNotFound(code); return; }
@@ -396,13 +496,23 @@
       if (msg.type === 'awb:new' || msg.type === 'awb:update'){
         rows[msg.awb.awb] = msg.awb;
         renderAll();
+        // Keep the returns bar in sync without a full re-fetch: add/remove
+        // this one row locally based on its current status.
+        if (msg.awb.return_received || !isReturnStatus(msg.awb.sameday_status)) {
+          if (returnRows[msg.awb.awb]) { delete returnRows[msg.awb.awb]; renderReturnsBar(); }
+        } else {
+          returnRows[msg.awb.awb] = msg.awb;
+          renderReturnsBar();
+        }
       } else if (msg.type === 'refresh'){
         loadToday();
+        loadReturns();
       }
     };
   }
 
   loadToday();
+  loadReturns();
   connectWs();
 </script>
 </body>
