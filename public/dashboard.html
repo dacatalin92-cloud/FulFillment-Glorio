@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard AWB Glorio</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#F6F4EF; --surface:#FFFFFF; --surface-2:#EFEBE2; --border:#DDD6C7;
+    --text:#232019; --text-dim:#6B6355; --accent:#0F6E5E; --accent-soft:#D9EEE8;
+    --amber:#B8722A; --amber-soft:#F5E4CE; --red:#B23A34; --red-soft:#F6DEDB;
+    --green:#2F7A4F; --green-soft:#DFEFE2;
+    --shadow: 0 1px 2px rgba(35,32,25,0.06), 0 8px 24px -12px rgba(35,32,25,0.12);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#171511; --surface:#1F1C17; --surface-2:#26221B; --border:#38332A;
+      --text:#EDE8DD; --text-dim:#A79E8C; --accent:#4FC3AA; --accent-soft:#1B3831;
+      --amber:#E0A05C; --amber-soft:#3A2E1B; --red:#E38079; --red-soft:#3D2320;
+      --green:#7FCB9A; --green-soft:#1E3625;
+    }
+  }
+  *{box-sizing:border-box;} html,body{height:100%;}
+  body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+  .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex-wrap:wrap; gap:0.6rem; }
+  .brand{ display:flex; align-items:baseline; gap:0.6rem; }
+  .brand .mark{ font-family:"Fraunces", serif; font-weight:700; font-size:1.15rem; }
+  .brand .eyebrow{ font-family:"IBM Plex Mono", monospace; font-size:0.72rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--accent); }
+  .conn-dot{ width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; margin-right:0.4rem; background:var(--red); }
+  .conn-dot.live{ background:var(--green); }
+  .topbar-right{ display:flex; align-items:center; gap:0.8rem; flex-wrap:wrap; }
+  select#daySelect{ font-family:"IBM Plex Mono", monospace; font-size:0.82rem; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .count-pill{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; padding:0.3rem 0.8rem; }
+
+  .stats{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:0.8rem; padding:1.2rem 1.5rem; }
+  .stat-card{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:0.9rem 1rem; box-shadow:var(--shadow); }
+  .stat-card .lbl{ font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); margin-bottom:0.35rem; }
+  .stat-card .val{ font-family:"Fraunces", serif; font-weight:700; font-size:1.55rem; line-height:1; }
+  .stat-card .val.amber{ color:var(--amber); }
+  .stat-card .val.green{ color:var(--green); }
+  .stat-card .val.red{ color:var(--red); }
+  .stat-card .sub{ font-size:0.72rem; color:var(--text-dim); margin-top:0.3rem; }
+
+  .controls{ display:flex; align-items:center; gap:0.7rem; padding:0 1.5rem 1rem; flex-wrap:wrap; }
+  #searchInput{ font-family:inherit; font-size:0.86rem; padding:0.5rem 0.8rem; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); flex:1 1 220px; min-width:180px; }
+  .filter-btn{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; padding:0.42rem 0.8rem; border-radius:999px; border:1px solid var(--border); background:var(--surface); color:var(--text-dim); cursor:pointer; }
+  .filter-btn.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  .table-wrap{ padding:0 1.5rem 2rem; overflow-x:auto; }
+  table{ width:100%; border-collapse:collapse; font-size:0.82rem; background:var(--surface); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+  thead th{ position:sticky; top:0; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.5rem 0.9rem; border-bottom:1px solid var(--border); white-space:nowrap; }
+  tbody td{ padding:0.45rem 0.9rem; border-bottom:1px solid var(--border); vertical-align:top; }
+  tbody tr:last-child td{ border-bottom:none; }
+  .awb-cell{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; white-space:nowrap; }
+  .empty-row{ padding:1.2rem 1.5rem; color:var(--text-dim); font-size:0.86rem; text-align:center; }
+
+  .chip{ display:inline-flex; align-items:center; gap:0.3rem; font-size:0.72rem; font-weight:500; padding:0.18rem 0.5rem; border-radius:999px; white-space:nowrap; }
+  .chip.pending{ background:var(--surface-2); color:var(--text-dim); }
+  .chip.ok{ background:var(--green-soft); color:var(--green); }
+  .chip.warn{ background:var(--amber-soft); color:var(--amber); }
+  .chip.crit{ background:var(--red-soft); color:var(--red); }
+  .chip.age-ok{ background:var(--green-soft); color:var(--green); }
+  .chip.age-warn{ background:var(--amber-soft); color:var(--amber); }
+  .chip.packed-yes{ background:var(--green-soft); color:var(--green); }
+  .chip.packed-no{ background:var(--amber-soft); color:var(--amber); }
+
+  .note-cell{ max-width:180px; font-size:0.78rem; color:var(--text-dim); white-space:pre-wrap; }
+  .num{ font-family:"IBM Plex Mono", monospace; white-space:nowrap; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="mark">Glorio</span>
+    <span class="eyebrow">Dashboard AWB</span>
+  </div>
+  <div class="topbar-right">
+    <span class="count-pill"><span class="conn-dot" id="connDot"></span><span id="liveLabel">live</span></span>
+    <select id="daySelect"></select>
+  </div>
+</div>
+
+<div class="stats" id="stats">
+  <div class="stat-card"><div class="lbl">AWB-uri azi</div><div class="val" id="statTotal">—</div></div>
+  <div class="stat-card"><div class="lbl">Ultima oră</div><div class="val" id="statLastHour">—</div></div>
+  <div class="stat-card"><div class="lbl">Neîmpachetate</div><div class="val amber" id="statUnpacked">—</div></div>
+  <div class="stat-card"><div class="lbl">Ridicate de curier</div><div class="val green" id="statPickedUp">—</div></div>
+  <div class="stat-card"><div class="lbl">Până la ora 18:00</div><div class="val" id="statCountdown">—</div><div class="sub" id="statCountdownSub"></div></div>
+  <div class="stat-card"><div class="lbl">Valoare totală</div><div class="val" id="statTotalValue">—</div></div>
+  <div class="stat-card"><div class="lbl">Ramburs total</div><div class="val" id="statTotalCod">—</div></div>
+</div>
+
+<div class="controls">
+  <input id="searchInput" type="text" placeholder="Caută comandă, AWB sau produs…">
+  <button class="filter-btn active" data-age="all">Toate</button>
+  <button class="filter-btn" data-age="3">&gt; 3 ore</button>
+  <button class="filter-btn" data-age="6">&gt; 6 ore</button>
+  <button class="filter-btn" data-packed="unpacked">Neîmpachetate</button>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Comandă</th><th>Ora comenzii</th><th>Ora generării AWB</th><th>AWB</th>
+      <th>Valoare</th><th>Ramburs</th><th>Vârstă</th><th>Împachetat</th><th>Status Sameday</th><th>Notițe</th>
+    </tr></thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+</div>
+
+<script>
+  const tz = 'Europe/Bucharest';
+  let rows = {};
+  let currentDay = null;
+  let ageFilter = 'all';
+  let packedFilter = 'all';
+
+  function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
+  function fmtMoney(n, cur){ if (n === null || n === undefined) return '—'; return n.toFixed(2) + ' ' + (cur || 'RON'); }
+
+  function samedayTone(status, err){
+    if (err) return null;
+    const t = (status || '').toLowerCase();
+    if (!t) return null;
+    if (t.includes('anulat') || t.includes('retur')) return 'crit';
+    if (t.includes('ridicat') || t.includes('tranzit') || t.includes('livrat') || t.includes('predat')) return 'ok';
+    return 'warn';
+  }
+  function isPickedUp(row){ return samedayTone(row.sameday_status, row.sameday_error) === 'ok'; }
+  function samedayChip(row){
+    if (row.sameday_error) return '<span class="chip pending">Eroare API</span>';
+    if (!row.sameday_status) return '<span class="chip pending">—</span>';
+    const tone = samedayTone(row.sameday_status, false) || 'pending';
+    return `<span class="chip ${tone}" title="${escapeHtml(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
+  }
+  function ageHours(row){ return (Date.now() - new Date(row.awb_created_at).getTime()) / 3600000; }
+  function ageChip(row){
+    const h = ageHours(row);
+    const cls = h >= 6 ? 'age-warn' : 'age-ok';
+    const label = h < 1 ? Math.round(h*60) + ' min' : h.toFixed(1) + ' h';
+    return `<span class="chip ${cls}">${label}</span>`;
+  }
+  function productsText(row){
+    const items = JSON.parse(row.items_json || '[]');
+    return items.map(it => `${it.qty}× ${escapeHtml(it.title)}`).join(', ') || '—';
+  }
+
+  // ---- Day selector ----------------------------------------------------
+  const daySelect = document.getElementById('daySelect');
+  async function loadDays(){
+    const res = await fetch('/api/days');
+    const data = await res.json();
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+    let days = data.days;
+    if (!days.includes(today)) days = [today, ...days];
+    daySelect.innerHTML = days.map(d => `<option value="${d}">${d === today ? d + ' (azi)' : d}</option>`).join('');
+    daySelect.value = currentDay || today;
+  }
+  daySelect.addEventListener('change', () => loadDay(daySelect.value));
+
+  async function loadDay(day){
+    currentDay = day;
+    const res = await fetch(`/api/day/${encodeURIComponent(day)}`);
+    const data = await res.json();
+    rows = {};
+    data.rows.forEach(r => { rows[r.awb] = r; });
+    renderAll();
+  }
+
+  // ---- Filters -----------------------------------------------------------
+  document.querySelectorAll('.filter-btn[data-age]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn[data-age]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      ageFilter = btn.dataset.age;
+      renderTable();
+    });
+  });
+  const packedBtn = document.querySelector('.filter-btn[data-packed]');
+  packedBtn.addEventListener('click', () => {
+    packedFilter = packedFilter === 'all' ? 'unpacked' : 'all';
+    packedBtn.classList.toggle('active', packedFilter === 'unpacked');
+    renderTable();
+  });
+  document.getElementById('searchInput').addEventListener('input', renderTable);
+
+  // ---- Stats -------------------------------------------------------------
+  function renderStats(){
+    const list = Object.values(rows);
+    const now = Date.now();
+    const lastHour = list.filter(r => now - new Date(r.awb_created_at).getTime() <= 3600000).length;
+    const unpacked = list.filter(r => !r.packed).length;
+    const pickedUp = list.filter(isPickedUp).length;
+    const totalValue = list.reduce((s,r) => s + (r.total || 0), 0);
+    const totalCod = list.reduce((s,r) => s + (r.cod || 0), 0);
+
+    document.getElementById('statTotal').textContent = list.length;
+    document.getElementById('statLastHour').textContent = lastHour;
+    document.getElementById('statUnpacked').textContent = unpacked;
+    document.getElementById('statPickedUp').textContent = pickedUp;
+    document.getElementById('statTotalValue').textContent = fmtMoney(totalValue, 'RON');
+    document.getElementById('statTotalCod').textContent = fmtMoney(totalCod, 'RON');
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+    const cd = document.getElementById('statCountdown');
+    const sub = document.getElementById('statCountdownSub');
+    if (currentDay !== today) {
+      cd.textContent = '—'; sub.textContent = 'nu e ziua curentă';
+    } else {
+      const nowParts = new Date().toLocaleString('en-US', { timeZone: tz, hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit' });
+      const [h,m,s] = nowParts.split(':').map(Number);
+      const secsNow = h*3600 + m*60 + s;
+      const target = 18*3600;
+      const diff = target - secsNow;
+      if (diff <= 0) { cd.textContent = 'trecut'; sub.textContent = 'ora 18:00 a trecut'; }
+      else {
+        const hh = Math.floor(diff/3600), mm = Math.floor((diff%3600)/60);
+        cd.textContent = `${hh}h ${mm}m`;
+        sub.textContent = unpacked + ' neîmpachetate rămase';
+      }
+    }
+  }
+
+  // ---- Table ---------------------------------------------------------
+  const tableBody = document.getElementById('tableBody');
+  function renderTable(){
+    const q = document.getElementById('searchInput').value.trim().toLowerCase();
+    let list = Object.values(rows);
+    if (ageFilter !== 'all') list = list.filter(r => ageHours(r) >= Number(ageFilter));
+    if (packedFilter === 'unpacked') list = list.filter(r => !r.packed);
+    if (q) {
+      list = list.filter(r => {
+        const items = JSON.parse(r.items_json || '[]');
+        const hay = [r.order_name, r.awb, r.note, ...items.map(i => i.title)].join(' ').toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    list.sort((a,b) => b.awb_created_at.localeCompare(a.awb_created_at));
+
+    if (!list.length){
+      tableBody.innerHTML = '<tr><td colspan="10" class="empty-row">Nicio comandă găsită.</td></tr>';
+      return;
+    }
+    tableBody.innerHTML = list.map(row => `
+      <tr>
+        <td>${escapeHtml(row.order_name)}</td>
+        <td class="num">${fmtTime(row.order_created_at)}</td>
+        <td class="num">${fmtTime(row.awb_created_at)}</td>
+        <td class="awb-cell">${escapeHtml(row.awb)}</td>
+        <td class="num">${fmtMoney(row.total, row.currency)}</td>
+        <td class="num">${row.cod ? fmtMoney(row.cod, row.currency) : '—'}</td>
+        <td>${ageChip(row)}</td>
+        <td><span class="chip ${row.packed ? 'packed-yes' : 'packed-no'}">${row.packed ? '✓ Da' : 'Nu'}</span></td>
+        <td>${samedayChip(row)}</td>
+        <td class="note-cell">${escapeHtml(row.note || '')}</td>
+      </tr>
+    `).join('');
+  }
+
+  function renderAll(){ renderStats(); renderTable(); }
+  setInterval(renderAll, 15000); // keep countdown/age chips fresh even with no new events
+
+  // ---- WebSocket live updates --------------------------------------------
+  function connectWs(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { document.getElementById('connDot').classList.add('live'); };
+    ws.onclose = () => { document.getElementById('connDot').classList.remove('live'); setTimeout(connectWs, 2000); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+      if (msg.type === 'awb:new' || msg.type === 'awb:update'){
+        // Only merge live updates into the view if we're looking at today
+        // (new AWBs always belong to today; a status update for an older
+        // AWB simply won't match any row in `rows` and is a no-op).
+        if (currentDay === today || rows[msg.awb.awb]) {
+          rows[msg.awb.awb] = msg.awb;
+          renderAll();
+          loadDays();
+        }
+      } else if (msg.type === 'refresh'){
+        if (currentDay === today) loadDay(today);
+        loadDays();
+      }
+    };
+  }
+
+  (async function init(){
+    await loadDays();
+    await loadDay(daySelect.value);
+    connectWs();
+  })();
+</script>
+</body>
+</html>

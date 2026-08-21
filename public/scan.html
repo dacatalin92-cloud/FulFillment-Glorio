@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stație scanare AWB Glorio</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#F6F4EF; --surface:#FFFFFF; --surface-2:#EFEBE2; --border:#DDD6C7;
+    --text:#232019; --text-dim:#6B6355; --accent:#0F6E5E; --accent-soft:#D9EEE8;
+    --amber:#B8722A; --amber-soft:#F5E4CE; --red:#B23A34; --red-soft:#F6DEDB;
+    --green:#2F7A4F; --green-soft:#DFEFE2;
+    --shadow: 0 1px 2px rgba(35,32,25,0.06), 0 8px 24px -12px rgba(35,32,25,0.12);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#171511; --surface:#1F1C17; --surface-2:#26221B; --border:#38332A;
+      --text:#EDE8DD; --text-dim:#A79E8C; --accent:#4FC3AA; --accent-soft:#1B3831;
+      --amber:#E0A05C; --amber-soft:#3A2E1B; --red:#E38079; --red-soft:#3D2320;
+      --green:#7FCB9A; --green-soft:#1E3625;
+    }
+  }
+  *{box-sizing:border-box;} html,body{height:100%;}
+  body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; display:flex; flex-direction:column; }
+  .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex:0 0 auto; }
+  .brand{ display:flex; align-items:baseline; gap:0.6rem; }
+  .brand .mark{ font-family:"Fraunces", serif; font-weight:700; font-size:1.15rem; }
+  .brand .eyebrow{ font-family:"IBM Plex Mono", monospace; font-size:0.72rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--accent); }
+  .count-pill{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; padding:0.3rem 0.8rem; }
+  .conn-dot{ width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; margin-right:0.4rem; background:var(--red); }
+  .conn-dot.live{ background:var(--green); }
+
+  .picklist{ flex:0 0 auto; border-bottom:1px solid var(--border); background:var(--surface); max-height:30vh; display:flex; flex-direction:column; }
+  .picklist-head{ display:flex; align-items:center; justify-content:space-between; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
+  .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
+  .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
+  table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
+  thead th{ position:sticky; top:0; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.4rem 1rem; border-bottom:1px solid var(--border); }
+  tbody td{ padding:0.38rem 1rem; border-bottom:1px solid var(--border); vertical-align:top; }
+  .awb-cell{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; white-space:nowrap; }
+  .empty-row{ padding:1.2rem 1.5rem; color:var(--text-dim); font-size:0.86rem; text-align:center; }
+
+  .note-input{ width:100%; font-family:inherit; font-size:0.8rem; padding:0.3rem 0.5rem; border-radius:6px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .note-input:not(:placeholder-shown){ border-color:var(--amber); background:var(--amber-soft); }
+
+  .chip{ display:inline-flex; align-items:center; gap:0.3rem; font-size:0.72rem; font-weight:500; padding:0.18rem 0.5rem; border-radius:999px; white-space:nowrap; }
+  .chip.pending{ background:var(--surface-2); color:var(--text-dim); }
+  .chip.ok{ background:var(--green-soft); color:var(--green); }
+  .chip.warn{ background:var(--amber-soft); color:var(--amber); }
+  .chip.crit{ background:var(--red-soft); color:var(--red); }
+  .chip.age-ok{ background:var(--green-soft); color:var(--green); }
+  .chip.age-warn{ background:var(--amber-soft); color:var(--amber); }
+
+  .scan-input-wrap{ flex:0 0 auto; padding:1.1rem 1.5rem; border-bottom:1px solid var(--border); background:var(--surface); }
+  #scanInput{ width:100%; font-family:"IBM Plex Mono", monospace; font-size:1.4rem; padding:0.85rem 1.1rem; border-radius:10px; border:2px solid var(--accent); background:var(--surface-2); color:var(--text); outline:none; }
+  #scanInput::placeholder{ color:var(--text-dim); font-size:1.05rem; }
+
+  main{ flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding:2rem 1.5rem 1rem; overflow-y:auto; }
+  .idle{ margin-top:3rem; text-align:center; color:var(--text-dim); max-width:32ch; }
+  .idle .glyph{ font-size:2.6rem; margin-bottom:0.75rem; opacity:0.6; }
+  .idle h2{ font-family:"Fraunces", serif; font-weight:600; font-size:1.3rem; color:var(--text); margin:0 0 0.4rem; }
+
+  .result{ width:100%; max-width:760px; }
+  .result-head{ display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem; margin-bottom:1rem; }
+  .result-head .order-tag{ font-family:"Fraunces", serif; font-weight:600; font-size:1.6rem; }
+  .result-head .meta{ font-family:"IBM Plex Mono", monospace; font-size:0.82rem; color:var(--text-dim); }
+  .item-card{ display:flex; gap:1.1rem; background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.1rem; margin-bottom:0.9rem; box-shadow:var(--shadow); align-items:center; }
+  .item-card img{ width:108px; height:108px; object-fit:cover; border-radius:10px; background:var(--surface-2); flex:0 0 auto; border:1px solid var(--border); }
+  .item-info{ flex:1 1 auto; min-width:0; }
+  .item-info .title{ font-size:1.02rem; font-weight:500; line-height:1.35; margin:0 0 0.4rem; }
+  .item-info .sku{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); }
+  .qty-badge{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:12px; padding:0.6rem 1.1rem; min-width:64px; }
+  .qty-badge .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.7rem; line-height:1; }
+  .qty-badge .lbl{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.06em; margin-top:0.15rem; }
+  .total-bar{ display:flex; justify-content:space-between; align-items:center; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:0.7rem 1rem; margin-top:0.4rem; font-size:0.88rem; color:var(--text-dim); }
+  .total-bar b{ color:var(--text); font-family:"IBM Plex Mono", monospace; }
+
+  .not-found{ margin-top:2.5rem; text-align:center; max-width:36ch; }
+  .not-found .glyph{ font-size:2.6rem; margin-bottom:0.75rem; color:var(--red); }
+  .not-found h2{ font-family:"Fraunces", serif; font-weight:600; color:var(--red); margin:0 0 0.4rem; }
+  .not-found p{ color:var(--text-dim); font-size:0.92rem; line-height:1.5; }
+
+  .status-banner{ width:100%; max-width:760px; display:flex; align-items:center; gap:0.6rem; border-radius:10px; padding:0.7rem 1rem; margin-bottom:1rem; font-size:0.92rem; font-weight:500; }
+  .status-banner.packed{ background:var(--green-soft); color:var(--green); }
+  .status-banner.first{ background:var(--amber-soft); color:var(--amber); }
+  .status-banner.already{ background:var(--accent-soft); color:var(--accent); }
+  .status-banner.reset{ background:var(--red-soft); color:var(--red); }
+
+  .registry{ flex:0 0 auto; border-top:1px solid var(--border); background:var(--surface); max-height:30vh; display:flex; flex-direction:column; }
+  .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
+  .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
+  .registry-stats{ display:flex; gap:0.5rem; font-family:"IBM Plex Mono", monospace; font-size:0.76rem; }
+  .registry-stats .pill{ border-radius:999px; padding:0.22rem 0.65rem; border:1px solid var(--border); }
+  .registry-stats .pill.packed{ background:var(--green-soft); color:var(--green); border-color:transparent; }
+  .registry-stats .pill.pending{ background:var(--amber-soft); color:var(--amber); border-color:transparent; }
+  .registry-scroll{ overflow-y:auto; flex:1 1 auto; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="mark">Glorio</span>
+    <span class="eyebrow">Stație scanare</span>
+  </div>
+  <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi azi</span></div>
+</div>
+
+<div class="picklist">
+  <div class="picklist-head">
+    <h3>De pregătit pentru curier</h3>
+    <span class="count-pill" id="picklistCount">0 comenzi</span>
+  </div>
+  <div class="picklist-scroll">
+    <table>
+      <thead><tr><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
+      <tbody id="picklistBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="scan-input-wrap">
+  <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
+    placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
+</div>
+
+<main id="main">
+  <div class="idle" id="idleState">
+    <div class="glyph">📦</div>
+    <h2>Gata de scanare</h2>
+    <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
+  </div>
+</main>
+
+<div class="registry">
+  <div class="registry-head">
+    <h3>Registru scanare — azi</h3>
+    <div class="registry-stats">
+      <span class="pill packed" id="packedCount">0 împachetate</span>
+      <span class="pill pending" id="pendingCount">0 în așteptare</span>
+    </div>
+  </div>
+  <div class="registry-scroll">
+    <table>
+      <thead><tr><th>AWB</th><th>Comandă</th><th>Prima scanare</th><th>Status</th><th>Confirmat la</th><th>Notițe</th></tr></thead>
+      <tbody id="registryBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const tz = 'Europe/Bucharest';
+  const REGISTRY_HIDE_AFTER_MS = 60000;
+  let rows = {}; // awb -> row object, current in-memory state
+
+  function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
+  function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function escapeAttr(s){ return escapeHtml(s); }
+
+  function samedayTone(status, err){
+    if (err) return null;
+    const t = (status || '').toLowerCase();
+    if (!t) return null;
+    if (t.includes('anulat') || t.includes('retur')) return 'crit';
+    if (t.includes('ridicat') || t.includes('tranzit') || t.includes('livrat') || t.includes('predat')) return 'ok';
+    return 'warn';
+  }
+
+  function samedayChip(row){
+    if (row.sameday_error) return '<span class="chip pending">Eroare API</span>';
+    if (!row.sameday_status) return '<span class="chip pending">—</span>';
+    const tone = samedayTone(row.sameday_status, false) || 'pending';
+    return `<span class="chip ${tone}" title="${escapeAttr(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
+  }
+
+  function productsText(row){
+    const items = JSON.parse(row.items_json || '[]');
+    return items.map(it => `${it.qty}× ${escapeHtml(it.title)}`).join(', ') || '—';
+  }
+
+  // ---- Picking list --------------------------------------------------
+  const picklistBody = document.getElementById('picklistBody');
+  function isPickable(row){
+    if (row.packed) return false;
+    const tone = samedayTone(row.sameday_status, row.sameday_error);
+    if (tone === 'ok') return false;
+    return true;
+  }
+  function renderPicklist(){
+    const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
+    document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
+    if (!list.length){
+      picklistBody.innerHTML = '<tr><td colspan="5" class="empty-row">Toate comenzile de azi sunt împachetate sau ridicate de curier. 🎉</td></tr>';
+      return;
+    }
+    picklistBody.innerHTML = list.map(row => `
+      <tr data-awb="${escapeAttr(row.awb)}">
+        <td>${escapeHtml(row.order_name)}</td>
+        <td class="awb-cell">${escapeHtml(row.awb)}</td>
+        <td>${productsText(row)}</td>
+        <td>${samedayChip(row)}</td>
+        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+      </tr>
+    `).join('');
+  }
+
+  // ---- Registry --------------------------------------------------------
+  const registryBody = document.getElementById('registryBody');
+  function renderRegistry(){
+    const now = Date.now();
+    const scanned = Object.values(rows)
+      .filter(r => r.first_scan_at)
+      .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
+    let packed = 0, pending = 0;
+    const visibleRows = [];
+    scanned.forEach(row => {
+      if (row.packed) packed++; else pending++;
+      const age = now - new Date(row.first_scan_at).getTime();
+      if (row.packed || age <= REGISTRY_HIDE_AFTER_MS) visibleRows.push(row);
+    });
+    document.getElementById('packedCount').textContent = packed + ' împachetate';
+    document.getElementById('pendingCount').textContent = pending + ' în așteptare';
+    registryBody.innerHTML = visibleRows.map(row => `
+      <tr data-awb="${escapeAttr(row.awb)}">
+        <td class="awb-cell">${escapeHtml(row.awb)}</td>
+        <td>${escapeHtml(row.order_name)}</td>
+        <td>${fmtTime(row.first_scan_at)}</td>
+        <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
+        <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+      </tr>
+    `).join('');
+  }
+  setInterval(renderRegistry, 5000);
+
+  function renderAll(){
+    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi azi';
+    renderPicklist();
+    renderRegistry();
+  }
+
+  // ---- Notes: change/Enter → POST /api/note ------------------------------
+  document.addEventListener('change', e => {
+    if (e.target.classList.contains('note-input')) commitNote(e.target);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.target.classList.contains('note-input') && e.key === 'Enter'){
+      e.preventDefault();
+      commitNote(e.target);
+      e.target.blur();
+    }
+  });
+  async function commitNote(inputEl){
+    const awb = inputEl.dataset.awb;
+    const note = inputEl.value;
+    try {
+      await fetch('/api/note', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb, note }) });
+    } catch (err) { console.error('note save failed', err); }
+  }
+
+  // ---- Scan input ----------------------------------------------------
+  const input = document.getElementById('scanInput');
+  const main = document.getElementById('main');
+  const idleState = document.getElementById('idleState');
+  function keepFocus(){ input.focus(); }
+  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input')) keepFocus(); });
+  window.addEventListener('load', keepFocus);
+  setInterval(() => { if (document.activeElement !== input) input.focus(); }, 1500);
+
+  function renderStatusBanner(kind, text){
+    const cls = { packed:'packed', first:'first', already:'already', reset:'reset' }[kind] || 'first';
+    return `<div class="status-banner ${cls}">${text}</div>`;
+  }
+  function renderFound(row, bannerHtml){
+    idleState.style.display = 'none';
+    const items = JSON.parse(row.items_json || '[]');
+    const totalQty = items.reduce((s,i) => s + i.qty, 0);
+    main.innerHTML = `
+      ${bannerHtml || ''}
+      <div class="result">
+        <div class="result-head">
+          <div class="order-tag">${escapeHtml(row.order_name)}</div>
+          <div class="meta">AWB ${escapeHtml(row.awb)} · comandă ${fmtTime(row.order_created_at)} · AWB generat ${fmtTime(row.awb_created_at)}</div>
+        </div>
+        ${items.map(it => `
+          <div class="item-card">
+            ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
+            <div class="item-info">
+              <p class="title">${escapeHtml(it.title)}</p>
+              ${it.sku ? `<span class="sku">SKU: ${escapeHtml(it.sku)}</span>` : ''}
+            </div>
+            <div class="qty-badge"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+          </div>
+        `).join('')}
+        <div class="total-bar">
+          <span>${items.length} produs${items.length === 1 ? '' : 'e'} în colet</span>
+          <span>Total bucăți: <b>${totalQty}</b></span>
+        </div>
+      </div>
+    `;
+  }
+  function renderNotFound(code){
+    idleState.style.display = 'none';
+    main.innerHTML = `
+      <div class="not-found">
+        <div class="glyph">✕</div>
+        <h2>AWB negăsit</h2>
+        <p>Codul <code>${escapeHtml(code)}</code> nu a fost găsit. Dacă a fost generat chiar acum, ar trebui să apară în câteva secunde — mai încearcă o dată.</p>
+      </div>
+    `;
+  }
+
+  async function handleScan(raw){
+    const code = raw.trim();
+    if (!code) return;
+    input.value = '';
+    try {
+      const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+      if (res.status === 404){ renderNotFound(code); return; }
+      const data = await res.json();
+      rows[data.row.awb] = data.row;
+      renderAll();
+      if (data.kind === 'first'){
+        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".'));
+      } else if (data.kind === 'packed'){
+        renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!'));
+      } else if (data.kind === 'already'){
+        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.`));
+      } else if (data.kind === 'reset'){
+        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.'));
+      }
+    } catch (err) {
+      console.error('scan failed', err);
+    }
+  }
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter'){ e.preventDefault(); handleScan(input.value); }
+  });
+
+  // ---- Initial load + WebSocket live updates ------------------------------
+  async function loadToday(){
+    const res = await fetch('/api/today');
+    const data = await res.json();
+    rows = {};
+    data.rows.forEach(r => { rows[r.awb] = r; });
+    renderAll();
+  }
+
+  function connectWs(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { document.getElementById('connDot').classList.add('live'); };
+    ws.onclose = () => { document.getElementById('connDot').classList.remove('live'); setTimeout(connectWs, 2000); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'awb:new' || msg.type === 'awb:update'){
+        rows[msg.awb.awb] = msg.awb;
+        renderAll();
+      } else if (msg.type === 'refresh'){
+        loadToday();
+      }
+    };
+  }
+
+  loadToday();
+  connectWs();
+</script>
+</body>
+</html>
