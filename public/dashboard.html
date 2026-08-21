@@ -91,6 +91,7 @@
   <div class="stat-card"><div class="lbl">Valoare totală</div><div class="val" id="statTotalValue">—</div></div>
   <div class="stat-card"><div class="lbl">Ramburs total</div><div class="val" id="statTotalCod">—</div></div>
   <div class="stat-card"><div class="lbl">Retururi în curs</div><div class="val red" id="statReturns">—</div><div class="sub">nu primite înapoi încă, orice zi</div></div>
+  <div class="stat-card"><div class="lbl">Retururi neidentificate</div><div class="val red" id="statUnknownReturns">—</div><div class="sub">nu sunt în sistem — vezi stația de scanare</div></div>
 </div>
 
 <div class="controls">
@@ -183,6 +184,9 @@
     const res = await fetch('/api/returns');
     const data = await res.json();
     document.getElementById('statReturns').textContent = data.rows.length;
+    const res2 = await fetch('/api/unknown-returns');
+    const data2 = await res2.json();
+    document.getElementById('statUnknownReturns').textContent = data2.rows.length;
   }
 
   // ---- Filters -----------------------------------------------------------
@@ -297,6 +301,8 @@
           renderAll();
           loadDays();
         }
+        loadReturnsCount();
+      } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update' || msg.type === 'unknown-return:resolved'){
         loadReturnsCount();
       } else if (msg.type === 'refresh'){
         if (currentDay === today) loadDay(today);
