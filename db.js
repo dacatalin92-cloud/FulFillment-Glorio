@@ -50,6 +50,35 @@ function bucharestDay(isoString) {
   return new Date(isoString).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
 }
 
+// All statements are prepared ONCE here and reused for the lifetime of the
+// process, instead of calling db.prepare() fresh inside every function call.
+// With the Sameday poller now running near-continuously (every AWB, one
+// query per status update), re-preparing a statement on every single call
+// creates and destroys a native Statement object at very high frequency —
+// that churn is what triggered a native crash (RemoveEnvironmentCleanupHook
+// assertion inside better-sqlite3's Statement destructor) under load. Reusing
+// cached statements avoids that churn entirely and is also just faster.
+const stmts = {
+  getAwb: db.prepare('SELECT * FROM awbs WHERE awb = ?'),
+  listDays: db.prepare('SELECT DISTINCT day FROM awbs ORDER BY day DESC'),
+  listForDay: db.prepare('SELECT * FROM awbs WHERE day = ? ORDER BY awb_created_at ASC'),
+  updateSameday: db.prepare(`
+    UPDATE awbs SET sameday_status = ?, sameday_status_label = ?, sameday_state = ?,
+      cod = COALESCE(?, cod), sameday_error = ?, sameday_checked_at = ?
+    WHERE awb = ?
+  `),
+  setFirstScan: db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?'),
+  setPacked: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
+  setPackedFromCourier: db.prepare(`
+    UPDATE awbs SET packed = 1, packed_at = ?, first_scan_at = COALESCE(first_scan_at, ?)
+    WHERE awb = ?
+  `),
+  cancelledAwbsForOrder: db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0'),
+  cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
+  setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
+  findByCodeFuzzy: db.prepare("SELECT * FROM awbs WHERE ? LIKE awb || '%' OR awb LIKE ? || '%' LIMIT 1"),
+};
+
 const upsertStmt = db.prepare(`
 INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id)
 VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id)
@@ -79,23 +108,19 @@ function upsertAwb(rec) {
 }
 
 function getAwb(awb) {
-  return db.prepare('SELECT * FROM awbs WHERE awb = ?').get(awb);
+  return stmts.getAwb.get(awb);
 }
 
 function listDays() {
-  return db.prepare('SELECT DISTINCT day FROM awbs ORDER BY day DESC').all().map((r) => r.day);
+  return stmts.listDays.all().map((r) => r.day);
 }
 
 function listForDay(day) {
-  return db.prepare('SELECT * FROM awbs WHERE day = ? ORDER BY awb_created_at ASC').all(day);
+  return stmts.listForDay.all(day);
 }
 
 function updateSameday(awb, { status, statusLabel, state, cod, error }) {
-  db.prepare(`
-    UPDATE awbs SET sameday_status = ?, sameday_status_label = ?, sameday_state = ?,
-      cod = COALESCE(?, cod), sameday_error = ?, sameday_checked_at = ?
-    WHERE awb = ?
-  `).run(status || null, statusLabel || null, state || null, cod ?? null, error || null, new Date().toISOString(), awb);
+  stmts.updateSameday.run(status || null, statusLabel || null, state || null, cod ?? null, error || null, new Date().toISOString(), awb);
   return getAwb(awb);
 }
 
@@ -109,15 +134,15 @@ function recordScan(awb, nowIso, packWindowMs) {
     return { found: true, row, kind: 'already', };
   }
   if (!row.first_scan_at) {
-    db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?').run(nowIso, awb);
+    stmts.setFirstScan.run(nowIso, awb);
     return { found: true, row: getAwb(awb), kind: 'first' };
   }
   const delta = new Date(nowIso).getTime() - new Date(row.first_scan_at).getTime();
   if (delta >= 0 && delta <= packWindowMs) {
-    db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?').run(nowIso, awb);
+    stmts.setPacked.run(nowIso, awb);
     return { found: true, row: getAwb(awb), kind: 'packed' };
   }
-  db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?').run(nowIso, awb);
+  stmts.setFirstScan.run(nowIso, awb);
   return { found: true, row: getAwb(awb), kind: 'reset' };
 }
 
@@ -129,10 +154,7 @@ function recordScan(awb, nowIso, packWindowMs) {
 function markPackedFromCourier(awb, whenIso) {
   const row = getAwb(awb);
   if (!row || row.packed) return row;
-  db.prepare(`
-    UPDATE awbs SET packed = 1, packed_at = ?, first_scan_at = COALESCE(first_scan_at, ?)
-    WHERE awb = ?
-  `).run(whenIso, whenIso, awb);
+  stmts.setPackedFromCourier.run(whenIso, whenIso, awb);
   return getAwb(awb);
 }
 
@@ -141,14 +163,14 @@ function markPackedFromCourier(awb, whenIso) {
 // the updated rows for broadcasting. Sameday does NOT auto-cancel the AWB
 // itself — this is purely our own "take it out of the packing flow" flag.
 function markOrderCancelled(orderId) {
-  const affected = db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0').all(orderId).map((r) => r.awb);
+  const affected = stmts.cancelledAwbsForOrder.all(orderId).map((r) => r.awb);
   if (!affected.length) return [];
-  db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?').run(orderId);
+  stmts.cancelOrder.run(orderId);
   return affected.map((awb) => getAwb(awb));
 }
 
 function setNote(awb, note) {
-  db.prepare('UPDATE awbs SET note = ? WHERE awb = ?').run(note, awb);
+  stmts.setNote.run(note, awb);
   return getAwb(awb);
 }
 
@@ -160,7 +182,7 @@ function findByCode(code) {
     row = getAwb(code.slice(0, -3));
     if (row) return row;
   }
-  row = db.prepare('SELECT * FROM awbs WHERE ? LIKE awb || \'%\' OR awb LIKE ? || \'%\' LIMIT 1').get(code, code);
+  row = stmts.findByCodeFuzzy.get(code, code);
   return row || null;
 }
 
