@@ -79,6 +79,33 @@ async function handleFulfillmentPayload(payload) {
   }
 }
 
+// --- One-time setup: register the fulfillments/create webhook -----------
+// Registers this server's own /webhooks/fulfillments-create URL with Shopify,
+// authenticated as THIS app (via the same client_credentials exchange used
+// for the Admin API), so the webhook ends up signed with SHOPIFY_CLIENT_SECRET
+// — the secret this server actually verifies against. Guarded by that same
+// secret as a query param so it can be triggered once from a browser.
+app.get('/admin/setup-webhook', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const uri = `https://${req.get('host')}/webhooks/fulfillments-create`;
+    const data = await shopify.shopifyGraphql(
+      `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+        webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+          webhookSubscription { id topic uri }
+          userErrors { field message }
+        }
+      }`,
+      { topic: 'FULFILLMENTS_CREATE', sub: { uri, format: 'JSON' } }
+    );
+    res.json(data.webhookSubscriptionCreate);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
