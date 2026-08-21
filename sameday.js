@@ -19,26 +19,29 @@ const AUTH_FAILURE_COOLDOWN_MS = 60 * 1000;
 
 async function authenticate() {
   try {
-    // Per Sameday's official API docs: remember_me is a query param with
-    // value 1 (extends the token to 30 days instead of the 12h default),
-    // and auth happens via the X-Auth-* headers — no request body needed.
-    const res = await fetch(`${BASE}/api/authenticate?remember_me=1`, {
+    // Confirmed-working format (matches the previous, still-functional
+    // Python-based pipeline): remember_me goes in an urlencoded form body,
+    // not as a query-string param — despite what the official PDF docs say.
+    const formBody = new URLSearchParams({ remember_me: 'true' });
+    const res = await fetch(`${BASE}/api/authenticate`, {
       method: 'POST',
       headers: {
         'X-Auth-Username': process.env.SAMEDAY_USERNAME,
         'X-Auth-Password': process.env.SAMEDAY_PASSWORD,
+        'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent': UA,
         Accept: 'application/json',
       },
+      body: formBody.toString(),
     });
     if (!res.ok) throw new Error(`Sameday auth failed: HTTP ${res.status}`);
-    const body = await res.json();
-    token = body.token;
-    // Docs: with remember_me=1 the token is valid 14 days. Trust their
+    const respBody = await res.json();
+    token = respBody.token;
+    // With remember_me=true the token is valid ~2 weeks. Trust their
     // expire_at_utc if present (refreshed a bit early); otherwise fall back
-    // to the documented 14-day lifetime, refreshed 2 days early.
-    tokenExpiresAt = body.expire_at_utc
-      ? new Date(body.expire_at_utc.replace(' ', 'T') + 'Z').getTime() - 6 * 3600 * 1000
+    // to a 12-day estimate, refreshed 2 days early.
+    tokenExpiresAt = respBody.expire_at_utc
+      ? new Date(respBody.expire_at_utc.replace(' ', 'T') + 'Z').getTime() - 6 * 3600 * 1000
       : Date.now() + 12 * 24 * 3600 * 1000;
     lastAuthFailureAt = 0;
     return token;
