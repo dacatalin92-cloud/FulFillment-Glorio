@@ -90,6 +90,7 @@
   <div class="stat-card"><div class="lbl">Până la ora 18:00</div><div class="val" id="statCountdown">—</div><div class="sub" id="statCountdownSub"></div></div>
   <div class="stat-card"><div class="lbl">Valoare totală</div><div class="val" id="statTotalValue">—</div></div>
   <div class="stat-card"><div class="lbl">Ramburs total</div><div class="val" id="statTotalCod">—</div></div>
+  <div class="stat-card"><div class="lbl">Retururi în curs</div><div class="val red" id="statReturns">—</div><div class="sub">nu primite înapoi încă, orice zi</div></div>
 </div>
 
 <div class="controls">
@@ -136,6 +137,7 @@
     return 'ok';
   }
   function isPickedUp(row){ return samedayTone(row.sameday_status, row.sameday_error) === 'ok'; }
+  function isReturnStatus(status){ return (status || '').toLowerCase().includes('retur'); }
   function samedayChip(row){
     if (row.sameday_error) return '<span class="chip pending">Eroare API</span>';
     if (!row.sameday_status) return '<span class="chip pending">—</span>';
@@ -174,6 +176,13 @@
     rows = {};
     data.rows.forEach(r => { rows[r.awb] = r; });
     renderAll();
+  }
+
+  // ---- Returns count (not day-scoped — a return can land any day) ---------
+  async function loadReturnsCount(){
+    const res = await fetch('/api/returns');
+    const data = await res.json();
+    document.getElementById('statReturns').textContent = data.rows.length;
   }
 
   // ---- Filters -----------------------------------------------------------
@@ -252,7 +261,7 @@
     }
     tableBody.innerHTML = list.map(row => `
       <tr${row.cancelled ? ' style="opacity:0.55"' : ''}>
-        <td>${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}</td>
+        <td>${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}${!row.cancelled && !row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
         <td class="num">${fmtTime(row.order_created_at)}</td>
         <td class="num">${fmtTime(row.awb_created_at)}</td>
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
@@ -288,9 +297,11 @@
           renderAll();
           loadDays();
         }
+        loadReturnsCount();
       } else if (msg.type === 'refresh'){
         if (currentDay === today) loadDay(today);
         loadDays();
+        loadReturnsCount();
       }
     };
   }
@@ -298,6 +309,7 @@
   (async function init(){
     await loadDays();
     await loadDay(daySelect.value);
+    await loadReturnsCount();
     connectWs();
   })();
 </script>
