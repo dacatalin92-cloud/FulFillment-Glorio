@@ -296,14 +296,41 @@ app.get('/api/returns', (req, res) => {
 // Manual confirmation scan: the box physically arrived back at the
 // warehouse. Deliberately separate from /api/scan's pack-confirmation flow
 // — scanning a returned AWB here never touches `packed`, only `return_received`.
+// If the code matches no known AWB at all (a return from another channel,
+// an older order, a typo, a damaged label), it's logged as an "unknown
+// return" instead of a plain 404 — those need a human to go find out what
+// they actually are, not silently vanish as a failed scan.
 app.post('/api/scan-return', (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: 'missing code' });
   const row = db.findByCode(code);
-  if (!row) return res.status(404).json({ found: false });
+  if (!row) {
+    const entry = db.logUnknownReturn(code, new Date().toISOString());
+    broadcast({ type: 'unknown-return:new', entry });
+    return res.json({ found: false, logged: true, entry });
+  }
   const updated = db.markReturnReceived(row.awb, new Date().toISOString());
   broadcast({ type: 'awb:update', awb: updated });
   res.json({ found: true, row: updated });
+});
+
+// Unknown-return entries: listing, adding a note, and marking one resolved
+// once someone has figured out / handled what it actually was.
+app.get('/api/unknown-returns', (req, res) => {
+  res.json({ rows: db.listUnknownReturns() });
+});
+
+app.post('/api/unknown-returns/:id/note', (req, res) => {
+  const { note } = req.body || {};
+  const entry = db.setUnknownReturnNote(Number(req.params.id), note || '');
+  broadcast({ type: 'unknown-return:update', entry });
+  res.json({ entry });
+});
+
+app.post('/api/unknown-returns/:id/resolve', (req, res) => {
+  const entry = db.resolveUnknownReturn(Number(req.params.id), new Date().toISOString());
+  broadcast({ type: 'unknown-return:resolved', entry });
+  res.json({ entry });
 });
 
 // --- Sameday polling (courier status for open AWBs) ----------------------
