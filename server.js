@@ -26,13 +26,18 @@ function broadcast(msg) {
 }
 
 // Same "has it clearly left our warehouse?" read as the picking-list filter
-// in scan.html (samedayTone) — kept in sync deliberately: cancelled/returned
-// parcels are excluded on purpose (a cancellation doesn't mean it shipped).
+// in scan.html / dashboard.html (samedayTone) — kept in sync deliberately.
+// Sameday's real statuses (from observed data) only have two "still sitting
+// with us" states: "Alocata pentru ridicare" and "Ridicare ulterioara".
+// Anything past that — "Iesire din hub", "Ridicata de la client", transit,
+// delivered, etc. — means the courier already has it. Cancelled is the one
+// exception: it doesn't imply the parcel ever left.
+const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
 function samedayIndicatesPickedUp(status) {
   const t = (status || '').toLowerCase();
   if (!t) return false;
-  if (t.includes('anulat') || t.includes('retur')) return false;
-  return t.includes('ridicat') || t.includes('tranzit') || t.includes('livrat') || t.includes('predat');
+  if (t.includes('anulat')) return false;
+  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
 }
 
 // Applies a fresh Sameday status to a row, auto-marking it packed if the
