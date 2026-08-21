@@ -123,6 +123,25 @@ app.get('/admin/whoami', async (req, res) => {
   }
 });
 
+// One-time (or occasional) manual pull of older AWBs — the automatic
+// backfillToday() only ever looks at today. This brings AWBs from the last
+// N days into the new system, e.g. so anything still unpacked from before
+// the webhook went live shows up here too. Guarded the same way as the
+// other /admin routes. Usage: /admin/backfill-old?secret=...&days=7
+app.get('/admin/backfill-old', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const days = Math.max(1, Math.min(60, parseInt(req.query.days, 10) || 7));
+  try {
+    const added = await backfillRange(days);
+    if (added) broadcast({ type: 'refresh' });
+    res.json({ added, days });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -243,6 +262,64 @@ async function backfillToday() {
     console.log(`[backfill] added ${added} AWB(s) missed by webhooks`);
     broadcast({ type: 'refresh' }); // simplest: tell clients to re-fetch today
   }
+  return added;
+}
+
+// Same crawl as backfillToday(), but over the last `daysBack` days instead of
+// just today, and without the "must be Sameday-created today" restriction —
+// used for the one-time manual catch-up via /admin/backfill-old.
+async function backfillRange(daysBack) {
+  const cutoffMs = Date.now() - daysBack * 24 * 3600 * 1000;
+  let cursor = null;
+  let added = 0;
+  for (let page = 0; page < 60; page++) {
+    const data = await shopify.shopifyGraphql(
+      `query($cursor: String) {
+        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+          edges { node {
+            name createdAt updatedAt
+            totalPriceSet { shopMoney { amount currencyCode } }
+            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
+            lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor }
+    );
+    const edges = data.orders.edges;
+    if (!edges.length) break;
+    let sawOld = false;
+    for (const { node: o } of edges) {
+      if (new Date(o.updatedAt).getTime() < cutoffMs) { sawOld = true; continue; }
+      for (const f of o.fulfillments) {
+        if (f.status !== 'SUCCESS') continue;
+        if (new Date(f.createdAt).getTime() < cutoffMs) continue;
+        const tracking = f.trackingInfo[0];
+        if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        const existing = db.getAwb(tracking.number);
+        if (existing) continue;
+        db.upsertAwb({
+          awb: tracking.number,
+          order_name: o.name,
+          order_created_at: o.createdAt,
+          awb_created_at: f.createdAt,
+          total: parseFloat(o.totalPriceSet.shopMoney.amount),
+          currency: o.totalPriceSet.shopMoney.currencyCode,
+          items: o.lineItems.edges.map((e) => ({
+            title: e.node.title,
+            qty: e.node.quantity,
+            sku: e.node.sku,
+            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+          })),
+        });
+        added++;
+      }
+    }
+    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
+    cursor = data.orders.pageInfo.endCursor;
+  }
+  if (added) console.log(`[backfill-old] added ${added} AWB(s) from the last ${daysBack} day(s)`);
   return added;
 }
 
