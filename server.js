@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const fetch = require('node-fetch');
 const { WebSocketServer } = require('ws');
 
 const db = require('./db');
@@ -105,6 +106,18 @@ app.get('/admin/setup-webhook', async (req, res) => {
       { topic: 'FULFILLMENTS_CREATE', sub: { uri, format: 'JSON' } }
     );
     res.json(data.webhookSubscriptionCreate);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Diagnostic: reports the public IP this server's outbound requests use —
+// useful to hand Sameday support an exact address to check/whitelist.
+app.get('/admin/whoami', async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const body = await r.json();
+    res.json({ outboundIp: body.ip });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
