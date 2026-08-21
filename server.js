@@ -285,6 +285,27 @@ app.post('/api/note', (req, res) => {
   res.json({ row });
 });
 
+// --- Returns --------------------------------------------------------------
+// AWBs Sameday currently shows as "in return" (courier bringing it back)
+// that nobody has confirmed as physically received yet — not scoped to
+// today, since a return can land days after the original order.
+app.get('/api/returns', (req, res) => {
+  res.json({ rows: db.listPendingReturns() });
+});
+
+// Manual confirmation scan: the box physically arrived back at the
+// warehouse. Deliberately separate from /api/scan's pack-confirmation flow
+// — scanning a returned AWB here never touches `packed`, only `return_received`.
+app.post('/api/scan-return', (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'missing code' });
+  const row = db.findByCode(code);
+  if (!row) return res.status(404).json({ found: false });
+  const updated = db.markReturnReceived(row.awb, new Date().toISOString());
+  broadcast({ type: 'awb:update', awb: updated });
+  res.json({ found: true, row: updated });
+});
+
 // --- Sameday polling (courier status for open AWBs) ----------------------
 // Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
 // entirely (e.g. while investigating a block/lockout on the Sameday side)
