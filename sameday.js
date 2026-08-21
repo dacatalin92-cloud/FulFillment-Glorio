@@ -9,29 +9,46 @@ const BASE = 'https://api.sameday.ro';
 
 let token = null;
 let tokenExpiresAt = 0;
+// If authentication fails, don't hammer Sameday's login endpoint once per
+// AWB in the same poll cycle (that's exactly what turns a single bad
+// credential/IP block into a 403/429 storm) — back off for a bit instead.
+let lastAuthFailureAt = 0;
+const AUTH_FAILURE_COOLDOWN_MS = 60 * 1000;
 
 async function authenticate() {
-  const res = await fetch(`${BASE}/api/authenticate`, {
-    method: 'POST',
-    headers: {
-      'X-Auth-Username': process.env.SAMEDAY_USERNAME,
-      'X-Auth-Password': process.env.SAMEDAY_PASSWORD,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': UA,
-      Accept: 'application/json',
-    },
-    body: 'remember_me=true',
-  });
-  if (!res.ok) throw new Error(`Sameday auth failed: HTTP ${res.status}`);
-  const body = await res.json();
-  token = body.token;
-  // Token is valid ~2 weeks; refresh a bit early to be safe.
-  tokenExpiresAt = Date.now() + 12 * 24 * 3600 * 1000;
-  return token;
+  try {
+    const res = await fetch(`${BASE}/api/authenticate`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Username': process.env.SAMEDAY_USERNAME,
+        'X-Auth-Password': process.env.SAMEDAY_PASSWORD,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': UA,
+        Accept: 'application/json',
+      },
+      body: 'remember_me=true',
+    });
+    if (!res.ok) throw new Error(`Sameday auth failed: HTTP ${res.status}`);
+    const body = await res.json();
+    token = body.token;
+    // Token is valid ~2 weeks; refresh a bit early to be safe.
+    tokenExpiresAt = Date.now() + 12 * 24 * 3600 * 1000;
+    lastAuthFailureAt = 0;
+    return token;
+  } catch (err) {
+    token = null;
+    tokenExpiresAt = 0;
+    lastAuthFailureAt = Date.now();
+    throw err;
+  }
 }
 
 async function ensureToken() {
-  if (!token || Date.now() > tokenExpiresAt) await authenticate();
+  if (token && Date.now() <= tokenExpiresAt) return token;
+  if (lastAuthFailureAt && Date.now() - lastAuthFailureAt < AUTH_FAILURE_COOLDOWN_MS) {
+    throw new Error('Sameday auth on cooldown after a recent failure — will retry automatically');
+  }
+  await authenticate();
   return token;
 }
 
@@ -41,8 +58,11 @@ async function getStatus(awb) {
     headers: { 'X-Auth-Token': t, 'User-Agent': UA, Accept: 'application/json' },
   });
   if (res.status === 401) {
-    // Token expired/invalid server-side — re-auth once and retry.
-    await authenticate();
+    // Token expired/invalid server-side — re-auth once (via ensureToken, so
+    // a failure here also respects the cooldown) and retry.
+    token = null;
+    tokenExpiresAt = 0;
+    await ensureToken();
     res = await fetch(`${BASE}/api/client/awb/${encodeURIComponent(awb)}/status`, {
       headers: { 'X-Auth-Token': token, 'User-Agent': UA, Accept: 'application/json' },
     });
