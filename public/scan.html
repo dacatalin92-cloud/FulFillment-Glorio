@@ -500,6 +500,18 @@
     if (needsModal.classList.contains('open')) renderNeeds();
   }
 
+  // Every ~30s Sameday poll cycle broadcasts one awb:update message PER AWB
+  // (190+ of them, arriving almost simultaneously) — calling renderAll()
+  // straight from each message rebuilds the entire picking list + registry
+  // table that many times in a couple of seconds, which is what was causing
+  // the page to feel laggy. This coalesces any burst of messages arriving
+  // within the same short window into a single re-render.
+  let renderAllTimer = null;
+  function scheduleRenderAll(){
+    if (renderAllTimer) return;
+    renderAllTimer = setTimeout(() => { renderAllTimer = null; renderAll(); }, 200);
+  }
+
   // ---- Notes: change/Enter → POST /api/note ------------------------------
   // Guarded against unknown-return note inputs, which share the same
   // .note-input styling class but are handled by their own listener above
@@ -659,7 +671,7 @@
       const msg = JSON.parse(ev.data);
       if (msg.type === 'awb:new' || msg.type === 'awb:update'){
         rows[msg.awb.awb] = msg.awb;
-        renderAll();
+        scheduleRenderAll();
         // Keep the returns bar in sync without a full re-fetch: add/remove
         // this one row locally based on its current status.
         if (msg.awb.return_received || !isReturnStatus(msg.awb.sameday_status)) {
