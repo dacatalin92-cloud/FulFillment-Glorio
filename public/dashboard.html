@@ -199,6 +199,7 @@
     const tone = samedayTone(row.sameday_status, false) || 'pending';
     return `<span class="chip ${tone}" title="${escapeHtml(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
   }
+  function bucharestDay(iso){ return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }); }
   function ageHours(row){ return (Date.now() - new Date(row.awb_created_at).getTime()) / 3600000; }
   function ageChip(row){
     const h = ageHours(row);
@@ -212,21 +213,26 @@
   }
 
   // ---- Day selector ----------------------------------------------------
+  // Days here are PACK days (when parcels actually shipped), not AWB
+  // creation days — an AWB generated on the 5th but packed today belongs
+  // under today, and one generated today but not packed yet belongs under
+  // no day at all (it's still on the scanning station's picking list).
   const daySelect = document.getElementById('daySelect');
   async function loadDays(){
-    const res = await fetch('/api/days');
+    const res = await fetch('/api/packed-days');
     const data = await res.json();
     const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
     let days = data.days;
     if (!days.includes(today)) days = [today, ...days];
+    const prevValue = daySelect.value;
     daySelect.innerHTML = days.map(d => `<option value="${d}">${d === today ? d + ' (azi)' : d}</option>`).join('');
-    daySelect.value = currentDay || today;
+    daySelect.value = currentDay || prevValue || today;
   }
   daySelect.addEventListener('change', () => loadDay(daySelect.value));
 
   async function loadDay(day){
     currentDay = day;
-    const res = await fetch(`/api/day/${encodeURIComponent(day)}`);
+    const res = await fetch(`/api/packed-day/${encodeURIComponent(day)}`);
     const data = await res.json();
     rows = {};
     data.rows.forEach(r => { rows[r.awb] = r; });
@@ -241,6 +247,15 @@
     const res2 = await fetch('/api/unknown-returns');
     const data2 = await res2.json();
     document.getElementById('statUnknownReturns').textContent = data2.rows.length;
+  }
+
+  // ---- Unpacked count (global, not day-scoped — `rows` now only ever
+  // contains already-packed AWBs for the selected pack-day, so this has to
+  // come from its own endpoint) ------------------------------------------
+  async function loadUnpackedCount(){
+    const res = await fetch('/api/unpacked-count');
+    const data = await res.json();
+    document.getElementById('statUnpacked').textContent = data.count;
   }
 
   // ---- Return history (lazy-loaded on first open, then kept live) ---------
@@ -299,19 +314,21 @@
   // orders are a different concern, tracked live at the scanning station;
   // this dashboard view is deliberately "what already went out the door".
   function renderStats(){
-    const all = Object.values(rows).filter(r => !r.cancelled);
-    const packedList = all.filter(r => r.packed);
+    // `rows` is already scoped server-side to packed AWBs for the selected
+    // pack-day (see loadDay -> /api/packed-day/:day), so no packed/cancelled
+    // filtering is needed here anymore. "Încă neîmpachetate" is intentionally
+    // NOT derived from `rows` — see loadUnpackedCount(), a separate
+    // day-agnostic fetch, since an unpacked AWB never appears in `rows` now.
+    const packedList = Object.values(rows);
     const now = Date.now();
     const lastHour = packedList.filter(r => r.packed_at && now - new Date(r.packed_at).getTime() <= 3600000).length;
-    const unpacked = all.filter(r => !r.packed).length;
     const pickedUp = packedList.filter(isPickedUp).length;
     const totalValue = packedList.reduce((s,r) => s + (r.total || 0), 0);
     const totalCod = packedList.reduce((s,r) => s + (r.cod || 0), 0);
 
     document.getElementById('statTotal').textContent = packedList.length;
-    document.getElementById('statTotalSub').textContent = all.length ? `din ${all.length} total` : '';
+    document.getElementById('statTotalSub').textContent = '';
     document.getElementById('statLastHour').textContent = lastHour;
-    document.getElementById('statUnpacked').textContent = unpacked;
     document.getElementById('statPickedUp').textContent = pickedUp;
     document.getElementById('statTotalValue').textContent = fmtMoney(totalValue, 'RON');
     document.getElementById('statTotalCod').textContent = fmtMoney(totalCod, 'RON');
@@ -357,6 +374,7 @@
 
   function renderAll(){ renderStats(); renderTable(); }
   setInterval(renderAll, 15000); // keep countdown/age chips fresh even with no new events
+  setInterval(loadUnpackedCount, 30000); // cheap poll — WS updates also trigger it directly
 
   // Same reasoning as on the scanning station: a Sameday poll cycle broadcasts
   // one awb:update message PER AWB (190+ of them, nearly simultaneous) — calling
@@ -378,24 +396,32 @@
     ws.onerror = () => ws.close();
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
       if (msg.type === 'awb:new' || msg.type === 'awb:update'){
-        // Only merge live updates into the view if we're looking at today
-        // (new AWBs always belong to today; a status update for an older
-        // AWB simply won't match any row in `rows` and is a no-op).
-        if (currentDay === today || rows[msg.awb.awb]) {
+        // The view is scoped to a PACK day now, not an AWB-creation day, so
+        // membership can change on every update: an AWB just packed now
+        // belongs in `rows` if its pack-day matches what's on screen; one
+        // that's no longer packed (or was, but for a different day — e.g. a
+        // correction) has to be removed instead of just left stale.
+        const belongs = msg.awb.packed && !msg.awb.cancelled && msg.awb.packed_at
+          && bucharestDay(msg.awb.packed_at) === currentDay;
+        if (belongs) {
           rows[msg.awb.awb] = msg.awb;
           scheduleRenderAll();
-          loadDays();
+        } else if (rows[msg.awb.awb]) {
+          delete rows[msg.awb.awb];
+          scheduleRenderAll();
         }
+        loadDays();
+        loadUnpackedCount();
         loadReturnsCount();
         if (msg.awb.return_received && historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update' || msg.type === 'unknown-return:resolved'){
         loadReturnsCount();
         if (historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       } else if (msg.type === 'refresh'){
-        if (currentDay === today) loadDay(today);
+        loadDay(currentDay);
         loadDays();
+        loadUnpackedCount();
         loadReturnsCount();
         if (historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       }
@@ -405,6 +431,7 @@
   (async function init(){
     await loadDays();
     await loadDay(daySelect.value);
+    await loadUnpackedCount();
     await loadReturnsCount();
     connectWs();
   })();
