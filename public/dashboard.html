@@ -126,13 +126,12 @@
 </div>
 
 <div class="stats" id="stats">
-  <div class="stat-card"><div class="lbl">AWB-uri azi</div><div class="val" id="statTotal">—</div></div>
-  <div class="stat-card"><div class="lbl">Ultima oră</div><div class="val" id="statLastHour">—</div></div>
-  <div class="stat-card"><div class="lbl">Neîmpachetate</div><div class="val amber" id="statUnpacked">—</div></div>
+  <div class="stat-card"><div class="lbl">Împachetate / plecate</div><div class="val green" id="statTotal">—</div><div class="sub" id="statTotalSub"></div></div>
+  <div class="stat-card"><div class="lbl">Împachetate ultima oră</div><div class="val" id="statLastHour">—</div></div>
+  <div class="stat-card"><div class="lbl">Încă neîmpachetate</div><div class="val amber" id="statUnpacked">—</div><div class="sub">nu apar mai jos — vezi stația de scanare</div></div>
   <div class="stat-card"><div class="lbl">Ridicate de curier</div><div class="val green" id="statPickedUp">—</div></div>
-  <div class="stat-card"><div class="lbl">Până la ora 18:00</div><div class="val" id="statCountdown">—</div><div class="sub" id="statCountdownSub"></div></div>
-  <div class="stat-card"><div class="lbl">Valoare totală</div><div class="val" id="statTotalValue">—</div></div>
-  <div class="stat-card"><div class="lbl">Ramburs total</div><div class="val" id="statTotalCod">—</div></div>
+  <div class="stat-card"><div class="lbl">Valoare totală (împachetate)</div><div class="val" id="statTotalValue">—</div></div>
+  <div class="stat-card"><div class="lbl">Ramburs total (împachetate)</div><div class="val" id="statTotalCod">—</div></div>
   <div class="stat-card"><div class="lbl">Retururi în curs</div><div class="val red" id="statReturns">—</div><div class="sub">nu primite înapoi încă, orice zi</div></div>
   <div class="stat-card"><div class="lbl">Retururi neidentificate</div><div class="val red" id="statUnknownReturns">—</div><div class="sub">nu sunt în sistem — vezi stația de scanare</div></div>
 </div>
@@ -142,7 +141,6 @@
   <button class="filter-btn active" data-age="all">Toate</button>
   <button class="filter-btn" data-age="3">&gt; 3 ore</button>
   <button class="filter-btn" data-age="6">&gt; 6 ore</button>
-  <button class="filter-btn" data-packed="unpacked">Neîmpachetate</button>
 </div>
 
 <div class="history-section">
@@ -163,7 +161,7 @@
   <table>
     <thead><tr>
       <th>Comandă</th><th>Ora comenzii</th><th>Ora generării AWB</th><th>AWB</th>
-      <th>Valoare</th><th>Ramburs</th><th>Vârstă</th><th>Împachetat</th><th>Status Sameday</th><th>Notițe</th>
+      <th>Valoare</th><th>Ramburs</th><th>Vârstă</th><th>Ora împachetării</th><th>Status Sameday</th><th>Notițe</th>
     </tr></thead>
     <tbody id="tableBody"></tbody>
   </table>
@@ -174,7 +172,6 @@
   let rows = {};
   let currentDay = null;
   let ageFilter = 'all';
-  let packedFilter = 'all';
 
   function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
@@ -294,58 +291,41 @@
       renderTable();
     });
   });
-  const packedBtn = document.querySelector('.filter-btn[data-packed]');
-  packedBtn.addEventListener('click', () => {
-    packedFilter = packedFilter === 'all' ? 'unpacked' : 'all';
-    packedBtn.classList.toggle('active', packedFilter === 'unpacked');
-    renderTable();
-  });
   document.getElementById('searchInput').addEventListener('input', renderTable);
 
   // ---- Stats -------------------------------------------------------------
+  // Every total here is computed from PACKED (shipped) orders only for the
+  // selected day — same scope as the table below. Unpacked/in-progress
+  // orders are a different concern, tracked live at the scanning station;
+  // this dashboard view is deliberately "what already went out the door".
   function renderStats(){
-    const list = Object.values(rows).filter(r => !r.cancelled);
+    const all = Object.values(rows).filter(r => !r.cancelled);
+    const packedList = all.filter(r => r.packed);
     const now = Date.now();
-    const lastHour = list.filter(r => now - new Date(r.awb_created_at).getTime() <= 3600000).length;
-    const unpacked = list.filter(r => !r.packed).length;
-    const pickedUp = list.filter(isPickedUp).length;
-    const totalValue = list.reduce((s,r) => s + (r.total || 0), 0);
-    const totalCod = list.reduce((s,r) => s + (r.cod || 0), 0);
+    const lastHour = packedList.filter(r => r.packed_at && now - new Date(r.packed_at).getTime() <= 3600000).length;
+    const unpacked = all.filter(r => !r.packed).length;
+    const pickedUp = packedList.filter(isPickedUp).length;
+    const totalValue = packedList.reduce((s,r) => s + (r.total || 0), 0);
+    const totalCod = packedList.reduce((s,r) => s + (r.cod || 0), 0);
 
-    document.getElementById('statTotal').textContent = list.length;
+    document.getElementById('statTotal').textContent = packedList.length;
+    document.getElementById('statTotalSub').textContent = all.length ? `din ${all.length} total` : '';
     document.getElementById('statLastHour').textContent = lastHour;
     document.getElementById('statUnpacked').textContent = unpacked;
     document.getElementById('statPickedUp').textContent = pickedUp;
     document.getElementById('statTotalValue').textContent = fmtMoney(totalValue, 'RON');
     document.getElementById('statTotalCod').textContent = fmtMoney(totalCod, 'RON');
-
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
-    const cd = document.getElementById('statCountdown');
-    const sub = document.getElementById('statCountdownSub');
-    if (currentDay !== today) {
-      cd.textContent = '—'; sub.textContent = 'nu e ziua curentă';
-    } else {
-      const nowParts = new Date().toLocaleString('en-US', { timeZone: tz, hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit' });
-      const [h,m,s] = nowParts.split(':').map(Number);
-      const secsNow = h*3600 + m*60 + s;
-      const target = 18*3600;
-      const diff = target - secsNow;
-      if (diff <= 0) { cd.textContent = 'trecut'; sub.textContent = 'ora 18:00 a trecut'; }
-      else {
-        const hh = Math.floor(diff/3600), mm = Math.floor((diff%3600)/60);
-        cd.textContent = `${hh}h ${mm}m`;
-        sub.textContent = unpacked + ' neîmpachetate rămase';
-      }
-    }
   }
 
   // ---- Table ---------------------------------------------------------
+  // Only packed/shipped orders show here — anything still owed to a
+  // customer and not yet packed belongs to the scanning station's picking
+  // list, not this dashboard. Cancelled orders stay excluded too.
   const tableBody = document.getElementById('tableBody');
   function renderTable(){
     const q = document.getElementById('searchInput').value.trim().toLowerCase();
-    let list = Object.values(rows);
+    let list = Object.values(rows).filter(r => r.packed && !r.cancelled);
     if (ageFilter !== 'all') list = list.filter(r => ageHours(r) >= Number(ageFilter));
-    if (packedFilter === 'unpacked') list = list.filter(r => !r.packed);
     if (q) {
       list = list.filter(r => {
         const items = JSON.parse(r.items_json || '[]');
@@ -353,22 +333,22 @@
         return hay.includes(q);
       });
     }
-    list.sort((a,b) => b.awb_created_at.localeCompare(a.awb_created_at));
+    list.sort((a,b) => (b.packed_at || b.awb_created_at).localeCompare(a.packed_at || a.awb_created_at));
 
     if (!list.length){
-      tableBody.innerHTML = '<tr><td colspan="10" class="empty-row">Nicio comandă găsită.</td></tr>';
+      tableBody.innerHTML = '<tr><td colspan="10" class="empty-row">Nicio comandă împachetată încă pentru ziua asta.</td></tr>';
       return;
     }
     tableBody.innerHTML = list.map(row => `
-      <tr${row.cancelled ? ' style="opacity:0.55"' : ''}>
-        <td data-label="Comandă">${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}${!row.cancelled && !row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
+      <tr>
+        <td data-label="Comandă">${escapeHtml(row.order_name)}${!row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
         <td class="num" data-label="Ora comenzii">${fmtTime(row.order_created_at)}</td>
         <td class="num" data-label="Ora generării AWB">${fmtTime(row.awb_created_at)}</td>
         <td class="awb-cell" data-label="AWB">${escapeHtml(row.awb)}</td>
         <td class="num" data-label="Valoare">${fmtMoney(row.total, row.currency)}</td>
         <td class="num" data-label="Ramburs">${row.cod ? fmtMoney(row.cod, row.currency) : '—'}</td>
         <td data-label="Vârstă">${ageChip(row)}</td>
-        <td data-label="Împachetat"><span class="chip ${row.packed ? 'packed-yes' : 'packed-no'}">${row.packed ? '✓ Da' : 'Nu'}</span></td>
+        <td class="num" data-label="Ora împachetării">${fmtTime(row.packed_at)}</td>
         <td data-label="Status Sameday">${samedayChip(row)}</td>
         <td class="note-cell" data-label="Notițe">${escapeHtml(row.note || '')}</td>
       </tr>
