@@ -82,6 +82,34 @@
   .history-row .order-name{ flex:0 0 auto; font-weight:500; }
   .history-row .note-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.76rem; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .history-row .when{ flex:0 0 auto; font-family:"IBM Plex Mono", monospace; font-size:0.74rem; color:var(--text-dim); }
+
+  /* ---- Mobile ------------------------------------------------------------
+     Below ~700px the 10-column table stops being usable even with horizontal
+     scroll — each row becomes a stacked card instead, one labeled field per
+     line, using the same header text as the label (set as data-label on each
+     td by renderTable()). Everything else on the page (stat cards, filters,
+     history panels) already reflows via flex-wrap/grid, so this is the one
+     structural change needed for phones. */
+  @media (max-width: 700px){
+    .topbar{ padding:0.8rem 1rem; }
+    .stats{ padding:1rem; gap:0.6rem; }
+    .controls{ padding:0 1rem 0.9rem; }
+    .history-section{ margin:0 1rem 1.6rem; }
+    #searchInput, select#daySelect{ font-size:16px; } /* keeps iOS/Android from auto-zooming on focus */
+    .filter-btn{ padding:0.55rem 0.9rem; font-size:0.8rem; } /* bigger tap target */
+
+    .table-wrap{ padding:0 1rem 1.5rem; overflow-x:visible; }
+    table{ box-shadow:none; }
+    thead{ display:none; }
+    tbody, tr, td{ display:block; width:100%; }
+    tr{ background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); margin-bottom:0.7rem; padding:0.3rem 0; }
+    tr:last-child{ margin-bottom:0; }
+    td{ display:flex; align-items:flex-start; justify-content:space-between; gap:0.8rem; padding:0.4rem 0.8rem; border-bottom:1px dashed var(--border); text-align:right; }
+    td:last-child{ border-bottom:none; }
+    td::before{ content:attr(data-label); flex:0 0 auto; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-dim); text-align:left; padding-top:0.15rem; }
+    td.note-cell{ max-width:none; }
+    .empty-row{ padding:1.5rem 1rem; }
+  }
 </style>
 </head>
 <body>
@@ -333,22 +361,33 @@
     }
     tableBody.innerHTML = list.map(row => `
       <tr${row.cancelled ? ' style="opacity:0.55"' : ''}>
-        <td>${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}${!row.cancelled && !row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
-        <td class="num">${fmtTime(row.order_created_at)}</td>
-        <td class="num">${fmtTime(row.awb_created_at)}</td>
-        <td class="awb-cell">${escapeHtml(row.awb)}</td>
-        <td class="num">${fmtMoney(row.total, row.currency)}</td>
-        <td class="num">${row.cod ? fmtMoney(row.cod, row.currency) : '—'}</td>
-        <td>${ageChip(row)}</td>
-        <td><span class="chip ${row.packed ? 'packed-yes' : 'packed-no'}">${row.packed ? '✓ Da' : 'Nu'}</span></td>
-        <td>${samedayChip(row)}</td>
-        <td class="note-cell">${escapeHtml(row.note || '')}</td>
+        <td data-label="Comandă">${escapeHtml(row.order_name)}${row.cancelled ? ' <span class="chip crit">Anulată</span>' : ''}${!row.cancelled && !row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
+        <td class="num" data-label="Ora comenzii">${fmtTime(row.order_created_at)}</td>
+        <td class="num" data-label="Ora generării AWB">${fmtTime(row.awb_created_at)}</td>
+        <td class="awb-cell" data-label="AWB">${escapeHtml(row.awb)}</td>
+        <td class="num" data-label="Valoare">${fmtMoney(row.total, row.currency)}</td>
+        <td class="num" data-label="Ramburs">${row.cod ? fmtMoney(row.cod, row.currency) : '—'}</td>
+        <td data-label="Vârstă">${ageChip(row)}</td>
+        <td data-label="Împachetat"><span class="chip ${row.packed ? 'packed-yes' : 'packed-no'}">${row.packed ? '✓ Da' : 'Nu'}</span></td>
+        <td data-label="Status Sameday">${samedayChip(row)}</td>
+        <td class="note-cell" data-label="Notițe">${escapeHtml(row.note || '')}</td>
       </tr>
     `).join('');
   }
 
   function renderAll(){ renderStats(); renderTable(); }
   setInterval(renderAll, 15000); // keep countdown/age chips fresh even with no new events
+
+  // Same reasoning as on the scanning station: a Sameday poll cycle broadcasts
+  // one awb:update message PER AWB (190+ of them, nearly simultaneous) — calling
+  // renderAll() straight from each message rebuilds the whole table that many
+  // times in a couple of seconds. Coalescing avoids that, which matters even
+  // more on a phone's weaker CPU.
+  let renderAllTimer = null;
+  function scheduleRenderAll(){
+    if (renderAllTimer) return;
+    renderAllTimer = setTimeout(() => { renderAllTimer = null; renderAll(); }, 200);
+  }
 
   // ---- WebSocket live updates --------------------------------------------
   function connectWs(){
@@ -366,7 +405,7 @@
         // AWB simply won't match any row in `rows` and is a no-op).
         if (currentDay === today || rows[msg.awb.awb]) {
           rows[msg.awb.awb] = msg.awb;
-          renderAll();
+          scheduleRenderAll();
           loadDays();
         }
         loadReturnsCount();
