@@ -395,6 +395,76 @@ app.get('/admin/backfill-sameday-status', (req, res) => {
   });
 });
 
+// Backfill order_id on old AWB rows that predate order_id tracking. The
+// normal Shopify crawl (backfillToday/backfillRange) only sets order_id on
+// AWBs it's inserting for the FIRST time — it skips (`if (existing) continue`)
+// any AWB already present in the DB, so old rows stay with order_id = NULL
+// forever. That in turn makes /admin/reconcile-with-shopify skip them (no ID
+// to query Shopify with). This looks each one up by order_name instead
+// (which every row does have) and fills in order_id directly. Dry-run first,
+// same pattern as the other /admin/* routes. Usage:
+// /admin/backfill-order-ids?secret=...  (add &apply=1 once it looks right)
+async function backfillOrderIds(rows) {
+  const results = [];
+  for (const row of rows) {
+    try {
+      const orderId = await shopify.findOrderIdByName(row.order_name);
+      results.push({ awb: row.awb, order_name: row.order_name, orderId, action: orderId ? 'set' : 'not-found' });
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let backfillOrderIdsRunning = false;
+app.get('/admin/backfill-order-ids', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillOrderIdsRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-order-ids] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().filter((r) => !r.order_id).slice(0, limit);
+  backfillOrderIdsRunning = true;
+  (async () => {
+    try {
+      const results = await backfillOrderIds(rows);
+      const toSet = results.filter((r) => r.action === 'set');
+      const notFound = results.filter((r) => r.action === 'not-found');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[backfill-order-ids] scanned ${results.length} — ${toSet.length} found, ${notFound.length} not found, ${errors.length} errors`);
+      if (apply) {
+        toSet.forEach((r) => db.setOrderId(r.awb, r.orderId));
+        console.log(`[backfill-order-ids] applied — set order_id on ${toSet.length} AWB(s)`);
+      }
+      global.__lastBackfillOrderIdsResult = { apply, count: results.length, toSet, notFound, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[backfill-order-ids] failed', err);
+      global.__lastBackfillOrderIdsResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      backfillOrderIdsRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/backfill-order-ids-result?secret=... for the outcome, or watch Deploy Logs for [backfill-order-ids].',
+  });
+});
+
+app.get('/admin/backfill-order-ids-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
+});
+
 // Reconciliation against SHOPIFY itself (not Sameday) — for the specific
 // case of old backlog AWBs where Sameday's own status lookup comes back
 // empty/erroring (so /admin/reconcile-sameday and the status backfill have
