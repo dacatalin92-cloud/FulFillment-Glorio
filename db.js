@@ -128,6 +128,11 @@ const stmts = {
   // a since-cancelled AWB could still carry the bad packed flag.
   listAllPacked: db.prepare('SELECT * FROM awbs WHERE packed = 1'),
   resetPacked: db.prepare('UPDATE awbs SET packed = 0, packed_at = NULL, first_scan_at = NULL WHERE awb = ?'),
+  // Backfill support: old rows created before order_id tracking existed
+  // never get it filled in by the normal Shopify crawl (which skips AWBs
+  // that already exist in the DB) — this lets a one-off admin pass set it
+  // directly once looked up by order_name. See shopify.findOrderIdByName.
+  setOrderId: db.prepare('UPDATE awbs SET order_id = ? WHERE awb = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -356,4 +361,9 @@ function markPackedFromReconciliation(awb, whenIso) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation };
+function setOrderId(awb, orderId) {
+  stmts.setOrderId.run(orderId, awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId };
