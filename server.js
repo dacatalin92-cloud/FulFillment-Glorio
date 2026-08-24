@@ -657,27 +657,30 @@ app.post('/api/scan', (req, res) => {
   if (!code) return res.status(400).json({ error: 'missing code' });
   const row = db.findByCode(code);
   if (!row) return res.status(404).json({ found: false });
-  const result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
-  if (result.kind && result.kind !== 'already') {
-    broadcast({ type: 'awb:update', awb: result.row });
-  }
+  let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
   // First scan at the station → best-effort note+tag on the Shopify order.
-  // The note text is computed HERE (not inside shopify.js) so we can hand it
-  // straight back to the scan station in the response below, instantly —
-  // the actual write to Shopify still happens, but in the background
-  // (fire-and-forget), so a slow/failed Shopify call never blocks or breaks
-  // the scan itself.
-  let scanNote;
+  // The note text is computed HERE (not inside shopify.js) and saved onto
+  // the row itself (db.setScanNote) so it survives from the first scan all
+  // the way through the "packed" confirmation — staff often scan twice in
+  // under a second and never really see the intermediate "1/2" screen, so
+  // the note has to still be there on the final green "Împachetat" screen
+  // too, not just flash by once. The actual write to Shopify still happens,
+  // but in the background (fire-and-forget), so a slow/failed Shopify call
+  // never blocks or breaks the scan itself.
   if (result.kind === 'first' && result.row.order_id) {
     const stamp = new Date().toLocaleString('ro-RO', {
       timeZone: 'Europe/Bucharest',
       day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
     });
-    scanNote = `Scanat la depozit: ${stamp}`;
+    const scanNote = `Scanat la depozit: ${stamp}`;
+    result.row = db.setScanNote(result.row.awb, scanNote);
     shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, scanNote)
       .catch((err) => console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err));
   }
-  res.json({ found: true, kind: result.kind, row: result.row, scanNote });
+  if (result.kind && result.kind !== 'already') {
+    broadcast({ type: 'awb:update', awb: result.row });
+  }
+  res.json({ found: true, kind: result.kind, row: result.row });
 });
 
 app.post('/api/note', (req, res) => {
