@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raport AWB neîmpachetate</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#f4f5f7; margin:0; padding:20px; color:#1a1a1a; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#666; margin-bottom:20px; font-size:14px; }
+  .summary { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px; }
+  .card { background:#fff; border-radius:10px; padding:12px 16px; box-shadow:0 1px 3px rgba(0,0,0,.08); min-width:140px; cursor:pointer; border:2px solid transparent; }
+  .card.active { border-color:#2563eb; }
+  .card .num { font-size:24px; font-weight:700; }
+  .card .lbl { font-size:12px; color:#666; }
+  .card.necunoscut .num { color:#b45309; }
+  .card.anulat .num { color:#b91c1c; }
+  .card.ridicare .num { color:#0369a1; }
+  .card.ok .num { color:#15803d; }
+  .card.toate .num { color:#1a1a1a; }
+  table { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  th, td { text-align:left; padding:8px 10px; font-size:13px; border-bottom:1px solid #eee; }
+  th { background:#fafafa; position:sticky; top:0; font-weight:600; color:#444; }
+  tr:hover { background:#f9fafb; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+  .badge.necunoscut { background:#fef3c7; color:#92400e; }
+  .badge.anulat { background:#fee2e2; color:#991b1b; }
+  .badge.ridicare { background:#e0f2fe; color:#075985; }
+  .badge.ok { background:#dcfce7; color:#166534; }
+  .muted { color:#999; }
+  #loading { padding:40px; text-align:center; color:#888; }
+  .refresh { float:right; background:#2563eb; color:#fff; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:13px; }
+  input#search { padding:8px 10px; border:1px solid #ddd; border-radius:6px; width:220px; margin-bottom:12px; font-size:13px; }
+</style>
+</head>
+<body>
+  <h1>Raport AWB neîmpachetate <button class="refresh" onclick="load()">↻ Reîmprospătează</button></h1>
+  <div class="sub">Pagină de citire, generată din <code>/api/unpacked</code> — nu afectează scan.html.</div>
+  <div class="summary" id="summary"></div>
+  <input id="search" type="text" placeholder="Caută AWB sau comandă..." oninput="render()">
+  <div id="loading">Se încarcă...</div>
+  <table id="tbl" style="display:none">
+    <thead><tr><th>#</th><th>AWB</th><th>Comandă</th><th>Creat</th><th>Vechime</th><th>Status Sameday</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+<script>
+let rows = [];
+let filter = 'toate';
+
+function daysAgo(iso) {
+  const d = (Date.now() - new Date(iso).getTime()) / 86400000;
+  return Math.floor(d);
+}
+
+function categorize(row) {
+  const s = (row.sameday_status || '').toLowerCase();
+  if (!s) return 'necunoscut';
+  if (s.includes('anulat')) return 'anulat';
+  if (s.includes('ridicare') || s.includes('alocata')) return 'ridicare';
+  return 'ok';
+}
+
+const LABELS = { necunoscut: 'Status necunoscut (—)', anulat: 'Anulate la Sameday', ridicare: 'Așteaptă ridicare', ok: 'Alt status', toate: 'Toate' };
+
+async function load() {
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('tbl').style.display = 'none';
+  const res = await fetch('/api/unpacked');
+  const data = await res.json();
+  rows = data.rows.map(r => ({ ...r, category: categorize(r) })).sort((a,b) => new Date(a.awb_created_at) - new Date(b.awb_created_at));
+  renderSummary();
+  render();
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('tbl').style.display = 'table';
+}
+
+function renderSummary() {
+  const counts = { toate: rows.length, necunoscut: 0, anulat: 0, ridicare: 0, ok: 0 };
+  rows.forEach(r => counts[r.category]++);
+  const el = document.getElementById('summary');
+  el.innerHTML = Object.keys(counts).map(k =>
+    `<div class="card ${k} ${filter===k?'active':''}" onclick="filter='${k}';render()">
+      <div class="num">${counts[k]}</div>
+      <div class="lbl">${LABELS[k]}</div>
+    </div>`
+  ).join('');
+}
+
+function render() {
+  renderSummary();
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  let filtered = rows.filter(r => filter === 'toate' || r.category === filter);
+  if (q) filtered = filtered.filter(r => r.awb.toLowerCase().includes(q) || (r.order_name||'').toLowerCase().includes(q));
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = filtered.map((r, i) => `
+    <tr>
+      <td>${i+1}</td>
+      <td>${r.awb}</td>
+      <td>${r.order_name || '<span class="muted">—</span>'}</td>
+      <td>${new Date(r.awb_created_at).toLocaleDateString('ro-RO')}</td>
+      <td>${daysAgo(r.awb_created_at)} zile</td>
+      <td><span class="badge ${r.category}">${r.sameday_status || '—'}</span></td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">Nimic de afișat.</td></tr>';
+}
+
+load();
+</script>
+</body>
+</html>
