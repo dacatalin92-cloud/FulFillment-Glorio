@@ -43,6 +43,7 @@ for (const stmt of [
   'ALTER TABLE awbs ADD COLUMN return_received INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE awbs ADD COLUMN return_received_at TEXT',
   'ALTER TABLE awbs ADD COLUMN scan_note TEXT',
+  'ALTER TABLE awbs ADD COLUMN client_note TEXT',
 ]) {
   try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
 }
@@ -140,11 +141,17 @@ const stmts = {
   // staff scan twice in quick succession and never really see the
   // intermediate "1/2" screen it was first shown on.
   setScanNote: db.prepare('UPDATE awbs SET scan_note = ? WHERE awb = ?'),
+  // The customer's own order note, as it stood in Shopify at the moment we
+  // first looked (AWB creation, or opportunistically at first scan for
+  // older rows that predate this column) — kept SEPARATE from scan_note
+  // (our own "Scanat la depozit..." line) so packing staff can see the
+  // client's actual instructions distinctly from our own confirmation text.
+  setClientNote: db.prepare('UPDATE awbs SET client_note = ? WHERE awb = ? AND (client_note IS NULL OR client_note = \'\')'),
 };
 
 const upsertStmt = db.prepare(`
-INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id)
-VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id)
+INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id, client_note)
+VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id, @client_note)
 ON CONFLICT(awb) DO UPDATE SET
   order_name = excluded.order_name,
   order_created_at = excluded.order_created_at,
@@ -152,7 +159,8 @@ ON CONFLICT(awb) DO UPDATE SET
   total = excluded.total,
   currency = excluded.currency,
   items_json = excluded.items_json,
-  order_id = COALESCE(excluded.order_id, awbs.order_id)
+  order_id = COALESCE(excluded.order_id, awbs.order_id),
+  client_note = COALESCE(NULLIF(awbs.client_note, ''), excluded.client_note)
 `);
 
 function upsertAwb(rec) {
@@ -166,6 +174,7 @@ function upsertAwb(rec) {
     currency: rec.currency || 'RON',
     items_json: JSON.stringify(rec.items || []),
     order_id: rec.order_id ? String(rec.order_id) : null,
+    client_note: rec.client_note || '',
   });
   return getAwb(rec.awb);
 }
@@ -378,4 +387,13 @@ function setScanNote(awb, note) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote };
+// Only fills client_note if it's currently empty (see the guarded WHERE in
+// the prepared statement) — never overwrites a client note already on file
+// with something older/different.
+function setClientNoteIfEmpty(awb, note) {
+  if (!note) return getAwb(awb);
+  stmts.setClientNote.run(note, awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty };
