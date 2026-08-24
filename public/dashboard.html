@@ -219,6 +219,11 @@
   // no day at all (it's still on the scanning station's picking list).
   const daySelect = document.getElementById('daySelect');
   async function loadDays(){
+    // Never rebuild the <select> while the user has it focused/open — on
+    // mobile especially, replacing the options mid-tap closes the picker
+    // and drops the tap, which made the dropdown feel unusable during a
+    // Sameday poll burst (see scheduleSecondaryRefresh() below).
+    if (document.activeElement === daySelect) return;
     const res = await fetch('/api/packed-days');
     const data = await res.json();
     const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -387,6 +392,24 @@
     renderAllTimer = setTimeout(() => { renderAllTimer = null; renderAll(); }, 200);
   }
 
+  // Same storm, different symptom: loadDays()/loadUnpackedCount()/loadReturnsCount()
+  // each hit the server and loadDays() rebuilds the <select> options from
+  // scratch. Calling them straight from every awb:update message (190+ per
+  // poll cycle) was rebuilding the day dropdown out from under the user
+  // several times a second — which is why it couldn't be clicked/selected.
+  // Coalesced the same way as the table re-render, plus loadDays() itself
+  // skips rebuilding while the dropdown is focused (user mid-selection).
+  let secondaryRefreshTimer = null;
+  function scheduleSecondaryRefresh(){
+    if (secondaryRefreshTimer) return;
+    secondaryRefreshTimer = setTimeout(() => {
+      secondaryRefreshTimer = null;
+      loadDays();
+      loadUnpackedCount();
+      loadReturnsCount();
+    }, 400);
+  }
+
   // ---- WebSocket live updates --------------------------------------------
   function connectWs(){
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -411,18 +434,14 @@
           delete rows[msg.awb.awb];
           scheduleRenderAll();
         }
-        loadDays();
-        loadUnpackedCount();
-        loadReturnsCount();
+        scheduleSecondaryRefresh();
         if (msg.awb.return_received && historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update' || msg.type === 'unknown-return:resolved'){
         loadReturnsCount();
         if (historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       } else if (msg.type === 'refresh'){
         loadDay(currentDay);
-        loadDays();
-        loadUnpackedCount();
-        loadReturnsCount();
+        scheduleSecondaryRefresh();
         if (historyLoaded && historyPanels.classList.contains('open')) loadHistory();
       }
     };
