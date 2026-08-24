@@ -129,6 +129,7 @@ async function handleFulfillmentPayload(payload) {
     currency: order.currency,
     items: order.items,
     order_id: payload.order_id,
+    client_note: order.note,
   });
   broadcast({ type: 'awb:new', awb: row });
   console.log(`[webhook] new AWB ${awb} for ${order.name}`);
@@ -688,12 +689,12 @@ app.post('/api/scan', async (req, res) => {
   if (!row) return res.status(404).json({ found: false });
   let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
   // First scan at the station → note+tag on the Shopify order. We AWAIT the
-  // Shopify round-trip here (rather than fire-and-forget) because staff want
-  // to see the REAL, full content of the order's Note field on Shopify —
-  // including any older lines from previous scans or notes typed by hand —
-  // not just the one line we're adding right now. shopify.appendOrderScanNote
-  // returns that full merged text; if the Shopify call fails for any reason,
-  // we fall back to saving just our own line so the scan itself never breaks.
+  // Shopify round-trip here (rather than fire-and-forget) so we can capture
+  // the ORIGINAL note (the client's own instructions, if any — shown under
+  // the SKU on the packing screen, separate from our own confirmation line)
+  // and the full merged text actually saved to Shopify. If the Shopify call
+  // fails for any reason, we fall back to saving just our own line so the
+  // scan itself never breaks.
   if (result.kind === 'first' && result.row.order_id) {
     const stamp = new Date().toLocaleString('ro-RO', {
       timeZone: 'Europe/Bucharest',
@@ -701,8 +702,9 @@ app.post('/api/scan', async (req, res) => {
     });
     const line = `Scanat la depozit: ${stamp}`;
     try {
-      const fullNote = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
+      const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
       result.row = db.setScanNote(result.row.awb, fullNote);
+      if (originalNote) result.row = db.setClientNoteIfEmpty(result.row.awb, originalNote);
     } catch (err) {
       console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
       result.row = db.setScanNote(result.row.awb, line);
@@ -811,7 +813,7 @@ async function backfillToday() {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            id name createdAt updatedAt
+            id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
@@ -841,6 +843,7 @@ async function backfillToday() {
           total: parseFloat(o.totalPriceSet.shopMoney.amount),
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
@@ -875,7 +878,7 @@ async function backfillRange(daysBack, debug) {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            id name createdAt updatedAt
+            id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
@@ -908,6 +911,7 @@ async function backfillRange(daysBack, debug) {
           total: parseFloat(o.totalPriceSet.shopMoney.amount),
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
