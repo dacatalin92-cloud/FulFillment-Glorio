@@ -86,6 +86,12 @@ const stmts = {
   `),
   setFirstScan: db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?'),
   setPacked: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
+  // Used for the Sameday reconciliation pass — marks packed WITHOUT touching
+  // first_scan_at (unlike the old, removed setPackedFromCourier), so a
+  // reconciled row is never mistaken for a manually-scanned one again (see
+  // findFalsePackedCandidates, which fingerprints "auto" rows by
+  // first_scan_at === packed_at). Reconciled rows keep first_scan_at NULL.
+  setPackedFromReconciliation: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
   cancelledAwbsForOrder: db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0'),
   cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
   setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
@@ -111,6 +117,11 @@ const stmts = {
   // ISO timestamp and doing timezone-correct day-bucketing in SQL is fragile.
   listPackedRaw: db.prepare('SELECT * FROM awbs WHERE packed = 1 AND cancelled = 0'),
   countUnpacked: db.prepare('SELECT COUNT(*) AS c FROM awbs WHERE packed = 0 AND cancelled = 0'),
+  // Reconciliation candidates: everything still unpacked in this app. Some of
+  // these were genuinely packed and shipped through the other, older
+  // fulfillment process — for those, Sameday's status is the only source of
+  // truth, since no one will ever scan them at this app's station.
+  listUnpackedNotCancelled: db.prepare('SELECT * FROM awbs WHERE packed = 0 AND cancelled = 0'),
   // One-off cleanup support for the removed auto-pack-from-courier feature
   // (see server.js applySamedayUpdate) — finds/reverts AWBs it wrongly
   // marked packed. Includes cancelled rows too, unlike listPackedRaw, since
@@ -321,4 +332,28 @@ function resetFalsePacked(awbs) {
   });
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked };
+// All AWBs still unpacked in this app, for the reconciliation pass — the
+// actual "does Sameday's status mean it genuinely left?" judgment call and
+// the age-safety guard both live in server.js (reconcileWithSameday), since
+// that's where the Sameday status-text knowledge already lives; this just
+// hands back the full candidate pool.
+function listUnpackedNotCancelled() {
+  return stmts.listUnpackedNotCancelled.all();
+}
+
+// Marks an AWB packed from Sameday reconciliation — i.e. we never got (or
+// will never get) a manual scan for it, but Sameday's own tracking shows a
+// courier scan/pickup already happened, so it's certainly packed in
+// reality. Deliberately does NOT touch first_scan_at (stays NULL), unlike a
+// real scan-confirmed pack — that keeps this permanently distinguishable
+// from a genuine station scan, including from the old buggy auto-pack
+// fingerprint (first_scan_at === packed_at) that findFalsePackedCandidates
+// looks for.
+function markPackedFromReconciliation(awb, whenIso) {
+  const row = getAwb(awb);
+  if (!row || row.packed) return row;
+  stmts.setPackedFromReconciliation.run(whenIso, awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation };
