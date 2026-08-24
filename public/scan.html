@@ -155,7 +155,7 @@
     <span class="mark">Glorio</span>
     <span class="eyebrow">Stație scanare</span>
   </div>
-  <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi azi</span></div>
+  <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
 </div>
 
 <div class="returns-bar hidden" id="returnsBar">
@@ -283,14 +283,18 @@
     if (row.cancelled) return false;
     if (row.packed) return false;
     const tone = samedayTone(row.sameday_status, row.sameday_error);
-    if (tone === 'ok') return false;
+    // 'ok' = courier already has it (in transit/delivered/etc — nothing left
+    // to pack). 'crit' = Sameday itself shows the shipment cancelled — it's
+    // never going anywhere, so it doesn't belong on an actionable packing
+    // list either, even though nobody has touched our own `cancelled` flag.
+    if (tone === 'ok' || tone === 'crit') return false;
     return true;
   }
   function renderPicklist(){
     const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
     document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
     if (!list.length){
-      picklistBody.innerHTML = '<tr><td colspan="5" class="empty-row">Toate comenzile de azi sunt împachetate sau ridicate de curier. 🎉</td></tr>';
+      picklistBody.innerHTML = '<tr><td colspan="5" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
       return;
     }
     picklistBody.innerHTML = list.map(row => `
@@ -494,7 +498,7 @@
   setInterval(renderRegistry, 5000);
 
   function renderAll(){
-    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi azi';
+    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
     renderPicklist();
     renderRegistry();
     if (needsModal.classList.contains('open')) renderNeeds();
@@ -653,8 +657,11 @@
   });
 
   // ---- Initial load + WebSocket live updates ------------------------------
-  async function loadToday(){
-    const res = await fetch('/api/today');
+  // Loads EVERY AWB that's neither packed nor cancelled, regardless of when
+  // it was created — not just today's — so the picking list surfaces the
+  // whole backlog still owed to a courier, not only what printed today.
+  async function loadUnpacked(){
+    const res = await fetch('/api/unpacked');
     const data = await res.json();
     rows = {};
     data.rows.forEach(r => { rows[r.awb] = r; });
@@ -687,14 +694,14 @@
         delete unknownReturns[msg.entry.id];
         renderUnknownReturnsBar();
       } else if (msg.type === 'refresh'){
-        loadToday();
+        loadUnpacked();
         loadReturns();
         loadUnknownReturns();
       }
     };
   }
 
-  loadToday();
+  loadUnpacked();
   loadReturns();
   loadUnknownReturns();
   connectWs();
