@@ -42,6 +42,7 @@ for (const stmt of [
   'ALTER TABLE awbs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE awbs ADD COLUMN return_received INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE awbs ADD COLUMN return_received_at TEXT',
+  'ALTER TABLE awbs ADD COLUMN scan_note TEXT',
 ]) {
   try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
 }
@@ -133,6 +134,12 @@ const stmts = {
   // that already exist in the DB) — this lets a one-off admin pass set it
   // directly once looked up by order_name. See shopify.findOrderIdByName.
   setOrderId: db.prepare('UPDATE awbs SET order_id = ? WHERE awb = ?'),
+  // Persists the "Scanat la depozit: ..." line written to Shopify at first
+  // scan (see server.js /api/scan + shopify.appendOrderScanNote), so it's
+  // still visible on the "packed" (2nd scan) confirmation screen even when
+  // staff scan twice in quick succession and never really see the
+  // intermediate "1/2" screen it was first shown on.
+  setScanNote: db.prepare('UPDATE awbs SET scan_note = ? WHERE awb = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -366,4 +373,9 @@ function setOrderId(awb, orderId) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId };
+function setScanNote(awb, note) {
+  stmts.setScanNote.run(note, awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote };
