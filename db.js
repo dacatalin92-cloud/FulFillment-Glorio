@@ -86,10 +86,6 @@ const stmts = {
   `),
   setFirstScan: db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?'),
   setPacked: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
-  setPackedFromCourier: db.prepare(`
-    UPDATE awbs SET packed = 1, packed_at = ?, first_scan_at = COALESCE(first_scan_at, ?)
-    WHERE awb = ?
-  `),
   cancelledAwbsForOrder: db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0'),
   cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
   setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
@@ -109,6 +105,18 @@ const stmts = {
   resolveUnknownReturn: db.prepare('UPDATE unknown_returns SET resolved = 1, resolved_at = ? WHERE id = ?'),
   // History: unknown-return entries already resolved, most recent first.
   listResolvedUnknownReturns: db.prepare('SELECT * FROM unknown_returns WHERE resolved = 1 ORDER BY resolved_at DESC LIMIT 200'),
+  // Dashboard "packed/shipped" view is grouped by the day the parcel was
+  // actually PACKED (packed_at), not the day the AWB was generated (day).
+  // Grouping by Bucharest day happens in JS below since packed_at is a raw
+  // ISO timestamp and doing timezone-correct day-bucketing in SQL is fragile.
+  listPackedRaw: db.prepare('SELECT * FROM awbs WHERE packed = 1 AND cancelled = 0'),
+  countUnpacked: db.prepare('SELECT COUNT(*) AS c FROM awbs WHERE packed = 0 AND cancelled = 0'),
+  // One-off cleanup support for the removed auto-pack-from-courier feature
+  // (see server.js applySamedayUpdate) — finds/reverts AWBs it wrongly
+  // marked packed. Includes cancelled rows too, unlike listPackedRaw, since
+  // a since-cancelled AWB could still carry the bad packed flag.
+  listAllPacked: db.prepare('SELECT * FROM awbs WHERE packed = 1'),
+  resetPacked: db.prepare('UPDATE awbs SET packed = 0, packed_at = NULL, first_scan_at = NULL WHERE awb = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -176,18 +184,6 @@ function recordScan(awb, nowIso, packWindowMs) {
   }
   stmts.setFirstScan.run(nowIso, awb);
   return { found: true, row: getAwb(awb), kind: 'reset' };
-}
-
-// Called when Sameday's status shows the parcel has already left our
-// warehouse (picked up / in transit / delivered) — if we never got a manual
-// pack-confirmation scan for it, mark it packed anyway so it doesn't sit in
-// the picking list forever, and so a later accidental re-scan shows "already
-// packed" instead of trying to pack it a second time.
-function markPackedFromCourier(awb, whenIso) {
-  const row = getAwb(awb);
-  if (!row || row.packed) return row;
-  stmts.setPackedFromCourier.run(whenIso, whenIso, awb);
-  return getAwb(awb);
 }
 
 // Called from the orders/cancelled webhook. One order can (rarely) have more
@@ -274,4 +270,55 @@ function listResolvedUnknownReturns() {
   return stmts.listResolvedUnknownReturns.all();
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markPackedFromCourier, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns };
+// --- Dashboard "packed/shipped" view — grouped by PACK date, not AWB ------
+// creation date. An AWB generated on the 5th but scanned/packed today must
+// show up under today here, and an AWB generated today but not yet packed
+// must NOT show up under today — the opposite of scan.html's picking list,
+// which is intentionally grouped by AWB creation date instead.
+function listPackedDays() {
+  const days = new Set();
+  for (const row of stmts.listPackedRaw.all()) {
+    if (row.packed_at) days.add(bucharestDay(row.packed_at));
+  }
+  return Array.from(days).sort().reverse();
+}
+
+function listPackedForDay(day) {
+  return stmts.listPackedRaw.all()
+    .filter((row) => row.packed_at && bucharestDay(row.packed_at) === day)
+    .sort((a, b) => new Date(a.packed_at).getTime() - new Date(b.packed_at).getTime());
+}
+
+// Count of AWBs still not packed (and not cancelled) — used by the dashboard
+// stat card now that its main row-fetch is scoped to a single packed day and
+// can no longer be used to derive this count itself.
+function countUnpacked() {
+  return stmts.countUnpacked.get().c;
+}
+
+// One-off cleanup for the removed auto-pack-from-courier feature: it used to
+// set packed_at and first_scan_at to the EXACT SAME timestamp whenever it
+// marked an AWB packed without a real prior scan (see the old
+// setPackedFromCourier statement). A genuine manual pack confirmation always
+// has two distinct scans, so first_scan_at === packed_at is a reliable
+// fingerprint of "the system did this, not a person". Restricting to AWBs
+// packed shortly (maxAgeMinutes) after their own creation narrows this to
+// the specific incident reported — AWBs showing packed within moments of
+// printing the label — without touching older, unrelated packed rows.
+function findFalsePackedCandidates(maxAgeMinutes) {
+  const maxAgeMs = maxAgeMinutes * 60 * 1000;
+  return stmts.listAllPacked.all().filter((row) => {
+    if (!row.packed_at || !row.first_scan_at || row.packed_at !== row.first_scan_at) return false;
+    const ageMs = new Date(row.packed_at).getTime() - new Date(row.awb_created_at).getTime();
+    return ageMs >= 0 && ageMs <= maxAgeMs;
+  });
+}
+
+function resetFalsePacked(awbs) {
+  return awbs.map((awb) => {
+    stmts.resetPacked.run(awb);
+    return getAwb(awb);
+  });
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked };
