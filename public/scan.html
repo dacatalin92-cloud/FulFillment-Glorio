@@ -575,12 +575,13 @@
           <div class="order-tag">${escapeHtml(row.order_name)}</div>
           <div class="meta">AWB ${escapeHtml(row.awb)} · comandă ${fmtTime(row.order_created_at)} · AWB generat ${fmtTime(row.awb_created_at)}</div>
         </div>
-        ${items.map(it => `
+        ${items.map((it, idx) => `
           <div class="item-card">
             ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
             <div class="item-info">
               <p class="title">${escapeHtml(it.title)}</p>
               ${it.sku ? `<span class="sku">SKU: ${escapeHtml(it.sku)}</span>` : ''}
+              ${idx === 0 && row.client_note ? `<div style="margin-top:0.35rem; font-size:0.82rem; color:var(--amber); background:var(--amber-soft); border-radius:6px; padding:0.35rem 0.55rem;">💬 Notă client: ${escapeHtml(row.client_note).replace(/\n/g, '<br>')}</div>` : ''}
             </div>
             <div class="qty-badge"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
           </div>
