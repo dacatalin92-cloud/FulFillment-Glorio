@@ -465,16 +465,51 @@ app.get('/admin/backfill-order-ids-result', (req, res) => {
   res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
 });
 
+// Safety-net revert: undoes an incorrect "packed" mark for a specific list
+// of AWBs, given as a comma-separated query param. Built for the incident
+// where an earlier version of /admin/reconcile-with-shopify wrongly marked
+// recently-created (still awaiting courier pickup) AWBs as packed, based on
+// Shopify's displayFulfillmentStatus alone — see the correctness note above
+// reconcileWithShopify. Reuses db.resetPacked (packed=0, packed_at=NULL,
+// first_scan_at=NULL) — harmless for these rows since first_scan_at was
+// already NULL (they were reconciled, never manually scanned). Usage:
+// /admin/revert-packed?secret=...&awbs=AWB1,AWB2,...
+app.get('/admin/revert-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const awbs = String(req.query.awbs || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!awbs.length) return res.status(400).json({ error: 'missing awbs (comma-separated query param)' });
+  const before = awbs.map((awb) => db.getAwb(awb)).filter(Boolean);
+  const stillPacked = before.filter((r) => r.packed);
+  const updated = db.resetFalsePacked(stillPacked.map((r) => r.awb));
+  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+  res.json({ requested: awbs.length, found: before.length, reverted: updated.length, awbs: updated.map((r) => r.awb) });
+});
+
 // Reconciliation against SHOPIFY itself (not Sameday) — for the specific
 // case of old backlog AWBs where Sameday's own status lookup comes back
 // empty/erroring (so /admin/reconcile-sameday and the status backfill have
 // nothing to work with), but Shopify's order record already tells the truth:
 // either the order was cancelled (and our own `cancelled` flag never got set
-// because it predates the orders/cancelled webhook), or the order shows
-// FULFILLED — meaning a courier scan already happened somewhere, just not
-// through this app's own Sameday-status pipeline (e.g. shipped manually by
-// an operator under a different/legacy process). Same dry-run-first pattern
-// as the other /admin/reconcile-* routes. Usage:
+// because it predates the orders/cancelled webhook), or a genuinely SEPARATE
+// fulfillment (different tracking number) already went out through another
+// channel — see the correctness note below.
+// CORRECTNESS NOTE (learned the hard way): Shopify's displayFulfillmentStatus
+// turns "FULFILLED" the instant a fulfillment record with tracking exists —
+// i.e. the moment an AWB label is created, same trigger as our own
+// awb_created_at. It does NOT mean the courier physically picked it up. An
+// earlier version of this function used bare displayFulfillmentStatus to
+// decide "pack", which wrongly marked recently-created (still awaiting
+// pickup) AWBs as packed — the exact same false-positive shape as the
+// original incident this whole app was built to avoid. The only safe "pack"
+// signal from Shopify is a genuinely SEPARATE completed fulfillment: one
+// whose tracking number does NOT match the AWB we already have on file for
+// this row (proof a real, different shipment already went out, e.g. through
+// a manual/legacy process). A fulfillment carrying the SAME awb we're
+// already tracking tells us nothing new — Sameday's own live status is the
+// only trustworthy source for whether THAT specific AWB was picked up.
+// Same dry-run-first pattern as the other /admin/reconcile-* routes. Usage:
 // /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
 async function reconcileWithShopify(rows) {
   const results = [];
@@ -485,7 +520,7 @@ async function reconcileWithShopify(rows) {
     }
     try {
       const data = await shopify.shopifyGraphql(
-        `query($id: ID!) { order(id: $id) { cancelledAt displayFulfillmentStatus } }`,
+        `query($id: ID!) { order(id: $id) { cancelledAt fulfillments(first: 10) { status trackingInfo(first: 1) { number } } } }`,
         { id: `gid://shopify/Order/${row.order_id}` }
       );
       const o = data.order;
@@ -493,10 +528,17 @@ async function reconcileWithShopify(rows) {
         results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'order not found in Shopify' });
       } else if (o.cancelledAt) {
         results.push({ awb: row.awb, order_name: row.order_name, order_id: row.order_id, action: 'cancel', cancelledAt: o.cancelledAt });
-      } else if (o.displayFulfillmentStatus === 'FULFILLED') {
-        results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', displayFulfillmentStatus: o.displayFulfillmentStatus });
       } else {
-        results.push({ awb: row.awb, order_name: row.order_name, action: 'none', displayFulfillmentStatus: o.displayFulfillmentStatus });
+        const otherShipment = (o.fulfillments || []).find((f) => {
+          if (f.status !== 'SUCCESS') return false;
+          const num = f.trackingInfo && f.trackingInfo[0] && f.trackingInfo[0].number;
+          return num && num !== row.awb;
+        });
+        if (otherShipment) {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', otherTrackingNumber: otherShipment.trackingInfo[0].number });
+        } else {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'none' });
+        }
       }
     } catch (err) {
       results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
