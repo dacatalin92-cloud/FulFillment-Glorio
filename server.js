@@ -395,6 +395,103 @@ app.get('/admin/backfill-sameday-status', (req, res) => {
   });
 });
 
+// Reconciliation against SHOPIFY itself (not Sameday) — for the specific
+// case of old backlog AWBs where Sameday's own status lookup comes back
+// empty/erroring (so /admin/reconcile-sameday and the status backfill have
+// nothing to work with), but Shopify's order record already tells the truth:
+// either the order was cancelled (and our own `cancelled` flag never got set
+// because it predates the orders/cancelled webhook), or the order shows
+// FULFILLED — meaning a courier scan already happened somewhere, just not
+// through this app's own Sameday-status pipeline (e.g. shipped manually by
+// an operator under a different/legacy process). Same dry-run-first pattern
+// as the other /admin/reconcile-* routes. Usage:
+// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
+async function reconcileWithShopify(rows) {
+  const results = [];
+  for (const row of rows) {
+    if (!row.order_id) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'no order_id on this row' });
+      continue;
+    }
+    try {
+      const data = await shopify.shopifyGraphql(
+        `query($id: ID!) { order(id: $id) { cancelledAt displayFulfillmentStatus } }`,
+        { id: `gid://shopify/Order/${row.order_id}` }
+      );
+      const o = data.order;
+      if (!o) {
+        results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'order not found in Shopify' });
+      } else if (o.cancelledAt) {
+        results.push({ awb: row.awb, order_name: row.order_name, order_id: row.order_id, action: 'cancel', cancelledAt: o.cancelledAt });
+      } else if (o.displayFulfillmentStatus === 'FULFILLED') {
+        results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', displayFulfillmentStatus: o.displayFulfillmentStatus });
+      } else {
+        results.push({ awb: row.awb, order_name: row.order_name, action: 'none', displayFulfillmentStatus: o.displayFulfillmentStatus });
+      }
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let reconcileShopifyRunning = false;
+app.get('/admin/reconcile-with-shopify', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (reconcileShopifyRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [reconcile-shopify] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  reconcileShopifyRunning = true;
+  (async () => {
+    try {
+      const results = await reconcileWithShopify(rows);
+      const toCancel = results.filter((r) => r.action === 'cancel');
+      const toPack = results.filter((r) => r.action === 'pack');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[reconcile-shopify] scanned ${results.length} — ${toCancel.length} to cancel, ${toPack.length} to pack, ${errors.length} errors`);
+      if (apply) {
+        const cancelledOrderIds = new Set();
+        for (const r of toCancel) {
+          if (cancelledOrderIds.has(r.order_id)) continue;
+          cancelledOrderIds.add(r.order_id);
+          db.markOrderCancelled(r.order_id).forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+        }
+        for (const r of toPack) {
+          const row = db.markPackedFromReconciliation(r.awb, new Date().toISOString());
+          if (row) broadcast({ type: 'awb:update', awb: row });
+        }
+        console.log(`[reconcile-shopify] applied — cancelled ${cancelledOrderIds.size} order(s), packed ${toPack.length} AWB(s)`);
+      }
+      global.__lastReconcileShopifyResult = { apply, count: results.length, toCancel, toPack, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[reconcile-shopify] failed', err);
+      global.__lastReconcileShopifyResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      reconcileShopifyRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/reconcile-with-shopify-result?secret=... for the outcome, or watch Deploy Logs for [reconcile-shopify].',
+  });
+});
+
+app.get('/admin/reconcile-with-shopify-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
+});
+
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
