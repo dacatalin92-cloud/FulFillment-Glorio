@@ -151,10 +151,12 @@ async function findOrderIdByName(orderName) {
 //
 // The note LINE itself (e.g. "Scanat la depozit: 24.08.2026 14:32") is
 // computed by the CALLER (server.js), at the moment of the scan, and passed
-// in here as `line` — not generated inside this function. That's what lets
-// server.js hand the exact same text straight back to the scan station in
-// the HTTP response, instantly, instead of waiting on this Shopify
-// round-trip (which still runs, but in the background — see server.js).
+// in here as `line`. This function reads whatever is CURRENTLY in the
+// order's Note field on Shopify, appends the line, writes it back, and
+// returns the full resulting note text — so the scan station can show
+// staff exactly what's really in Shopify (including any older lines from
+// previous scans, or notes someone typed there by hand), not just the one
+// line we happen to be adding right now.
 const SCAN_TAG = 'scanat-depozit';
 async function appendOrderScanNote(orderGid, line) {
   const data = await shopifyGraphql(
@@ -162,7 +164,7 @@ async function appendOrderScanNote(orderGid, line) {
     { id: orderGid }
   );
   const o = data.order;
-  if (!o) return;
+  if (!o) return line; // order not found in Shopify — best-effort fallback
   const newNote = o.note ? `${o.note}\n${line}` : line;
   const tags = Array.isArray(o.tags) ? o.tags.slice() : [];
   if (!tags.includes(SCAN_TAG)) tags.push(SCAN_TAG);
@@ -172,6 +174,7 @@ async function appendOrderScanNote(orderGid, line) {
   );
   const errors = result.orderUpdate && result.orderUpdate.userErrors;
   if (errors && errors.length) throw new Error('orderUpdate userErrors: ' + JSON.stringify(errors));
+  return newNote;
 }
 
 module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote };
