@@ -249,6 +249,35 @@ app.get('/admin/secret-debug', (req, res) => {
   res.json(result);
 });
 
+// TEMPORARY diagnostic: pinpoints exactly why a given code does/doesn't
+// match a row — used to debug /api/lookup returning found:false for AWBs
+// that /api/scan clearly does find. Shows the raw char codes of the queried
+// string (catches invisible whitespace / lookalike characters that a
+// screenshot can't show), the exact-match result, the same findByCode()
+// logic /api/scan and /api/lookup both use, and any row whose awb merely
+// CONTAINS the tail of the queried code (catches base-vs-suffix mismatches).
+app.get('/admin/debug-awb', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const code = String(req.query.code || '');
+  if (!code) return res.status(400).json({ error: 'missing code query param' });
+  const exactMatch = db.getAwb(code);
+  const findByCodeResult = db.findByCode(code);
+  const tail = code.slice(-8);
+  const similarRows = db.db
+    .prepare('SELECT awb, order_name, scan_note, order_id, packed, cancelled FROM awbs WHERE awb LIKE ?')
+    .all(`%${tail}%`);
+  res.json({
+    queried: code,
+    queriedLength: code.length,
+    queriedCharCodes: Array.from(code).map((c) => c.charCodeAt(0)),
+    exactMatch,
+    findByCodeResult,
+    similarRows,
+  });
+});
+
 // One-time (or occasional) manual pull of older AWBs — the automatic
 // backfillToday() only ever looks at today. This brings AWBs from the last
 // N days into the new system, e.g. so anything still unpacked from before
