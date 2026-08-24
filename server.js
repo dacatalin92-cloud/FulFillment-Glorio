@@ -709,6 +709,18 @@ app.post('/api/scan', async (req, res) => {
       console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
       result.row = db.setScanNote(result.row.awb, line);
     }
+  } else if (result.row.order_id && !result.row.client_note) {
+    // Not the first scan — the client note can still be missing simply
+    // because it was typed into Shopify a few seconds AFTER the very first
+    // scan (appendOrderScanNote only ever reads once). Re-check on every
+    // subsequent scan, as long as we still don't have one saved, so timing
+    // no longer matters. Read-only, best-effort — never breaks the scan.
+    try {
+      const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+      if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+    } catch (err) {
+      console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
+    }
   }
   if (result.kind && result.kind !== 'already') {
     broadcast({ type: 'awb:update', awb: result.row });
