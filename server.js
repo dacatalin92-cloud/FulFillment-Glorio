@@ -492,9 +492,12 @@ app.get('/admin/revert-packed', (req, res) => {
 // empty/erroring (so /admin/reconcile-sameday and the status backfill have
 // nothing to work with), but Shopify's order record already tells the truth:
 // either the order was cancelled (and our own `cancelled` flag never got set
-// because it predates the orders/cancelled webhook), or a genuinely SEPARATE
-// fulfillment (different tracking number) already went out through another
-// channel — see the correctness note below.
+// because it predates the orders/cancelled webhook), or the order shows
+// FULFILLED — meaning a courier scan already happened somewhere, just not
+// through this app's own Sameday-status pipeline (e.g. shipped manually by
+// an operator under a different/legacy process). Same dry-run-first pattern
+// as the other /admin/reconcile-* routes. Usage:
+// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
 // CORRECTNESS NOTE (learned the hard way): Shopify's displayFulfillmentStatus
 // turns "FULFILLED" the instant a fulfillment record with tracking exists —
 // i.e. the moment an AWB label is created, same trigger as our own
@@ -509,8 +512,6 @@ app.get('/admin/revert-packed', (req, res) => {
 // a manual/legacy process). A fulfillment carrying the SAME awb we're
 // already tracking tells us nothing new — Sameday's own live status is the
 // only trustworthy source for whether THAT specific AWB was picked up.
-// Same dry-run-first pattern as the other /admin/reconcile-* routes. Usage:
-// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
 async function reconcileWithShopify(rows) {
   const results = [];
   for (const row of rows) {
@@ -659,6 +660,13 @@ app.post('/api/scan', (req, res) => {
   const result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
   if (result.kind && result.kind !== 'already') {
     broadcast({ type: 'awb:update', awb: result.row });
+  }
+  // First scan at the station → best-effort note+tag on the Shopify order.
+  // Fire-and-forget: never block the scan response on a Shopify round-trip,
+  // and a Shopify hiccup here must never make the scan itself look failed.
+  if (result.kind === 'first' && result.row.order_id) {
+    shopify.markOrderScanned(`gid://shopify/Order/${result.row.order_id}`)
+      .catch((err) => console.error('[shopify] markOrderScanned failed for', result.row.awb, err));
   }
   res.json({ found: true, kind: result.kind, row: result.row });
 });
