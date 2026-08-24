@@ -639,7 +639,8 @@
       rows[data.row.awb] = data.row;
       renderAll();
       if (data.kind === 'first'){
-        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".'));
+        const noteLine = data.scanNote ? `<br><span style="opacity:0.8">📝 Notă scrisă în Shopify: „${escapeHtml(data.scanNote)}"</span>` : '';
+        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'packed'){
         renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!'));
       } else if (data.kind === 'already'){
