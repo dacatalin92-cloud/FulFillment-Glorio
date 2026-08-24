@@ -321,6 +321,28 @@ function listPackedForDay(day) {
     .sort((a, b) => new Date(a.packed_at).getTime() - new Date(b.packed_at).getTime());
 }
 
+// Per-day summary for the dashboard's "câte se împachetează pe zi" list —
+// same PACK-day grouping as listPackedDays/listPackedForDay above (not AWB
+// creation date), but pre-aggregated server-side (count + value/COD sums)
+// instead of making the browser fetch every single day's full row list just
+// to add them up. Sorted newest day first, same as listPackedDays.
+function listPackedSummary() {
+  const byDay = new Map(); // day -> { day, count, totalValue, totalCod }
+  for (const row of stmts.listPackedRaw.all()) {
+    if (!row.packed_at) continue;
+    const day = bucharestDay(row.packed_at);
+    let bucket = byDay.get(day);
+    if (!bucket) {
+      bucket = { day, count: 0, totalValue: 0, totalCod: 0 };
+      byDay.set(day, bucket);
+    }
+    bucket.count += 1;
+    bucket.totalValue += row.total || 0;
+    bucket.totalCod += row.cod || 0;
+  }
+  return Array.from(byDay.values()).sort((a, b) => b.day.localeCompare(a.day));
+}
+
 // Count of AWBs still not packed (and not cancelled) — used by the dashboard
 // stat card now that its main row-fetch is scoped to a single packed day and
 // can no longer be used to derive this count itself.
@@ -396,4 +418,4 @@ function setClientNoteIfEmpty(awb, note) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty };
