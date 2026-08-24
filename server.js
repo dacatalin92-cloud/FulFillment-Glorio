@@ -339,6 +339,62 @@ app.get('/admin/reconcile-sameday', (req, res) => {
   }
 });
 
+// The live poller (see startPoller below) only checks Sameday status for
+// AWBs created today/yesterday — on purpose, so it doesn't hammer Sameday's
+// API with thousands of requests every 30s for orders that settled long ago.
+// The tradeoff: for AWBs older than that, sameday_status in the DB can be
+// stale or (for very old backlog) never fetched at all, so the cache-based
+// /admin/reconcile-sameday above has nothing to work with for them. This
+// does the same reconciliation but fetches a FRESH live status per AWB first
+// — same 200ms throttle as the poller — then feeds it through the same
+// applySamedayUpdate() used everywhere else, so the normal 30-min-age +
+// status rules still apply. Meant for the historical backlog, not routine
+// use. Runs in the background (the HTTP response returns immediately) since
+// a few thousand AWBs at ~200ms each can take several minutes — watch the
+// Deploy Logs for "[backfill-status]" progress lines. Usage:
+// /admin/backfill-sameday-status?secret=...&limit=3000
+let backfillStatusRunning = false;
+async function backfillSamedayStatusLive(rows) {
+  let ok = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      const status = await sameday.getStatus(row.awb);
+      applySamedayUpdate(row.awb, status);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.error(`[backfill-status] ${row.awb} failed`, err.message || err);
+    }
+    if ((ok + failed) % 100 === 0) {
+      console.log(`[backfill-status] progress ${ok + failed}/${rows.length} (${ok} ok, ${failed} failed)`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  console.log(`[backfill-status] done — ${ok} ok, ${failed} failed out of ${rows.length}`);
+}
+
+app.get('/admin/backfill-sameday-status', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillStatusRunning) {
+    return res.status(409).json({ error: 'a backfill is already running — check Deploy Logs for [backfill-status] progress' });
+  }
+  const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  backfillStatusRunning = true;
+  backfillSamedayStatusLive(rows).finally(() => {
+    backfillStatusRunning = false;
+  });
+  res.json({
+    started: true,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.2) / 60),
+    hint: 'Running in background — watch Deploy Logs for [backfill-status] lines, or just refresh the dashboard in a few minutes.',
+  });
+});
+
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
