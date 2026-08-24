@@ -426,6 +426,16 @@ app.get('/api/unpacked-count', (req, res) => {
   res.json({ count: db.countUnpacked() });
 });
 
+// Full list of every AWB that exists (has a printed label) but is neither
+// packed nor cancelled — across ALL days, not just today. This is the real
+// "still owed to a courier" backlog: unlike /api/today (which is scoped to
+// today's creation date, for the scan-station picking list), this covers
+// everything regardless of when the AWB was created.
+app.get('/api/unpacked', (req, res) => {
+  const rows = db.listUnpackedNotCancelled().sort((a, b) => new Date(a.awb_created_at) - new Date(b.awb_created_at));
+  res.json({ count: rows.length, rows });
+});
+
 app.get('/api/lookup/:code', (req, res) => {
   const row = db.findByCode(req.params.code);
   if (!row) return res.status(404).json({ found: false });
