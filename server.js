@@ -31,47 +31,20 @@ function broadcast(msg) {
   });
 }
 
-// Same "has it clearly left our warehouse?" read as the picking-list filter
-// in scan.html / dashboard.html (samedayTone) — kept in sync deliberately.
-// Sameday's real statuses (from observed data) only have two "still sitting
-// with us" states: "Alocata pentru ridicare" and "Ridicare ulterioara".
-// Anything past that — "Iesire din hub", "Ridicata de la client", transit,
-// delivered, etc. — means the courier already has it. Cancelled is the one
-// exception: it doesn't imply the parcel ever left.
-const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
-function samedayIndicatesPickedUp(status) {
-  const t = (status || '').toLowerCase();
-  if (!t) return false;
-  if (t.includes('anulat')) return false;
-  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
-}
-
-// Safety net for samedayIndicatesPickedUp()'s "fail-open" design: it treats
-// ANY status text it doesn't recognize as "already picked up" (only two
-// known phrases mean "still with us"). If Sameday ever returns a new/unknown
-// status for a freshly created AWB — which is exactly what happened, causing
-// every AWB to show as packed within seconds of printing the label — that
-// blacklist match fails and the AWB gets auto-marked packed immediately.
-// A courier physically cannot have picked up a parcel seconds after its AWB
-// was generated, so refuse to auto-pack anything younger than this, no
-// matter what status text comes back. This is a hard backstop independent of
-// whatever wording Sameday uses.
-const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 10 * 60 * 1000; // 10 minutes
-
-// Applies a fresh Sameday status to a row, auto-marking it packed if the
-// status shows the courier already has it (see markPackedFromCourier), then
-// broadcasts the final state once.
+// "packed" is a warehouse-floor fact — someone at the scanning station
+// physically confirmed the parcel is boxed and ready — and it must stay
+// completely independent of whatever Sameday's API reports. Sameday status
+// is informational only (shown as a chip, used for the "Ridicate de curier"
+// stat, flags returns), never a trigger for marking something packed. This
+// used to also auto-mark an AWB as packed when Sameday's status implied the
+// courier already had it, on the theory that a "missed" manual scan should
+// self-heal — but that conflated two unrelated concepts and caused every
+// freshly printed AWB to show as packed within seconds (Sameday's status
+// text for a new AWB didn't match the expected "still pending" phrases, so
+// it was read as "already picked up"). Removed entirely: packed now only
+// ever comes from db.recordScan(), i.e. an actual scan at the station.
 function applySamedayUpdate(awb, result) {
-  let row = db.updateSameday(awb, result);
-  if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
-    const ageMs = Date.now() - new Date(row.awb_created_at).getTime();
-    if (ageMs >= MIN_AWB_AGE_FOR_AUTO_PACK_MS) {
-      row = db.markPackedFromCourier(awb, row.sameday_checked_at || new Date().toISOString());
-      console.log(`[sameday] ${awb} marked packed automatically (courier status: ${row.sameday_status})`);
-    } else {
-      console.log(`[sameday] ${awb} looks picked-up per status "${row.sameday_status}" but is only ${Math.round(ageMs / 1000)}s old — skipping auto-pack (too soon to be real; likely an unrecognized status string)`);
-    }
-  }
+  const row = db.updateSameday(awb, result);
   broadcast({ type: 'awb:update', awb: row });
   return row;
 }
@@ -254,6 +227,39 @@ app.get('/admin/backfill-old', async (req, res) => {
     const added = debug ? result.added : result;
     if (added) broadcast({ type: 'refresh' });
     res.json(debug ? { ...result, days } : { added, days });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// One-off cleanup for the now-removed auto-pack-from-courier bug: some AWBs
+// got marked packed within moments of their label being printed, without
+// anyone actually scanning them (see db.js findFalsePackedCandidates for the
+// exact detection rule). Dry-run by default — lists what would be reset;
+// pass &apply=1 to actually reset them back to unpacked so they return to
+// the normal picking list. Usage: /admin/fix-false-packed?secret=...
+// (add &apply=1 once the dry-run list looks right; &maxAgeMin=N to widen/
+// narrow the "packed within N minutes of creation" window, default 15).
+app.get('/admin/fix-false-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const maxAgeMin = Math.max(1, Math.min(180, parseInt(req.query.maxAgeMin, 10) || 15));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = db.findFalsePackedCandidates(maxAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        maxAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to reset these to unpacked.',
+      });
+    }
+    const updated = db.resetFalsePacked(candidates.map((r) => r.awb));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, maxAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
