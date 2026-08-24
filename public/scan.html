@@ -638,15 +638,15 @@
       const data = await res.json();
       rows[data.row.awb] = data.row;
       renderAll();
+      const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă scrisă în Shopify: „${escapeHtml(data.row.scan_note)}"</span>` : '';
       if (data.kind === 'first'){
-        const noteLine = data.scanNote ? `<br><span style="opacity:0.8">📝 Notă scrisă în Shopify: „${escapeHtml(data.scanNote)}"</span>` : '';
         renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'packed'){
-        renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!'));
+        renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
       } else if (data.kind === 'already'){
-        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.`));
+        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
       } else if (data.kind === 'reset'){
-        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.'));
+        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
       } else if (data.kind === 'cancelled'){
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
       }
