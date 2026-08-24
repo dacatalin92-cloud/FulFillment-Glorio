@@ -706,15 +706,31 @@ app.post('/api/scan', async (req, res) => {
       result.row = db.setScanNote(result.row.awb, fullNote);
       if (originalNote) result.row = db.setClientNoteIfEmpty(result.row.awb, originalNote);
     } catch (err) {
+      // Can fail for reasons that have nothing to do with the note content —
+      // e.g. an order placed through a marketplace/POS-quick-sale channel
+      // needs a write scope (write_marketplace_orders / write_quick_sale)
+      // this app's token doesn't have, so the WRITE (our confirmation line +
+      // tag) is rejected even though nothing is actually wrong. When that
+      // happens we still don't want to lose the client's own note, so fall
+      // back to a plain READ (which doesn't need that extra scope) to at
+      // least capture it for display, even though our own line can't be
+      // written to Shopify for this order.
       console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
       result.row = db.setScanNote(result.row.awb, line);
+      try {
+        const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+        if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+      } catch (readErr) {
+        console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
+      }
     }
   } else if (result.row.order_id && !result.row.client_note) {
-    // Not the first scan — the client note can still be missing simply
-    // because it was typed into Shopify a few seconds AFTER the very first
-    // scan (appendOrderScanNote only ever reads once). Re-check on every
-    // subsequent scan, as long as we still don't have one saved, so timing
-    // no longer matters. Read-only, best-effort — never breaks the scan.
+    // Not the first scan (or already had order_id-less row) — the client
+    // note can still be missing simply because it was typed into Shopify
+    // a few seconds AFTER the very first scan (appendOrderScanNote only
+    // ever reads once). Re-check on every subsequent scan, as long as we
+    // still don't have one saved, so timing no longer matters. Read-only,
+    // best-effort — never breaks the scan if it fails.
     try {
       const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
       if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
