@@ -1,713 +1,976 @@
-<!DOCTYPE html>
-<html lang="ro">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stație scanare AWB Glorio</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
-<style>
-  :root{
-    --bg:#F6F4EF; --surface:#FFFFFF; --surface-2:#EFEBE2; --border:#DDD6C7;
-    --text:#232019; --text-dim:#6B6355; --accent:#0F6E5E; --accent-soft:#D9EEE8;
-    --amber:#B8722A; --amber-soft:#F5E4CE; --red:#B23A34; --red-soft:#F6DEDB;
-    --green:#2F7A4F; --green-soft:#DFEFE2;
-    --shadow: 0 1px 2px rgba(35,32,25,0.06), 0 8px 24px -12px rgba(35,32,25,0.12);
-  }
-  @media (prefers-color-scheme: dark){
-    :root:not([data-theme="light"]){
-      --bg:#171511; --surface:#1F1C17; --surface-2:#26221B; --border:#38332A;
-      --text:#EDE8DD; --text-dim:#A79E8C; --accent:#4FC3AA; --accent-soft:#1B3831;
-      --amber:#E0A05C; --amber-soft:#3A2E1B; --red:#E38079; --red-soft:#3D2320;
-      --green:#7FCB9A; --green-soft:#1E3625;
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const fetch = require('node-fetch');
+const { WebSocketServer } = require('ws');
+
+const db = require('./db');
+const sameday = require('./sameday');
+const shopify = require('./shopify');
+
+const PORT = process.env.PORT || 3000;
+const PACK_WINDOW_MS = 30000;
+// 5 seconds caused the server to crash-loop in production (a native SQLite
+// assertion, from creating/destroying prepared statements at very high
+// frequency — fixed separately in db.js by caching statements, but running
+// the poll near-continuously is still much heavier load than needed). 30
+// seconds is a safe middle ground: still 4x faster than the original 2
+// minutes, without hammering Sameday's API or the DB nonstop.
+const SAMEDAY_POLL_MS = 30 * 1000;
+const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+function broadcast(msg) {
+  const payload = JSON.stringify(msg);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) client.send(payload);
+  });
+}
+
+// "packed" is primarily a warehouse-floor fact confirmed by a scan at the
+// station — but not every order goes through this app's station. Some are
+// fulfilled through the older/other process, and for those Sameday's own
+// tracking is the only signal that they ever left the warehouse ("cele care
+// au ajuns sa aibe scan de la ei, au fost sigur impachetate"). So Sameday
+// status DOES get to mark something packed — just never instantly. Only two
+// real "still sitting with us" statuses exist; anything past that means a
+// courier scan happened.
+const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
+function samedayIndicatesPickedUp(status) {
+  const t = (status || '').toLowerCase();
+  if (!t) return false;
+  if (t.includes('anulat')) return false;
+  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
+}
+
+// The original incident: this same "picked up" check ran INSTANTLY, right
+// when the AWB was printed, and Sameday's status text for a brand-new label
+// didn't match the two known "still pending" phrases — so it read as
+// "already picked up" within seconds of printing. A courier physically
+// cannot pick something up seconds after the label exists, so nothing gets
+// auto-packed from Sameday status until it's had time to become real. This
+// is also what makes the live poller (every 30s, see startPoller below) a
+// standing reconciliation pass — old-process orders self-heal to packed as
+// soon as they age past this window and Sameday shows real movement.
+const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
+
+function applySamedayUpdate(awb, result) {
+  let row = db.updateSameday(awb, result);
+  if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
+    const ageMs = Date.now() - new Date(row.awb_created_at).getTime();
+    if (ageMs >= MIN_AWB_AGE_FOR_AUTO_PACK_MS) {
+      row = db.markPackedFromReconciliation(awb, row.sameday_checked_at || new Date().toISOString());
+      console.log(`[sameday] ${awb} reconciled as packed (courier status: ${row.sameday_status})`);
     }
   }
-  *{box-sizing:border-box;} html,body{height:100%;}
-  body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; display:flex; flex-direction:column; }
-  .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex:0 0 auto; }
-  .brand{ display:flex; align-items:baseline; gap:0.6rem; }
-  .brand .mark{ font-family:"Fraunces", serif; font-weight:700; font-size:1.15rem; }
-  .brand .eyebrow{ font-family:"IBM Plex Mono", monospace; font-size:0.72rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--accent); }
-  .count-pill{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; padding:0.3rem 0.8rem; }
-  .conn-dot{ width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; margin-right:0.4rem; background:var(--red); }
-  .conn-dot.live{ background:var(--green); }
+  broadcast({ type: 'awb:update', awb: row });
+  return row;
+}
 
-  .layout{ flex:1 1 auto; display:flex; min-height:0; }
-  .left-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--border); min-height:0; }
-  .right-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; min-height:0; }
-
-  .picklist{ flex:1 1 50%; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
-  .picklist.full-height{ flex:1 1 100%; border-bottom:none; }
-  .picklist-head{ display:flex; align-items:center; justify-content:space-between; gap:0.6rem; flex-wrap:wrap; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
-  .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
-  .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
-  table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
-  thead th{ position:sticky; top:0; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.4rem 1rem; border-bottom:1px solid var(--border); }
-  tbody td{ padding:0.38rem 1rem; border-bottom:1px solid var(--border); vertical-align:top; }
-  .awb-cell{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; white-space:nowrap; }
-  .empty-row{ padding:1.2rem 1.5rem; color:var(--text-dim); font-size:0.86rem; text-align:center; }
-
-  .note-input{ width:100%; font-family:inherit; font-size:0.8rem; padding:0.3rem 0.5rem; border-radius:6px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
-  .note-input:not(:placeholder-shown){ border-color:var(--amber); background:var(--amber-soft); }
-
-  .chip{ display:inline-flex; align-items:center; gap:0.3rem; font-size:0.72rem; font-weight:500; padding:0.18rem 0.5rem; border-radius:999px; white-space:nowrap; }
-  .chip.pending{ background:var(--surface-2); color:var(--text-dim); }
-  .chip.ok{ background:var(--green-soft); color:var(--green); }
-  .chip.warn{ background:var(--amber-soft); color:var(--amber); }
-  .chip.crit{ background:var(--red-soft); color:var(--red); }
-  .chip.age-ok{ background:var(--green-soft); color:var(--green); }
-  .chip.age-warn{ background:var(--amber-soft); color:var(--amber); }
-
-  .scan-input-wrap{ flex:0 0 auto; padding:1.1rem 1.5rem; border-bottom:1px solid var(--border); background:var(--surface); }
-  #scanInput{ width:100%; font-family:"IBM Plex Mono", monospace; font-size:1.4rem; padding:0.85rem 1.1rem; border-radius:10px; border:2px solid var(--accent); background:var(--surface-2); color:var(--text); outline:none; }
-  #scanInput::placeholder{ color:var(--text-dim); font-size:1.05rem; }
-
-  main{ flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding:2rem 1.5rem 1rem; overflow-y:auto; }
-  .idle{ margin-top:3rem; text-align:center; color:var(--text-dim); max-width:32ch; }
-  .idle .glyph{ font-size:2.6rem; margin-bottom:0.75rem; opacity:0.6; }
-  .idle h2{ font-family:"Fraunces", serif; font-weight:600; font-size:1.3rem; color:var(--text); margin:0 0 0.4rem; }
-
-  .result{ width:100%; max-width:760px; }
-  .result-head{ display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem; margin-bottom:1rem; }
-  .result-head .order-tag{ font-family:"Fraunces", serif; font-weight:600; font-size:1.6rem; }
-  .result-head .meta{ font-family:"IBM Plex Mono", monospace; font-size:0.82rem; color:var(--text-dim); }
-  .item-card{ display:flex; gap:1.1rem; background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.1rem; margin-bottom:0.9rem; box-shadow:var(--shadow); align-items:center; }
-  .item-card img{ width:108px; height:108px; object-fit:cover; border-radius:10px; background:var(--surface-2); flex:0 0 auto; border:1px solid var(--border); }
-  .item-info{ flex:1 1 auto; min-width:0; }
-  .item-info .title{ font-size:1.02rem; font-weight:500; line-height:1.35; margin:0 0 0.4rem; }
-  .item-info .sku{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); }
-  .qty-badge{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:12px; padding:0.6rem 1.1rem; min-width:64px; }
-  .qty-badge .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.7rem; line-height:1; }
-  .qty-badge .lbl{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.06em; margin-top:0.15rem; }
-  .total-bar{ display:flex; justify-content:space-between; align-items:center; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:0.7rem 1rem; margin-top:0.4rem; font-size:0.88rem; color:var(--text-dim); }
-  .total-bar b{ color:var(--text); font-family:"IBM Plex Mono", monospace; }
-
-  .not-found{ margin-top:2.5rem; text-align:center; max-width:36ch; }
-  .not-found .glyph{ font-size:2.6rem; margin-bottom:0.75rem; color:var(--red); }
-  .not-found h2{ font-family:"Fraunces", serif; font-weight:600; color:var(--red); margin:0 0 0.4rem; }
-  .not-found p{ color:var(--text-dim); font-size:0.92rem; line-height:1.5; }
-
-  .status-banner{ width:100%; max-width:760px; display:flex; align-items:center; gap:0.6rem; border-radius:10px; padding:0.7rem 1rem; margin-bottom:1rem; font-size:0.92rem; font-weight:500; }
-  .status-banner.packed{ background:var(--green-soft); color:var(--green); }
-  .status-banner.first{ background:var(--amber-soft); color:var(--amber); }
-  .status-banner.already{ background:var(--accent-soft); color:var(--accent); }
-  .status-banner.reset{ background:var(--red-soft); color:var(--red); }
-  .status-banner.cancelled{ background:var(--red-soft); color:var(--red); font-weight:700; }
-  .status-banner.returned{ background:var(--accent-soft); color:var(--accent); font-weight:700; }
-
-  .returns-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
-  .returns-bar.hidden{ display:none; }
-  .returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--amber); font-weight:600; font-size:0.88rem; }
-  .returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:180px; overflow-y:auto; }
-  .returns-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
-  .returns-row .order-name{ flex:0 0 auto; font-weight:500; }
-  .returns-row .status-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
-  .mark-received-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; }
-
-  .unknown-returns-bar{ flex:0 0 auto; background:var(--red-soft); border-bottom:1px solid var(--border); }
-  .unknown-returns-bar.hidden{ display:none; }
-  .unknown-returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--red); font-weight:600; font-size:0.88rem; }
-  .unknown-returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:220px; overflow-y:auto; }
-  .unknown-returns-row{ display:flex; align-items:center; gap:0.6rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
-  .unknown-returns-row .awb-cell{ flex:0 0 auto; }
-  .unknown-returns-row .scanned-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
-  .unknown-returns-row .note-input{ flex:1 1 auto; }
-  .resolve-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--green); background:var(--green-soft); color:var(--green); cursor:pointer; }
-
-  .scan-mode-row{ display:flex; gap:0.6rem; align-items:center; }
-  .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
-  .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
-
-  .needs-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; white-space:nowrap; }
-
-  .needs-modal{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; padding:0; }
-  .needs-modal.open{ display:flex; }
-  .needs-panel{ background:var(--surface); width:100%; height:100%; max-width:100%; display:flex; flex-direction:column; }
-  @media (min-width:640px){
-    .needs-panel{ width:min(560px, 92vw); height:min(88vh, 820px); border-radius:16px; box-shadow:var(--shadow); overflow:hidden; }
-  }
-  .needs-header{ flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:0.6rem; padding:1rem 1.1rem; border-bottom:1px solid var(--border); background:var(--surface); }
-  .needs-header h3{ font-family:"Fraunces", serif; font-size:1.05rem; font-weight:600; margin:0; }
-  .needs-close{ flex:0 0 auto; font-family:inherit; font-size:1.3rem; line-height:1; padding:0.4rem 0.65rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); cursor:pointer; }
-  .needs-list{ flex:1 1 auto; overflow-y:auto; padding:0.6rem; }
-  .needs-row{ display:flex; align-items:center; gap:0.9rem; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:0.7rem; margin-bottom:0.6rem; }
-  .needs-row img{ width:56px; height:56px; object-fit:cover; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
-  .needs-row .img-placeholder{ width:56px; height:56px; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
-  .needs-row .needs-title{ flex:1 1 auto; min-width:0; font-size:0.92rem; line-height:1.3; }
-  .needs-row .needs-qty{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:10px; padding:0.4rem 0.8rem; min-width:48px; }
-  .needs-row .needs-qty .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.3rem; line-height:1; }
-  .needs-row .needs-qty .lbl{ font-size:0.6rem; text-transform:uppercase; letter-spacing:0.05em; margin-top:0.1rem; }
-
-  .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
-  .registry.hidden{ display:none; }
-  .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
-  .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
-  .registry-stats{ display:flex; gap:0.5rem; font-family:"IBM Plex Mono", monospace; font-size:0.76rem; }
-  .registry-stats .pill{ border-radius:999px; padding:0.22rem 0.65rem; border:1px solid var(--border); }
-  .registry-stats .pill.packed{ background:var(--green-soft); color:var(--green); border-color:transparent; }
-  .registry-stats .pill.pending{ background:var(--amber-soft); color:var(--amber); border-color:transparent; }
-  .registry-scroll{ overflow-y:auto; flex:1 1 auto; }
-</style>
-</head>
-<body>
-
-<div class="topbar">
-  <div class="brand">
-    <span class="mark">Glorio</span>
-    <span class="eyebrow">Stație scanare</span>
-  </div>
-  <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
-</div>
-
-<div class="returns-bar hidden" id="returnsBar">
-  <div class="returns-bar-head" id="returnsBarHead">
-    <span>🔄 <span id="returnsCount">0</span> retur(uri) de gestionat — click pentru listă</span>
-  </div>
-  <div class="returns-list" id="returnsList" style="display:none;"></div>
-</div>
-
-<div class="unknown-returns-bar hidden" id="unknownReturnsBar">
-  <div class="unknown-returns-bar-head" id="unknownReturnsBarHead">
-    <span>⚠️ <span id="unknownReturnsCount">0</span> retur(uri) neidentificate (nu sunt în sistem) — click pentru listă</span>
-  </div>
-  <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
-</div>
-
-<div class="layout">
-  <div class="left-panel">
-    <div class="picklist">
-      <div class="picklist-head">
-        <h3>De pregătit pentru curier</h3>
-        <button type="button" class="needs-btn" id="needsBtn">📋 Necesar produse</button>
-        <span class="count-pill" id="picklistCount">0 comenzi</span>
-      </div>
-      <div class="picklist-scroll">
-        <table>
-          <thead><tr><th>#</th><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
-          <tbody id="picklistBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="registry">
-      <div class="registry-head">
-        <h3>Registru scanare — azi</h3>
-        <div class="registry-stats">
-          <span class="pill packed" id="packedCount">0 împachetate</span>
-          <span class="pill pending" id="pendingCount">0 în așteptare</span>
-        </div>
-      </div>
-      <div class="registry-scroll">
-        <table>
-          <thead><tr><th>AWB</th><th>Comandă</th><th>Prima scanare</th><th>Status</th><th>Confirmat la</th><th>Notițe</th></tr></thead>
-          <tbody id="registryBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <div class="right-panel">
-    <div class="scan-input-wrap">
-      <div class="scan-mode-row">
-        <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
-          placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
-        <button type="button" class="mode-toggle" id="returnModeBtn">🔄 Scanează retur primit</button>
-      </div>
-    </div>
-
-    <main id="main">
-      <div class="idle" id="idleState">
-        <div class="glyph">📦</div>
-        <h2>Gata de scanare</h2>
-        <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
-      </div>
-    </main>
-  </div>
-</div>
-
-<div class="needs-modal" id="needsModal">
-  <div class="needs-panel">
-    <div class="needs-header">
-      <h3>📋 Necesar produse — <span id="needsSubcount">0</span> comenzi neîmpachetate</h3>
-      <button type="button" class="needs-close" id="needsCloseBtn" aria-label="Închide">✕</button>
-    </div>
-    <div class="needs-list" id="needsList"></div>
-  </div>
-</div>
-
-<script>
-  const tz = 'Europe/Bucharest';
-  const REGISTRY_HIDE_AFTER_MS = 60000;
-  let rows = {}; // awb -> row object, current in-memory state
-  let returnRows = {}; // awb -> row object, AWBs Sameday shows as "in return" and not yet confirmed received
-  let unknownReturns = {}; // id -> entry, return-mode scans that matched no known AWB at all
-  let returnMode = false; // when true, the scan input confirms return receipt instead of packing
-
-  function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
-  function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  function escapeAttr(s){ return escapeHtml(s); }
-
-  // Sameday's real statuses only have two "still sitting with us" states:
-  // "Alocata pentru ridicare" and "Ridicare ulterioara". Anything past that
-  // (Iesire din hub, Ridicata de la client, tranzit, livrat, etc.) means the
-  // courier already has it. Cancelled is the one exception — it doesn't
-  // imply the parcel ever left.
-  const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
-  function samedayTone(status, err){
-    if (err) return null;
-    const t = (status || '').toLowerCase();
-    if (!t) return null;
-    if (t.includes('anulat')) return 'crit';
-    if (PENDING_PICKUP_PHRASES.some(p => t.includes(p))) return 'warn';
-    return 'ok';
-  }
-
-  function isReturnStatus(status){
-    return (status || '').toLowerCase().includes('retur');
-  }
-
-  function samedayChip(row){
-    if (row.sameday_error) return '<span class="chip pending">Eroare API</span>';
-    if (!row.sameday_status) return '<span class="chip pending">—</span>';
-    const tone = samedayTone(row.sameday_status, false) || 'pending';
-    return `<span class="chip ${tone}" title="${escapeAttr(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
-  }
-
-  function productsText(row){
-    const items = JSON.parse(row.items_json || '[]');
-    return items.map(it => `${it.qty}× ${escapeHtml(it.title)}`).join(', ') || '—';
-  }
-
-  // ---- Picking list --------------------------------------------------
-  const picklistBody = document.getElementById('picklistBody');
-  function isPickable(row){
-    if (row.cancelled) return false;
-    if (row.packed) return false;
-    const tone = samedayTone(row.sameday_status, row.sameday_error);
-    // 'ok' = courier already has it (in transit/delivered/etc — nothing left
-    // to pack). 'crit' = Sameday itself shows the shipment cancelled — it's
-    // never going anywhere, so it doesn't belong on an actionable packing
-    // list either, even though nobody has touched our own `cancelled` flag.
-    if (tone === 'ok' || tone === 'crit') return false;
-    return true;
-  }
-  function renderPicklist(){
-    const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
-    document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
-    if (!list.length){
-      picklistBody.innerHTML = '<tr><td colspan="6" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
-      return;
-    }
-    picklistBody.innerHTML = list.map((row, i) => `
-      <tr data-awb="${escapeAttr(row.awb)}">
-        <td>${i + 1}</td>
-        <td>${escapeHtml(row.order_name)}</td>
-        <td class="awb-cell">${escapeHtml(row.awb)}</td>
-        <td>${productsText(row)}</td>
-        <td>${samedayChip(row)}</td>
-        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
-      </tr>
-    `).join('');
-  }
-
-  // ---- Returns ---------------------------------------------------------
-  // Loaded separately from `rows` (which only ever holds today's AWBs) —
-  // a return can land days after the AWB was originally created, so this
-  // tracks its own state across the full history, kept in sync via
-  // /api/returns on load/refresh and updated incrementally from WebSocket
-  // awb:update messages (see connectWs below).
-  const returnsBar = document.getElementById('returnsBar');
-  const returnsList = document.getElementById('returnsList');
-  async function loadReturns(){
-    const res = await fetch('/api/returns');
-    const data = await res.json();
-    returnRows = {};
-    data.rows.forEach(r => { returnRows[r.awb] = r; });
-    renderReturnsBar();
-  }
-  function renderReturnsBar(){
-    const list = Object.values(returnRows);
-    document.getElementById('returnsCount').textContent = list.length;
-    returnsBar.classList.toggle('hidden', list.length === 0);
-    returnsList.innerHTML = list.map(row => `
-      <div class="returns-row">
-        <span class="awb-cell">${escapeHtml(row.awb)}</span>
-        <span class="order-name">${escapeHtml(row.order_name)}</span>
-        <span class="status-txt">${escapeHtml(row.sameday_status || '')}</span>
-        <button type="button" class="mark-received-btn" data-awb="${escapeAttr(row.awb)}">✅ Am primit-o</button>
-      </div>
-    `).join('');
-  }
-  document.getElementById('returnsBarHead').addEventListener('click', () => {
-    returnsList.style.display = returnsList.style.display === 'none' ? 'flex' : 'none';
+// On-demand version of the same reconciliation the live poller does
+// gradually — sweeps every currently-unpacked AWB against its last-known
+// Sameday status right now, for catching up a backlog immediately (e.g.
+// right after the false-packed cleanup) instead of waiting on the 30s
+// poller to cycle through all of them. Uses the cached sameday_status
+// already in the DB rather than hitting Sameday's API again — that column
+// is kept fresh by the poller regardless.
+function reconcileWithSameday(minAgeMinutes) {
+  const minAgeMs = minAgeMinutes * 60 * 1000;
+  const now = Date.now();
+  return db.listUnpackedNotCancelled().filter((row) => {
+    if (!samedayIndicatesPickedUp(row.sameday_status)) return false;
+    return now - new Date(row.awb_created_at).getTime() >= minAgeMs;
   });
-  document.addEventListener('click', async (e) => {
-    if (e.target.classList.contains('mark-received-btn')){
-      const awb = e.target.dataset.awb;
-      try {
-        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code: awb }) });
-        const data = await res.json();
-        if (data.found){
-          delete returnRows[awb];
-          renderReturnsBar();
-        }
-      } catch (err) { console.error('mark return received failed', err); }
-    }
-  });
+}
 
-  // ---- Unknown returns ---------------------------------------------------
-  // Return-mode scans that matched no AWB in the system at all — a box from
-  // another channel, a much older order, a typo, a damaged label. These
-  // can't be tied to an order, so they're tracked separately and need a
-  // human to go figure out what they actually are.
-  const unknownReturnsBar = document.getElementById('unknownReturnsBar');
-  const unknownReturnsList = document.getElementById('unknownReturnsList');
-  async function loadUnknownReturns(){
-    const res = await fetch('/api/unknown-returns');
-    const data = await res.json();
-    unknownReturns = {};
-    data.rows.forEach(r => { unknownReturns[r.id] = r; });
-    renderUnknownReturnsBar();
-  }
-  function renderUnknownReturnsBar(){
-    const list = Object.values(unknownReturns).sort((a,b) => b.scanned_at.localeCompare(a.scanned_at));
-    document.getElementById('unknownReturnsCount').textContent = list.length;
-    unknownReturnsBar.classList.toggle('hidden', list.length === 0);
-    unknownReturnsList.innerHTML = list.map(entry => `
-      <div class="unknown-returns-row" data-id="${entry.id}">
-        <span class="awb-cell">${escapeHtml(entry.code)}</span>
-        <span class="scanned-at">${fmtTime(entry.scanned_at)}</span>
-        <input type="text" class="note-input" data-unknown-id="${entry.id}" placeholder="Ce e coletul ăsta?…" value="${escapeAttr(entry.note || '')}">
-        <button type="button" class="resolve-btn" data-id="${entry.id}">✅ Rezolvat</button>
-      </div>
-    `).join('');
-  }
-  document.getElementById('unknownReturnsBarHead').addEventListener('click', () => {
-    unknownReturnsList.style.display = unknownReturnsList.style.display === 'none' ? 'flex' : 'none';
-  });
-  document.addEventListener('change', async e => {
-    if (e.target.dataset.unknownId){
-      const id = e.target.dataset.unknownId;
-      try {
-        await fetch(`/api/unknown-returns/${id}/note`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ note: e.target.value }) });
-      } catch (err) { console.error('unknown-return note save failed', err); }
-    }
-  });
-  document.addEventListener('click', async e => {
-    if (e.target.classList.contains('resolve-btn')){
-      const id = e.target.dataset.id;
-      try {
-        await fetch(`/api/unknown-returns/${id}/resolve`, { method:'POST' });
-        delete unknownReturns[id];
-        renderUnknownReturnsBar();
-      } catch (err) { console.error('resolve unknown return failed', err); }
-    }
-  });
-
-  // ---- Product needs (aggregated across all unpacked orders) --------------
-  // Same base set as the picking list (isPickable) — everything still owed
-  // to a customer that hasn't left the warehouse yet — summed by product so
-  // whoever is picking stock can grab it all in one pass instead of walking
-  // the shelves once per order.
-  const needsModal = document.getElementById('needsModal');
-  const needsList = document.getElementById('needsList');
-  const needsSubcount = document.getElementById('needsSubcount');
-  function computeProductNeeds(){
-    const list = Object.values(rows).filter(isPickable);
-    const agg = new Map(); // key -> { title, img, qty }
-    list.forEach(row => {
-      const items = JSON.parse(row.items_json || '[]');
-      items.forEach(it => {
-        const key = (it.sku && it.sku.trim()) || it.title;
-        const existing = agg.get(key);
-        if (existing) {
-          existing.qty += it.qty;
-          if (!existing.img && it.img) existing.img = it.img;
-        } else {
-          agg.set(key, { title: it.title, img: it.img || null, qty: it.qty });
-        }
-      });
-    });
-    return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
-  }
-  function renderNeeds(){
-    const { orderCount, items } = computeProductNeeds();
-    needsSubcount.textContent = orderCount;
-    if (!items.length){
-      needsList.innerHTML = '<div class="empty-row">Nimic de pregătit — toate comenzile sunt împachetate sau ridicate. 🎉</div>';
-      return;
-    }
-    needsList.innerHTML = items.map(it => `
-      <div class="needs-row">
-        ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}</div>
-        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
-      </div>
-    `).join('');
-  }
-  document.getElementById('needsBtn').addEventListener('click', () => {
-    renderNeeds();
-    needsModal.classList.add('open');
-  });
-  document.getElementById('needsCloseBtn').addEventListener('click', () => {
-    needsModal.classList.remove('open');
-  });
-  needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
-
-  // ---- Registry --------------------------------------------------------
-  // Only useful while the warehouse is actually staffed — outside 08:00-18:00
-  // (Bucharest time) we hide it and let the picking list use the full column,
-  // instead of re-rendering a table nobody is looking at.
-  const registryPanel = document.querySelector('.registry');
-  const picklistPanel = document.querySelector('.picklist');
-  function isWorkHours(){
-    const h = Number(new Date().toLocaleString('en-US', { timeZone: tz, hour12:false, hour:'2-digit' }));
-    return h >= 8 && h < 18;
-  }
-  const registryBody = document.getElementById('registryBody');
-  function renderRegistry(){
-    if (!isWorkHours()){
-      registryPanel.classList.add('hidden');
-      picklistPanel.classList.add('full-height');
-      return;
-    }
-    registryPanel.classList.remove('hidden');
-    picklistPanel.classList.remove('full-height');
-    const now = Date.now();
-    const scanned = Object.values(rows)
-      .filter(r => r.first_scan_at)
-      .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
-    let packed = 0, pending = 0;
-    const visibleRows = [];
-    scanned.forEach(row => {
-      if (row.packed) packed++; else pending++;
-      const age = now - new Date(row.first_scan_at).getTime();
-      if (row.packed || age <= REGISTRY_HIDE_AFTER_MS) visibleRows.push(row);
-    });
-    document.getElementById('packedCount').textContent = packed + ' împachetate';
-    document.getElementById('pendingCount').textContent = pending + ' în așteptare';
-    registryBody.innerHTML = visibleRows.map(row => `
-      <tr data-awb="${escapeAttr(row.awb)}">
-        <td class="awb-cell">${escapeHtml(row.awb)}</td>
-        <td>${escapeHtml(row.order_name)}</td>
-        <td>${fmtTime(row.first_scan_at)}</td>
-        <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
-        <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
-        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
-      </tr>
-    `).join('');
-  }
-  setInterval(renderRegistry, 5000);
-
-  function renderAll(){
-    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
-    renderPicklist();
-    renderRegistry();
-    if (needsModal.classList.contains('open')) renderNeeds();
-  }
-
-  // Every ~30s Sameday poll cycle broadcasts one awb:update message PER AWB
-  // (190+ of them, arriving almost simultaneously) — calling renderAll()
-  // straight from each message rebuilds the entire picking list + registry
-  // table that many times in a couple of seconds, which is what was causing
-  // the page to feel laggy. This coalesces any burst of messages arriving
-  // within the same short window into a single re-render.
-  let renderAllTimer = null;
-  function scheduleRenderAll(){
-    if (renderAllTimer) return;
-    renderAllTimer = setTimeout(() => { renderAllTimer = null; renderAll(); }, 200);
-  }
-
-  // ---- Notes: change/Enter → POST /api/note ------------------------------
-  // Guarded against unknown-return note inputs, which share the same
-  // .note-input styling class but are handled by their own listener above
-  // (they POST to /api/unknown-returns/:id/note, not /api/note).
-  document.addEventListener('change', e => {
-    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId) commitNote(e.target);
-  });
-  document.addEventListener('keydown', e => {
-    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId && e.key === 'Enter'){
-      e.preventDefault();
-      commitNote(e.target);
-      e.target.blur();
-    }
-  });
-  async function commitNote(inputEl){
-    const awb = inputEl.dataset.awb;
-    const note = inputEl.value;
+// --- Shopify webhook: fulfillments/create -----------------------------
+// Needs the raw body for HMAC verification, so this route uses its own
+// raw-body parser instead of the app-wide express.json().
+app.post(
+  '/webhooks/fulfillments-create',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
     try {
-      await fetch('/api/note', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb, note }) });
-    } catch (err) { console.error('note save failed', err); }
-  }
+      const hmac = req.get('X-Shopify-Hmac-Sha256');
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
+      if (!ok) return res.status(401).send('invalid signature');
+      res.status(200).send('ok'); // ack immediately, Shopify retries on timeout/non-2xx
 
-  // ---- Scan input ----------------------------------------------------
-  const input = document.getElementById('scanInput');
-  const main = document.getElementById('main');
-  const idleState = document.getElementById('idleState');
-  function keepFocus(){ input.focus(); }
-  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal')) keepFocus(); });
-  window.addEventListener('load', keepFocus);
-  setInterval(() => { if (!needsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
-
-  function renderStatusBanner(kind, text){
-    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned' }[kind] || 'first';
-    return `<div class="status-banner ${cls}">${text}</div>`;
-  }
-
-  // ---- Return-receipt scan mode ------------------------------------------
-  // Toggled on when a returned box physically arrives — scanning it then
-  // only confirms return_received, completely separate from the normal
-  // pack-confirmation flow (never touches `packed`).
-  const returnModeBtn = document.getElementById('returnModeBtn');
-  returnModeBtn.addEventListener('click', () => {
-    returnMode = !returnMode;
-    returnModeBtn.classList.toggle('active', returnMode);
-    returnModeBtn.textContent = returnMode ? '🔄 Mod retur ACTIV' : '🔄 Scanează retur primit';
-    input.placeholder = returnMode ? 'Scanează AWB-ul returnat…' : 'Scanează AWB-ul de pe etichetă…';
-  });
-  function renderFound(row, bannerHtml){
-    idleState.style.display = 'none';
-    const items = JSON.parse(row.items_json || '[]');
-    const totalQty = items.reduce((s,i) => s + i.qty, 0);
-    main.innerHTML = `
-      ${bannerHtml || ''}
-      <div class="result">
-        <div class="result-head">
-          <div class="order-tag">${escapeHtml(row.order_name)}</div>
-          <div class="meta">AWB ${escapeHtml(row.awb)} · comandă ${fmtTime(row.order_created_at)} · AWB generat ${fmtTime(row.awb_created_at)}</div>
-        </div>
-        ${items.map((it, idx) => `
-          <div class="item-card">
-            ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
-            <div class="item-info">
-              <p class="title">${escapeHtml(it.title)}</p>
-              ${it.sku ? `<span class="sku">SKU: ${escapeHtml(it.sku)}</span>` : ''}
-              ${idx === 0 && row.client_note ? `<div style="margin-top:0.35rem; font-size:0.82rem; color:var(--amber); background:var(--amber-soft); border-radius:6px; padding:0.35rem 0.55rem;">💬 Notă client: ${escapeHtml(row.client_note).replace(/\n/g, '<br>')}</div>` : ''}
-            </div>
-            <div class="qty-badge"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
-          </div>
-        `).join('')}
-        <div class="total-bar">
-          <span>${items.length} produs${items.length === 1 ? '' : 'e'} în colet</span>
-          <span>Total bucăți: <b>${totalQty}</b></span>
-        </div>
-      </div>
-    `;
-  }
-  function renderNotFound(code){
-    idleState.style.display = 'none';
-    main.innerHTML = `
-      <div class="not-found">
-        <div class="glyph">✕</div>
-        <h2>AWB negăsit</h2>
-        <p>Codul <code>${escapeHtml(code)}</code> nu a fost găsit. Dacă a fost generat chiar acum, ar trebui să apară în câteva secunde — mai încearcă o dată.</p>
-      </div>
-    `;
-  }
-
-  async function handleScan(raw){
-    const code = raw.trim();
-    if (!code) return;
-    input.value = '';
-    if (returnMode){
-      try {
-        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-        const data = await res.json();
-        if (data.found){
-          delete returnRows[data.row.awb];
-          renderReturnsBar();
-          renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
-        } else if (data.logged){
-          unknownReturns[data.entry.id] = data.entry;
-          renderUnknownReturnsBar();
-          idleState.style.display = 'none';
-          main.innerHTML = `
-            <div class="not-found">
-              <div class="glyph">⚠️</div>
-              <h2>Retur neidentificat</h2>
-              <p>Codul <code>${escapeHtml(code)}</code> nu există în sistem — a fost adăugat în lista de retururi neidentificate, jos, pentru verificare manuală.</p>
-            </div>
-          `;
-        }
-      } catch (err) {
-        console.error('return scan failed', err);
-      }
-      return;
+      const payload = JSON.parse(req.body.toString('utf8'));
+      await handleFulfillmentPayload(payload);
+    } catch (err) {
+      console.error('[webhook] processing error', err);
+      if (!res.headersSent) res.status(500).send('error');
     }
+  }
+);
+
+async function handleFulfillmentPayload(payload) {
+  if ((payload.status || '').toLowerCase() !== 'success') return;
+  const company = (payload.tracking_company || '').toLowerCase();
+  if (!company.includes('sameday')) return;
+  const awb = payload.tracking_number;
+  if (!awb) return;
+
+  const orderGid = `gid://shopify/Order/${payload.order_id}`;
+  const order = await shopify.fetchOrderDetails(orderGid);
+  if (!order) return;
+
+  const row = db.upsertAwb({
+    awb,
+    order_name: order.name,
+    order_created_at: order.createdAt,
+    awb_created_at: payload.created_at,
+    total: order.total,
+    currency: order.currency,
+    items: order.items,
+    order_id: payload.order_id,
+    client_note: order.note,
+  });
+  broadcast({ type: 'awb:new', awb: row });
+  console.log(`[webhook] new AWB ${awb} for ${order.name}`);
+
+  // Get a first real status right away instead of waiting for the next poll tick
+  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), in which
+  // case skip this too rather than sneaking in auth attempts another way.
+  if (process.env.SAMEDAY_POLL_ENABLED !== 'false') {
     try {
-      const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-      if (res.status === 404){ renderNotFound(code); return; }
-      const data = await res.json();
-      rows[data.row.awb] = data.row;
-      renderAll();
-      const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
-      if (data.kind === 'first'){
-        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".' + noteLine));
-      } else if (data.kind === 'packed'){
-        renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
-      } else if (data.kind === 'already'){
-        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
-      } else if (data.kind === 'reset'){
-        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
-      } else if (data.kind === 'cancelled'){
-        renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
+      const status = await sameday.getStatus(awb);
+      applySamedayUpdate(awb, status);
+    } catch (err) {
+      console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
+    }
+  }
+}
+
+// --- Shopify webhook: orders/cancelled -----------------------------------
+// Sameday does NOT auto-cancel the AWB when the Shopify order is cancelled,
+// so this is our own signal to pull a cancelled order out of the packing
+// flow. A cancelled order can (rarely) have more than one AWB — markOrderCancelled
+// handles all of them and we broadcast an update for each.
+app.post(
+  '/webhooks/orders-cancelled',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    try {
+      const hmac = req.get('X-Shopify-Hmac-Sha256');
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
+      if (!ok) return res.status(401).send('invalid signature');
+      res.status(200).send('ok');
+
+      const payload = JSON.parse(req.body.toString('utf8'));
+      const orderId = String(payload.id);
+      const updatedRows = db.markOrderCancelled(orderId);
+      updatedRows.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+      if (updatedRows.length) {
+        console.log(`[webhook] order ${orderId} cancelled — ${updatedRows.length} AWB(s) taken out of the packing flow`);
       }
     } catch (err) {
-      console.error('scan failed', err);
+      console.error('[webhook] orders-cancelled processing error', err);
+      if (!res.headersSent) res.status(500).send('error');
     }
   }
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter'){ e.preventDefault(); handleScan(input.value); }
+);
+
+// --- One-time setup: register Shopify webhooks ---------------------------
+// Registers this server's own webhook URLs with Shopify, authenticated as
+// THIS app (via the same client_credentials exchange used for the Admin
+// API), so webhooks end up signed with SHOPIFY_CLIENT_SECRET — the secret
+// this server actually verifies against. Guarded by that same secret as a
+// query param so it can be triggered once from a browser. Safe to call again
+// later (e.g. after adding a new webhook here) — Shopify just reports a
+// userError for any topic/URI combo that's already registered.
+const WEBHOOKS_TO_REGISTER = [
+  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/fulfillments-create' },
+  { topic: 'ORDERS_CANCELLED', path: '/webhooks/orders-cancelled' },
+];
+app.get('/admin/setup-webhook', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const results = [];
+    for (const w of WEBHOOKS_TO_REGISTER) {
+      const uri = `https://${req.get('host')}${w.path}`;
+      const data = await shopify.shopifyGraphql(
+        `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+            webhookSubscription { id topic uri }
+            userErrors { field message }
+          }
+        }`,
+        { topic: w.topic, sub: { uri, format: 'JSON' } }
+      );
+      results.push({ topic: w.topic, ...data.webhookSubscriptionCreate });
+    }
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Diagnostic: reports the public IP this server's outbound requests use —
+// useful to hand Sameday support an exact address to check/whitelist.
+app.get('/admin/whoami', async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const body = await r.json();
+    res.json({ outboundIp: body.ip });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// TEMPORARY diagnostic: shows a masked preview + length of the secret this
+// server actually has configured, so it can be visually compared against
+// what's pasted into a URL — without ever printing the full value. Remove
+// this route once the /admin/backfill-old 403 mismatch is resolved.
+function maskedPreview(s) {
+  return s.length > 8 ? `${s.slice(0, 4)}...${s.slice(-4)}` : '(too short to preview safely)';
+}
+
+app.get('/admin/secret-debug', (req, res) => {
+  const s = process.env.SHOPIFY_CLIENT_SECRET || '';
+  if (!s) return res.json({ configured: false });
+  const result = {
+    configured: true,
+    length: s.length,
+    preview: maskedPreview(s),
+  };
+  // Pass ?got=<value you're about to use in the URL> to compare it directly
+  // against the real configured secret, without ever showing either in full.
+  if (typeof req.query.got === 'string') {
+    const g = req.query.got;
+    result.got = { length: g.length, preview: maskedPreview(g), match: g === s };
+  }
+  res.json(result);
+});
+
+// TEMPORARY diagnostic: pinpoints exactly why a given code does/doesn't
+// match a row — used to debug /api/lookup returning found:false for AWBs
+// that /api/scan clearly does find. Shows the raw char codes of the queried
+// string (catches invisible whitespace / lookalike characters that a
+// screenshot can't show), the exact-match result, the same findByCode()
+// logic /api/scan and /api/lookup both use, and any row whose awb merely
+// CONTAINS the tail of the queried code (catches base-vs-suffix mismatches).
+app.get('/admin/debug-awb', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const code = String(req.query.code || '');
+  if (!code) return res.status(400).json({ error: 'missing code query param' });
+  const exactMatch = db.getAwb(code);
+  const findByCodeResult = db.findByCode(code);
+  const tail = code.slice(-8);
+  const similarRows = db.db
+    .prepare('SELECT awb, order_name, scan_note, order_id, packed, cancelled FROM awbs WHERE awb LIKE ?')
+    .all(`%${tail}%`);
+  res.json({
+    queried: code,
+    queriedLength: code.length,
+    queriedCharCodes: Array.from(code).map((c) => c.charCodeAt(0)),
+    exactMatch,
+    findByCodeResult,
+    similarRows,
   });
+});
 
-  // ---- Initial load + WebSocket live updates ------------------------------
-  // Loads EVERY AWB that's neither packed nor cancelled, regardless of when
-  // it was created — not just today's — so the picking list surfaces the
-  // whole backlog still owed to a courier, not only what printed today.
-  async function loadUnpacked(){
-    const res = await fetch('/api/unpacked');
-    const data = await res.json();
-    rows = {};
-    data.rows.forEach(r => { rows[r.awb] = r; });
-    renderAll();
+// One-time (or occasional) manual pull of older AWBs — the automatic
+// backfillToday() only ever looks at today. This brings AWBs from the last
+// N days into the new system, e.g. so anything still unpacked from before
+// the webhook went live shows up here too. Guarded the same way as the
+// other /admin routes. Usage: /admin/backfill-old?secret=...&days=7
+app.get('/admin/backfill-old', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
   }
+  const days = Math.max(1, Math.min(60, parseInt(req.query.days, 10) || 7));
+  const debug = req.query.debug === '1';
+  try {
+    const result = await backfillRange(days, debug);
+    const added = debug ? result.added : result;
+    if (added) broadcast({ type: 'refresh' });
+    res.json(debug ? { ...result, days } : { added, days });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
 
-  function connectWs(){
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => { document.getElementById('connDot').classList.add('live'); };
-    ws.onclose = () => { document.getElementById('connDot').classList.remove('live'); setTimeout(connectWs, 2000); };
-    ws.onerror = () => ws.close();
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'awb:new' || msg.type === 'awb:update'){
-        rows[msg.awb.awb] = msg.awb;
-        scheduleRenderAll();
-        // Keep the returns bar in sync without a full re-fetch: add/remove
-        // this one row locally based on its current status.
-        if (msg.awb.return_received || !isReturnStatus(msg.awb.sameday_status)) {
-          if (returnRows[msg.awb.awb]) { delete returnRows[msg.awb.awb]; renderReturnsBar(); }
-        } else {
-          returnRows[msg.awb.awb] = msg.awb;
-          renderReturnsBar();
-        }
-      } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update'){
-        unknownReturns[msg.entry.id] = msg.entry;
-        renderUnknownReturnsBar();
-      } else if (msg.type === 'unknown-return:resolved'){
-        delete unknownReturns[msg.entry.id];
-        renderUnknownReturnsBar();
-      } else if (msg.type === 'refresh'){
-        loadUnpacked();
-        loadReturns();
-        loadUnknownReturns();
+// One-off cleanup for the now-removed auto-pack-from-courier bug: some AWBs
+// got marked packed within moments of their label being printed, without
+// anyone actually scanning them (see db.js findFalsePackedCandidates for the
+// exact detection rule). Dry-run by default — lists what would be reset;
+// pass &apply=1 to actually reset them back to unpacked so they return to
+// the normal picking list. Usage: /admin/fix-false-packed?secret=...
+// (add &apply=1 once the dry-run list looks right; &maxAgeMin=N to widen/
+// narrow the "packed within N minutes of creation" window, default 15).
+app.get('/admin/fix-false-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const maxAgeMin = Math.max(1, Math.min(180, parseInt(req.query.maxAgeMin, 10) || 15));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = db.findFalsePackedCandidates(maxAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        maxAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to reset these to unpacked.',
+      });
+    }
+    const updated = db.resetFalsePacked(candidates.map((r) => r.awb));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, maxAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Reconciliation: some orders are fulfilled through the older/other process
+// and never get a manual scan at this app's station — for those, Sameday's
+// own tracking is the only proof they actually shipped. The live poller
+// already does this gradually every 30s (see applySamedayUpdate above); this
+// sweeps everything currently unpacked right now, for an immediate catch-up
+// instead of waiting on the poll cycle. Same dry-run-first pattern as
+// /admin/fix-false-packed. Usage: /admin/reconcile-sameday?secret=...
+// (add &apply=1 once the list looks right; &minAgeMin=N to change the "must
+// be at least this old" safety window, default 30 — matches
+// MIN_AWB_AGE_FOR_AUTO_PACK_MS).
+app.get('/admin/reconcile-sameday', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const minAgeMin = Math.max(1, Math.min(1440, parseInt(req.query.minAgeMin, 10) || 30));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = reconcileWithSameday(minAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        minAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to mark these packed.',
+      });
+    }
+    const whenIso = new Date().toISOString();
+    const updated = candidates.map((r) => db.markPackedFromReconciliation(r.awb, r.sameday_checked_at || whenIso));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, minAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// The live poller (see startPoller below) only checks Sameday status for
+// AWBs created today/yesterday — on purpose, so it doesn't hammer Sameday's
+// API with thousands of requests every 30s for orders that settled long ago.
+// The tradeoff: for AWBs older than that, sameday_status in the DB can be
+// stale or (for very old backlog) never fetched at all, so the cache-based
+// /admin/reconcile-sameday above has nothing to work with for them. This
+// does the same reconciliation but fetches a FRESH live status per AWB first
+// — same 200ms throttle as the poller — then feeds it through the same
+// applySamedayUpdate() used everywhere else, so the normal 30-min-age +
+// status rules still apply. Meant for the historical backlog, not routine
+// use. Runs in the background (the HTTP response returns immediately) since
+// a few thousand AWBs at ~200ms each can take several minutes — watch the
+// Deploy Logs for "[backfill-status]" progress lines. Usage:
+// /admin/backfill-sameday-status?secret=...&limit=3000
+let backfillStatusRunning = false;
+async function backfillSamedayStatusLive(rows) {
+  let ok = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      const status = await sameday.getStatus(row.awb);
+      applySamedayUpdate(row.awb, status);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.error(`[backfill-status] ${row.awb} failed`, err.message || err);
+    }
+    if ((ok + failed) % 100 === 0) {
+      console.log(`[backfill-status] progress ${ok + failed}/${rows.length} (${ok} ok, ${failed} failed)`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  console.log(`[backfill-status] done — ${ok} ok, ${failed} failed out of ${rows.length}`);
+}
+
+app.get('/admin/backfill-sameday-status', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillStatusRunning) {
+    return res.status(409).json({ error: 'a backfill is already running — check Deploy Logs for [backfill-status] progress' });
+  }
+  const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  backfillStatusRunning = true;
+  backfillSamedayStatusLive(rows).finally(() => {
+    backfillStatusRunning = false;
+  });
+  res.json({
+    started: true,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.2) / 60),
+    hint: 'Running in background — watch Deploy Logs for [backfill-status] lines, or just refresh the dashboard in a few minutes.',
+  });
+});
+
+// Backfill order_id on old AWB rows that predate order_id tracking. The
+// normal Shopify crawl (backfillToday/backfillRange) only sets order_id on
+// AWBs it's inserting for the FIRST time — it skips (`if (existing) continue`)
+// any AWB already present in the DB, so old rows stay with order_id = NULL
+// forever. That in turn makes /admin/reconcile-with-shopify skip them (no ID
+// to query Shopify with). This looks each one up by order_name instead
+// (which every row does have) and fills in order_id directly. Dry-run first,
+// same pattern as the other /admin/* routes. Usage:
+// /admin/backfill-order-ids?secret=...  (add &apply=1 once it looks right)
+async function backfillOrderIds(rows) {
+  const results = [];
+  for (const row of rows) {
+    try {
+      const orderId = await shopify.findOrderIdByName(row.order_name);
+      results.push({ awb: row.awb, order_name: row.order_name, orderId, action: orderId ? 'set' : 'not-found' });
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let backfillOrderIdsRunning = false;
+app.get('/admin/backfill-order-ids', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillOrderIdsRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-order-ids] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().filter((r) => !r.order_id).slice(0, limit);
+  backfillOrderIdsRunning = true;
+  (async () => {
+    try {
+      const results = await backfillOrderIds(rows);
+      const toSet = results.filter((r) => r.action === 'set');
+      const notFound = results.filter((r) => r.action === 'not-found');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[backfill-order-ids] scanned ${results.length} — ${toSet.length} found, ${notFound.length} not found, ${errors.length} errors`);
+      if (apply) {
+        toSet.forEach((r) => db.setOrderId(r.awb, r.orderId));
+        console.log(`[backfill-order-ids] applied — set order_id on ${toSet.length} AWB(s)`);
       }
-    };
-  }
+      global.__lastBackfillOrderIdsResult = { apply, count: results.length, toSet, notFound, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[backfill-order-ids] failed', err);
+      global.__lastBackfillOrderIdsResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      backfillOrderIdsRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/backfill-order-ids-result?secret=... for the outcome, or watch Deploy Logs for [backfill-order-ids].',
+  });
+});
 
-  loadUnpacked();
-  loadReturns();
-  loadUnknownReturns();
-  connectWs();
-</script>
-</body>
-</html>
+app.get('/admin/backfill-order-ids-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
+});
+
+// Safety-net revert: undoes an incorrect "packed" mark for a specific list
+// of AWBs, given as a comma-separated query param. Built for the incident
+// where an earlier version of /admin/reconcile-with-shopify wrongly marked
+// recently-created (still awaiting courier pickup) AWBs as packed, based on
+// Shopify's displayFulfillmentStatus alone — see the correctness note above
+// reconcileWithShopify. Reuses db.resetPacked (packed=0, packed_at=NULL,
+// first_scan_at=NULL) — harmless for these rows since first_scan_at was
+// already NULL (they were reconciled, never manually scanned). Usage:
+// /admin/revert-packed?secret=...&awbs=AWB1,AWB2,...
+app.get('/admin/revert-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const awbs = String(req.query.awbs || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!awbs.length) return res.status(400).json({ error: 'missing awbs (comma-separated query param)' });
+  const before = awbs.map((awb) => db.getAwb(awb)).filter(Boolean);
+  const stillPacked = before.filter((r) => r.packed);
+  const updated = db.resetFalsePacked(stillPacked.map((r) => r.awb));
+  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+  res.json({ requested: awbs.length, found: before.length, reverted: updated.length, awbs: updated.map((r) => r.awb) });
+});
+
+// Reconciliation against SHOPIFY itself (not Sameday) — for the specific
+// case of old backlog AWBs where Sameday's own status lookup comes back
+// empty/erroring (so /admin/reconcile-sameday and the status backfill have
+// nothing to work with), but Shopify's order record already tells the truth:
+// either the order was cancelled (and our own `cancelled` flag never got set
+// because it predates the orders/cancelled webhook), or the order shows
+// FULFILLED — meaning a courier scan already happened somewhere, just not
+// through this app's own Sameday-status pipeline (e.g. shipped manually by
+// an operator under a different/legacy process). Same dry-run-first pattern
+// as the other /admin/reconcile-* routes. Usage:
+// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
+// CORRECTNESS NOTE (learned the hard way): Shopify's displayFulfillmentStatus
+// turns "FULFILLED" the instant a fulfillment record with tracking exists —
+// i.e. the moment an AWB label is created, same trigger as our own
+// awb_created_at. It does NOT mean the courier physically picked it up. An
+// earlier version of this function used bare displayFulfillmentStatus to
+// decide "pack", which wrongly marked recently-created (still awaiting
+// pickup) AWBs as packed — the exact same false-positive shape as the
+// original incident this whole app was built to avoid. The only safe "pack"
+// signal from Shopify is a genuinely SEPARATE completed fulfillment: one
+// whose tracking number does NOT match the AWB we already have on file for
+// this row (proof a real, different shipment already went out, e.g. through
+// a manual/legacy process). A fulfillment carrying the SAME awb we're
+// already tracking tells us nothing new — Sameday's own live status is the
+// only trustworthy source for whether THAT specific AWB was picked up.
+async function reconcileWithShopify(rows) {
+  const results = [];
+  for (const row of rows) {
+    if (!row.order_id) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'no order_id on this row' });
+      continue;
+    }
+    try {
+      const data = await shopify.shopifyGraphql(
+        `query($id: ID!) { order(id: $id) { cancelledAt fulfillments(first: 10) { status trackingInfo(first: 1) { number } } } }`,
+        { id: `gid://shopify/Order/${row.order_id}` }
+      );
+      const o = data.order;
+      if (!o) {
+        results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'order not found in Shopify' });
+      } else if (o.cancelledAt) {
+        results.push({ awb: row.awb, order_name: row.order_name, order_id: row.order_id, action: 'cancel', cancelledAt: o.cancelledAt });
+      } else {
+        const otherShipment = (o.fulfillments || []).find((f) => {
+          if (f.status !== 'SUCCESS') return false;
+          const num = f.trackingInfo && f.trackingInfo[0] && f.trackingInfo[0].number;
+          return num && num !== row.awb;
+        });
+        if (otherShipment) {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', otherTrackingNumber: otherShipment.trackingInfo[0].number });
+        } else {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'none' });
+        }
+      }
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let reconcileShopifyRunning = false;
+app.get('/admin/reconcile-with-shopify', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (reconcileShopifyRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [reconcile-shopify] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  reconcileShopifyRunning = true;
+  (async () => {
+    try {
+      const results = await reconcileWithShopify(rows);
+      const toCancel = results.filter((r) => r.action === 'cancel');
+      const toPack = results.filter((r) => r.action === 'pack');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[reconcile-shopify] scanned ${results.length} — ${toCancel.length} to cancel, ${toPack.length} to pack, ${errors.length} errors`);
+      if (apply) {
+        const cancelledOrderIds = new Set();
+        for (const r of toCancel) {
+          if (cancelledOrderIds.has(r.order_id)) continue;
+          cancelledOrderIds.add(r.order_id);
+          db.markOrderCancelled(r.order_id).forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+        }
+        for (const r of toPack) {
+          const row = db.markPackedFromReconciliation(r.awb, new Date().toISOString());
+          if (row) broadcast({ type: 'awb:update', awb: row });
+        }
+        console.log(`[reconcile-shopify] applied — cancelled ${cancelledOrderIds.size} order(s), packed ${toPack.length} AWB(s)`);
+      }
+      global.__lastReconcileShopifyResult = { apply, count: results.length, toCancel, toPack, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[reconcile-shopify] failed', err);
+      global.__lastReconcileShopifyResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      reconcileShopifyRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/reconcile-with-shopify-result?secret=... for the outcome, or watch Deploy Logs for [reconcile-shopify].',
+  });
+});
+
+app.get('/admin/reconcile-with-shopify-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
+});
+
+// --- REST API -----------------------------------------------------------
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/days', (req, res) => {
+  res.json({ days: db.listDays() });
+});
+
+app.get('/api/today', (req, res) => {
+  const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
+  res.json({ day, rows: db.listForDay(day) });
+});
+
+app.get('/api/day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listForDay(req.params.day) });
+});
+
+// --- Dashboard "packed/shipped" view (grouped by pack date, not AWB
+// creation date — see db.js listPackedDays/listPackedForDay) -------------
+app.get('/api/packed-days', (req, res) => {
+  res.json({ days: db.listPackedDays() });
+});
+
+app.get('/api/packed-day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listPackedForDay(req.params.day) });
+});
+
+app.get('/api/unpacked-count', (req, res) => {
+  res.json({ count: db.countUnpacked() });
+});
+
+// Full list of every AWB that exists (has a printed label) but is neither
+// packed nor cancelled — across ALL days, not just today. This is the real
+// "still owed to a courier" backlog: unlike /api/today (which is scoped to
+// today's creation date, for the scan-station picking list), this covers
+// everything regardless of when the AWB was created.
+app.get('/api/unpacked', (req, res) => {
+  const rows = db.listUnpackedNotCancelled().sort((a, b) => new Date(a.awb_created_at) - new Date(b.awb_created_at));
+  res.json({ count: rows.length, rows });
+});
+
+app.get('/api/lookup/:code', (req, res) => {
+  const row = db.findByCode(req.params.code);
+  if (!row) return res.status(404).json({ found: false });
+  res.json({ found: true, row });
+});
+
+app.post('/api/scan', async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'missing code' });
+  const row = db.findByCode(code);
+  if (!row) return res.status(404).json({ found: false });
+  let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
+  // First scan at the station → note+tag on the Shopify order. We AWAIT the
+  // Shopify round-trip here (rather than fire-and-forget) so we can capture
+  // the ORIGINAL note (the client's own instructions, if any — shown under
+  // the SKU on the packing screen, separate from our own confirmation line)
+  // and the full merged text actually saved to Shopify. If the Shopify call
+  // fails for any reason, we fall back to saving just our own line so the
+  // scan itself never breaks.
+  if (result.kind === 'first' && result.row.order_id) {
+    const stamp = new Date().toLocaleString('ro-RO', {
+      timeZone: 'Europe/Bucharest',
+      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+    const line = `Scanat la depozit: ${stamp}`;
+    try {
+      const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
+      result.row = db.setScanNote(result.row.awb, fullNote);
+      if (originalNote) result.row = db.setClientNoteIfEmpty(result.row.awb, originalNote);
+    } catch (err) {
+      // Can fail for reasons that have nothing to do with the note content —
+      // e.g. an order placed through a marketplace/POS-quick-sale channel
+      // needs a write scope (write_marketplace_orders / write_quick_sale)
+      // this app's token doesn't have, so the WRITE (our confirmation line +
+      // tag) is rejected even though nothing is actually wrong. When that
+      // happens we still don't want to lose the client's own note, so fall
+      // back to a plain READ (which doesn't need that extra scope) to at
+      // least capture it for display, even though our own line can't be
+      // written to Shopify for this order.
+      console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
+      result.row = db.setScanNote(result.row.awb, line);
+      try {
+        const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+        if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+      } catch (readErr) {
+        console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
+      }
+    }
+  } else if (result.row.order_id && !result.row.client_note) {
+    // Not the first scan (or already had order_id-less row) — the client
+    // note can still be missing simply because it was typed into Shopify
+    // a few seconds AFTER the very first scan (appendOrderScanNote only
+    // ever reads once). Re-check on every subsequent scan, as long as we
+    // still don't have one saved, so timing no longer matters. Read-only,
+    // best-effort — never breaks the scan if it fails.
+    try {
+      const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+      if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+    } catch (err) {
+      console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
+    }
+  }
+  if (result.kind && result.kind !== 'already') {
+    broadcast({ type: 'awb:update', awb: result.row });
+  }
+  res.json({ found: true, kind: result.kind, row: result.row });
+});
+
+app.post('/api/note', (req, res) => {
+  const { awb, note } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.setNote(awb, note || '');
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ row });
+});
+
+// --- Returns --------------------------------------------------------------
+// AWBs Sameday currently shows as "in return" (courier bringing it back)
+// that nobody has confirmed as physically received yet — not scoped to
+// today, since a return can land days after the original order.
+app.get('/api/returns', (req, res) => {
+  res.json({ rows: db.listPendingReturns() });
+});
+
+// History: returns already confirmed as physically received (most recent
+// first, capped at 200) — separate from /api/returns above, which only
+// lists the ones still waiting for confirmation.
+app.get('/api/returns/history', (req, res) => {
+  res.json({ rows: db.listReturnHistory() });
+});
+
+// Manual confirmation scan: the box physically arrived back at the
+// warehouse. Deliberately separate from /api/scan's pack-confirmation flow
+// — scanning a returned AWB here never touches `packed`, only `return_received`.
+// If the code matches no known AWB at all (a return from another channel,
+// an older order, a typo, a damaged label), it's logged as an "unknown
+// return" instead of a plain 404 — those need a human to go find out what
+// they actually are, not silently vanish as a failed scan.
+app.post('/api/scan-return', (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'missing code' });
+  const row = db.findByCode(code);
+  if (!row) {
+    const entry = db.logUnknownReturn(code, new Date().toISOString());
+    broadcast({ type: 'unknown-return:new', entry });
+    return res.json({ found: false, logged: true, entry });
+  }
+  const updated = db.markReturnReceived(row.awb, new Date().toISOString());
+  broadcast({ type: 'awb:update', awb: updated });
+  res.json({ found: true, row: updated });
+});
+
+// Unknown-return entries: listing, adding a note, and marking one resolved
+// once someone has figured out / handled what it actually was.
+app.get('/api/unknown-returns', (req, res) => {
+  res.json({ rows: db.listUnknownReturns() });
+});
+
+app.post('/api/unknown-returns/:id/note', (req, res) => {
+  const { note } = req.body || {};
+  const entry = db.setUnknownReturnNote(Number(req.params.id), note || '');
+  broadcast({ type: 'unknown-return:update', entry });
+  res.json({ entry });
+});
+
+app.post('/api/unknown-returns/:id/resolve', (req, res) => {
+  const entry = db.resolveUnknownReturn(Number(req.params.id), new Date().toISOString());
+  broadcast({ type: 'unknown-return:resolved', entry });
+  res.json({ entry });
+});
+
+// History: unknown-return entries already resolved (most recent first,
+// capped at 200).
+app.get('/api/unknown-returns/history', (req, res) => {
+  res.json({ rows: db.listResolvedUnknownReturns() });
+});
+
+// --- Sameday polling (courier status for open AWBs) ----------------------
+// Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
+// entirely (e.g. while investigating a block/lockout on the Sameday side)
+// without touching anything else — AWB tracking via the Shopify webhook
+// keeps working either way, this only feeds the courier-status column.
+if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
+  console.warn('[sameday] polling disabled via SAMEDAY_POLL_ENABLED=false');
+} else {
+  sameday.startPoller(
+    db,
+    (awb, result) => applySamedayUpdate(awb, result),
+    SAMEDAY_POLL_MS
+  );
+}
+
+// --- Shopify backfill safety net -----------------------------------------
+// Webhooks are the primary path (seconds of latency); this just guards
+// against a missed delivery (server restart, transient network blip).
+async function backfillToday() {
+  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
+  const startIso = new Date(`${todayKey}T00:00:00+03:00`).toISOString(); // Bucharest is UTC+2/+3; adjust below if needed
+  let cursor = null;
+  let added = 0;
+  for (let page = 0; page < 20; page++) {
+    const data = await shopify.shopifyGraphql(
+      `query($cursor: String) {
+        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+          edges { node {
+            id name createdAt updatedAt note
+            totalPriceSet { shopMoney { amount currencyCode } }
+            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor }
+    );
+    const edges = data.orders.edges;
+    if (!edges.length) break;
+    let sawOld = false;
+    for (const { node: o } of edges) {
+      if (new Date(o.updatedAt) < new Date(startIso)) { sawOld = true; continue; }
+      for (const f of o.fulfillments) {
+        if (f.status !== 'SUCCESS') continue;
+        const tracking = f.trackingInfo[0];
+        if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        if (new Date(f.createdAt).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' }) !== todayKey) continue;
+        const existing = db.getAwb(tracking.number);
+        if (existing) continue;
+        db.upsertAwb({
+          awb: tracking.number,
+          order_name: o.name,
+          order_created_at: o.createdAt,
+          awb_created_at: f.createdAt,
+          total: parseFloat(o.totalPriceSet.shopMoney.amount),
+          currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
+          items: o.lineItems.edges.map((e) => ({
+            title: e.node.title,
+            qty: e.node.quantity,
+            sku: e.node.sku,
+            variant: e.node.variantTitle || '',
+            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+          })),
+        });
+        added++;
+      }
+    }
+    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
+    cursor = data.orders.pageInfo.endCursor;
+  }
+  if (added) {
+    console.log(`[backfill] added ${added} AWB(s) missed by webhooks`);
+    broadcast({ type: 'refresh' }); // simplest: tell clients to re-fetch today
+  }
+  return added;
+}
+
+// Same crawl as backfillToday(), but over the last `daysBack` days instead of
+// just today, and without the "must be Sameday-created today" restriction —
+// used for the one-time manual catch-up via /admin/backfill-old.
+async function backfillRange(daysBack, debug) {
+  const cutoffMs = Date.now() - daysBack * 24 * 3600 * 1000;
+  let cursor = null;
+  let added = 0;
+  const stats = { ordersScanned: 0, fulfillmentsSuccess: 0, samedayMatches: 0, alreadyInDb: 0, pages: 0 };
+  for (let page = 0; page < 60; page++) {
+    stats.pages++;
+    const data = await shopify.shopifyGraphql(
+      `query($cursor: String) {
+        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+          edges { node {
+            id name createdAt updatedAt note
+            totalPriceSet { shopMoney { amount currencyCode } }
+            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor }
+    );
+    const edges = data.orders.edges;
+    if (!edges.length) break;
+    let sawOld = false;
+    for (const { node: o } of edges) {
+      stats.ordersScanned++;
+      if (new Date(o.updatedAt).getTime() < cutoffMs) { sawOld = true; continue; }
+      for (const f of o.fulfillments) {
+        if (f.status !== 'SUCCESS') continue;
+        if (new Date(f.createdAt).getTime() < cutoffMs) continue;
+        stats.fulfillmentsSuccess++;
+        const tracking = f.trackingInfo[0];
+        if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        stats.samedayMatches++;
+        const existing = db.getAwb(tracking.number);
+        if (existing) { stats.alreadyInDb++; continue; }
+        db.upsertAwb({
+          awb: tracking.number,
+          order_name: o.name,
+          order_created_at: o.createdAt,
+          awb_created_at: f.createdAt,
+          total: parseFloat(o.totalPriceSet.shopMoney.amount),
+          currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
+          items: o.lineItems.edges.map((e) => ({
+            title: e.node.title,
+            qty: e.node.quantity,
+            sku: e.node.sku,
+            variant: e.node.variantTitle || '',
+            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+          })),
+        });
+        added++;
+      }
+    }
+    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
+    cursor = data.orders.pageInfo.endCursor;
+  }
+  if (added) console.log(`[backfill-old] added ${added} AWB(s) from the last ${daysBack} day(s)`);
+  return debug ? { added, stats } : added;
+}
+
+if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
+  backfillToday().catch((err) => console.error('[backfill] startup run failed', err));
+  setInterval(() => backfillToday().catch((err) => console.error('[backfill] error', err)), BACKFILL_INTERVAL_MS);
+} else {
+  console.warn('[backfill] SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set — skipping Shopify backfill (webhook-only mode)');
+}
+
+server.listen(PORT, () => {
+  console.log(`AWB Glorio server listening on :${PORT}`);
+});
+
+// Last-resort safety net: log and keep running instead of crashing the
+// whole process on an unexpected error (e.g. from a background poll tick).
+process.on('uncaughtException', (err) => console.error('[fatal] uncaughtException', err));
+process.on('unhandledRejection', (err) => console.error('[fatal] unhandledRejection', err));
