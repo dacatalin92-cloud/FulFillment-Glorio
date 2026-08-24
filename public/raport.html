@@ -18,6 +18,8 @@
   .card.ridicare .num { color:#0369a1; }
   .card.ok .num { color:#15803d; }
   .card.toate .num { color:#1a1a1a; }
+  .card.depregatit { background:#eef2ff; }
+  .card.depregatit .num { color:#4338ca; }
   table { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08); }
   th, td { text-align:left; padding:8px 10px; font-size:13px; border-bottom:1px solid #eee; }
   th { background:#fafafa; position:sticky; top:0; font-weight:600; color:#444; }
@@ -46,7 +48,7 @@
 
 <script>
 let rows = [];
-let filter = 'toate';
+let filter = 'depregatit';
 
 function daysAgo(iso) {
   const d = (Date.now() - new Date(iso).getTime()) / 86400000;
@@ -61,7 +63,14 @@ function categorize(row) {
   return 'ok';
 }
 
-const LABELS = { necunoscut: 'Status necunoscut (—)', anulat: 'Anulate la Sameday', ridicare: 'Așteaptă ridicare', ok: 'Alt status', toate: 'Toate' };
+const LABELS = { depregatit: '📦 De pregătit (ca în scan.html)', necunoscut: 'Status necunoscut (—)', anulat: 'Anulate la Sameday', ridicare: 'Așteaptă ridicare', ok: 'Alt status', toate: 'Toate' };
+
+// Matches EXACTLY the isPickable() logic in scan.html: everything except
+// tone 'anulat' (courier-cancelled) and tone 'ok' (already moved/delivered)
+// counts as "still needs packing" — i.e. 'necunoscut' + 'ridicare'.
+function isDePregatit(row) {
+  return row.category === 'necunoscut' || row.category === 'ridicare';
+}
 
 async function load() {
   document.getElementById('loading').style.display = 'block';
@@ -76,10 +85,11 @@ async function load() {
 }
 
 function renderSummary() {
-  const counts = { toate: rows.length, necunoscut: 0, anulat: 0, ridicare: 0, ok: 0 };
-  rows.forEach(r => counts[r.category]++);
+  const counts = { toate: rows.length, depregatit: 0, necunoscut: 0, anulat: 0, ridicare: 0, ok: 0 };
+  rows.forEach(r => { counts[r.category]++; if (isDePregatit(r)) counts.depregatit++; });
   const el = document.getElementById('summary');
-  el.innerHTML = Object.keys(counts).map(k =>
+  const order = ['depregatit', 'toate', 'necunoscut', 'ridicare', 'anulat', 'ok'];
+  el.innerHTML = order.map(k =>
     `<div class="card ${k} ${filter===k?'active':''}" onclick="filter='${k}';render()">
       <div class="num">${counts[k]}</div>
       <div class="lbl">${LABELS[k]}</div>
@@ -90,7 +100,7 @@ function renderSummary() {
 function render() {
   renderSummary();
   const q = document.getElementById('search').value.trim().toLowerCase();
-  let filtered = rows.filter(r => filter === 'toate' || r.category === filter);
+  let filtered = filter === 'depregatit' ? rows.filter(isDePregatit) : rows.filter(r => filter === 'toate' || r.category === filter);
   if (q) filtered = filtered.filter(r => r.awb.toLowerCase().includes(q) || (r.order_name||'').toLowerCase().includes(q));
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = filtered.map((r, i) => `
