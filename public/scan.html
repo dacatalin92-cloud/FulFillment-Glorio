@@ -638,7 +638,7 @@
       const data = await res.json();
       rows[data.row.awb] = data.row;
       renderAll();
-      const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă scrisă în Shopify: „${escapeHtml(data.row.scan_note)}"</span>` : '';
+      const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
       if (data.kind === 'first'){
         renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'packed'){
