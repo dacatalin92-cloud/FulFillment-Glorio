@@ -662,13 +662,22 @@ app.post('/api/scan', (req, res) => {
     broadcast({ type: 'awb:update', awb: result.row });
   }
   // First scan at the station → best-effort note+tag on the Shopify order.
-  // Fire-and-forget: never block the scan response on a Shopify round-trip,
-  // and a Shopify hiccup here must never make the scan itself look failed.
+  // The note text is computed HERE (not inside shopify.js) so we can hand it
+  // straight back to the scan station in the response below, instantly —
+  // the actual write to Shopify still happens, but in the background
+  // (fire-and-forget), so a slow/failed Shopify call never blocks or breaks
+  // the scan itself.
+  let scanNote;
   if (result.kind === 'first' && result.row.order_id) {
-    shopify.markOrderScanned(`gid://shopify/Order/${result.row.order_id}`)
-      .catch((err) => console.error('[shopify] markOrderScanned failed for', result.row.awb, err));
+    const stamp = new Date().toLocaleString('ro-RO', {
+      timeZone: 'Europe/Bucharest',
+      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+    scanNote = `Scanat la depozit: ${stamp}`;
+    shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, scanNote)
+      .catch((err) => console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err));
   }
-  res.json({ found: true, kind: result.kind, row: result.row });
+  res.json({ found: true, kind: result.kind, row: result.row, scanNote });
 });
 
 app.post('/api/note', (req, res) => {
