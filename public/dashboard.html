@@ -83,6 +83,15 @@
   .history-row .note-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.76rem; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .history-row .when{ flex:0 0 auto; font-family:"IBM Plex Mono", monospace; font-size:0.74rem; color:var(--text-dim); }
 
+  .summary-section{ margin:0 1.5rem 1.4rem; }
+  .summary-table-wrap{ background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); overflow:hidden; margin-top:0.7rem; }
+  table.summary-table{ width:100%; border-collapse:collapse; font-size:0.84rem; }
+  table.summary-table thead th{ position:static; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.55rem 0.9rem; border-bottom:1px solid var(--border); }
+  table.summary-table tbody td{ padding:0.5rem 0.9rem; border-bottom:1px solid var(--border); }
+  table.summary-table tbody tr:last-child td{ border-bottom:none; }
+  table.summary-table tbody tr.today{ background:var(--accent-soft); }
+  table.summary-table .num{ font-family:"IBM Plex Mono", monospace; }
+
   /* ---- Mobile ------------------------------------------------------------
      Below ~700px the 10-column table stops being usable even with horizontal
      scroll — each row becomes a stacked card instead, one labeled field per
@@ -141,6 +150,16 @@
   <button class="filter-btn active" data-age="all">Toate</button>
   <button class="filter-btn" data-age="3">&gt; 3 ore</button>
   <button class="filter-btn" data-age="6">&gt; 6 ore</button>
+</div>
+
+<div class="summary-section">
+  <button type="button" class="history-toggle" id="summaryToggle">📊 Sumar pe zile (câte se împachetează + valoare) — click pentru a deschide</button>
+  <div class="summary-table-wrap" id="summaryWrap" style="display:none;">
+    <table class="summary-table">
+      <thead><tr><th>Ziua</th><th>Comenzi împachetate</th><th>Valoare totală</th><th>Ramburs total</th></tr></thead>
+      <tbody id="summaryBody"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="history-section">
@@ -262,6 +281,37 @@
     const data = await res.json();
     document.getElementById('statUnpacked').textContent = data.count;
   }
+
+  // ---- Per-day summary (câte se împachetează + valoare, pe fiecare zi) ----
+  // Pulls the pre-aggregated totals from /api/packed-summary (see
+  // db.listPackedSummary) instead of summing client-side — same PACK-day
+  // grouping as the day selector above, so the numbers here always match
+  // what /api/packed-day/:day would show for that day.
+  const summaryToggle = document.getElementById('summaryToggle');
+  const summaryWrap = document.getElementById('summaryWrap');
+  const summaryBody = document.getElementById('summaryBody');
+  async function loadPackedSummary(){
+    const res = await fetch('/api/packed-summary');
+    const data = await res.json();
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+    if (!data.days.length){
+      summaryBody.innerHTML = '<tr><td colspan="4" class="empty-row">Nicio comandă împachetată încă.</td></tr>';
+      return;
+    }
+    summaryBody.innerHTML = data.days.map(d => `
+      <tr class="${d.day === today ? 'today' : ''}">
+        <td>${d.day}${d.day === today ? ' (azi)' : ''}</td>
+        <td class="num">${d.count}</td>
+        <td class="num">${fmtMoney(d.totalValue, 'RON')}</td>
+        <td class="num">${d.totalCod ? fmtMoney(d.totalCod, 'RON') : '—'}</td>
+      </tr>
+    `).join('');
+  }
+  summaryToggle.addEventListener('click', () => {
+    const opening = summaryWrap.style.display === 'none';
+    summaryWrap.style.display = opening ? 'block' : 'none';
+    if (opening) loadPackedSummary();
+  });
 
   // ---- Return history (lazy-loaded on first open, then kept live) ---------
   const historyToggle = document.getElementById('historyToggle');
@@ -407,6 +457,7 @@
       loadDays();
       loadUnpackedCount();
       loadReturnsCount();
+      if (summaryWrap.style.display !== 'none') loadPackedSummary();
     }, 400);
   }
 
