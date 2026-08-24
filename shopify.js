@@ -101,6 +101,7 @@ const ORDER_QUERY = `
   query OrderForFulfillment($id: ID!) {
     order(id: $id) {
       name
+      note
       createdAt
       totalPriceSet { shopMoney { amount currencyCode } }
       lineItems(first: 20) {
@@ -116,6 +117,7 @@ async function fetchOrderDetails(orderGid) {
   if (!o) return null;
   return {
     name: o.name,
+    note: o.note || '',
     createdAt: o.createdAt,
     total: parseFloat(o.totalPriceSet.shopMoney.amount),
     currency: o.totalPriceSet.shopMoney.currencyCode,
@@ -153,10 +155,11 @@ async function findOrderIdByName(orderName) {
 // computed by the CALLER (server.js), at the moment of the scan, and passed
 // in here as `line`. This function reads whatever is CURRENTLY in the
 // order's Note field on Shopify, appends the line, writes it back, and
-// returns the full resulting note text — so the scan station can show
-// staff exactly what's really in Shopify (including any older lines from
-// previous scans, or notes someone typed there by hand), not just the one
-// line we happen to be adding right now.
+// returns { originalNote, fullNote }:
+//   - originalNote: exactly what was there BEFORE we touched it (the
+//     client's own note/instructions, if any — kept separate so it can be
+//     shown to packing staff distinctly from our own confirmation line)
+//   - fullNote: the merged text now actually saved in Shopify
 const SCAN_TAG = 'scanat-depozit';
 async function appendOrderScanNote(orderGid, line) {
   const data = await shopifyGraphql(
@@ -164,8 +167,9 @@ async function appendOrderScanNote(orderGid, line) {
     { id: orderGid }
   );
   const o = data.order;
-  if (!o) return line; // order not found in Shopify — best-effort fallback
-  const newNote = o.note ? `${o.note}\n${line}` : line;
+  if (!o) return { originalNote: '', fullNote: line }; // order not found — best-effort fallback
+  const originalNote = o.note || '';
+  const newNote = originalNote ? `${originalNote}\n${line}` : line;
   const tags = Array.isArray(o.tags) ? o.tags.slice() : [];
   if (!tags.includes(SCAN_TAG)) tags.push(SCAN_TAG);
   const result = await shopifyGraphql(
@@ -174,7 +178,21 @@ async function appendOrderScanNote(orderGid, line) {
   );
   const errors = result.orderUpdate && result.orderUpdate.userErrors;
   if (errors && errors.length) throw new Error('orderUpdate userErrors: ' + JSON.stringify(errors));
-  return newNote;
+  return { originalNote, fullNote: newNote };
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote };
+// Lightweight, READ-ONLY fetch of just the order's current note — used to
+// opportunistically re-check for a client note on scans AFTER the first one
+// (see server.js /api/scan), since the note can be added to the order a few
+// seconds after the very first scan (e.g. an operator typing it in while the
+// AWB is already being handled at the station) and appendOrderScanNote only
+// ever looks once, at first scan. Returns '' if the order isn't found.
+async function fetchOrderNote(orderGid) {
+  const data = await shopifyGraphql(
+    `query($id: ID!) { order(id: $id) { note } }`,
+    { id: orderGid }
+  );
+  return (data.order && data.order.note) || '';
+}
+
+module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote };
