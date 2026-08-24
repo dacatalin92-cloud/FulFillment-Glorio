@@ -31,22 +31,60 @@ function broadcast(msg) {
   });
 }
 
-// "packed" is a warehouse-floor fact — someone at the scanning station
-// physically confirmed the parcel is boxed and ready — and it must stay
-// completely independent of whatever Sameday's API reports. Sameday status
-// is informational only (shown as a chip, used for the "Ridicate de curier"
-// stat, flags returns), never a trigger for marking something packed. This
-// used to also auto-mark an AWB as packed when Sameday's status implied the
-// courier already had it, on the theory that a "missed" manual scan should
-// self-heal — but that conflated two unrelated concepts and caused every
-// freshly printed AWB to show as packed within seconds (Sameday's status
-// text for a new AWB didn't match the expected "still pending" phrases, so
-// it was read as "already picked up"). Removed entirely: packed now only
-// ever comes from db.recordScan(), i.e. an actual scan at the station.
+// "packed" is primarily a warehouse-floor fact confirmed by a scan at the
+// station — but not every order goes through this app's station. Some are
+// fulfilled through the older/other process, and for those Sameday's own
+// tracking is the only signal that they ever left the warehouse ("cele care
+// au ajuns sa aibe scan de la ei, au fost sigur impachetate"). So Sameday
+// status DOES get to mark something packed — just never instantly. Only two
+// real "still sitting with us" statuses exist; anything past that means a
+// courier scan happened.
+const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
+function samedayIndicatesPickedUp(status) {
+  const t = (status || '').toLowerCase();
+  if (!t) return false;
+  if (t.includes('anulat')) return false;
+  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
+}
+
+// The original incident: this same "picked up" check ran INSTANTLY, right
+// when the AWB was printed, and Sameday's status text for a brand-new label
+// didn't match the two known "still pending" phrases — so it read as
+// "already picked up" within seconds of printing. A courier physically
+// cannot pick something up seconds after the label exists, so nothing gets
+// auto-packed from Sameday status until it's had time to become real. This
+// is also what makes the live poller (every 30s, see startPoller below) a
+// standing reconciliation pass — old-process orders self-heal to packed as
+// soon as they age past this window and Sameday shows real movement.
+const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
+
 function applySamedayUpdate(awb, result) {
-  const row = db.updateSameday(awb, result);
+  let row = db.updateSameday(awb, result);
+  if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
+    const ageMs = Date.now() - new Date(row.awb_created_at).getTime();
+    if (ageMs >= MIN_AWB_AGE_FOR_AUTO_PACK_MS) {
+      row = db.markPackedFromReconciliation(awb, row.sameday_checked_at || new Date().toISOString());
+      console.log(`[sameday] ${awb} reconciled as packed (courier status: ${row.sameday_status})`);
+    }
+  }
   broadcast({ type: 'awb:update', awb: row });
   return row;
+}
+
+// On-demand version of the same reconciliation the live poller does
+// gradually — sweeps every currently-unpacked AWB against its last-known
+// Sameday status right now, for catching up a backlog immediately (e.g.
+// right after the false-packed cleanup) instead of waiting on the 30s
+// poller to cycle through all of them. Uses the cached sameday_status
+// already in the DB rather than hitting Sameday's API again — that column
+// is kept fresh by the poller regardless.
+function reconcileWithSameday(minAgeMinutes) {
+  const minAgeMs = minAgeMinutes * 60 * 1000;
+  const now = Date.now();
+  return db.listUnpackedNotCancelled().filter((row) => {
+    if (!samedayIndicatesPickedUp(row.sameday_status)) return false;
+    return now - new Date(row.awb_created_at).getTime() >= minAgeMs;
+  });
 }
 
 // --- Shopify webhook: fulfillments/create -----------------------------
@@ -260,6 +298,42 @@ app.get('/admin/fix-false-packed', (req, res) => {
     const updated = db.resetFalsePacked(candidates.map((r) => r.awb));
     updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
     res.json({ applied: true, maxAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Reconciliation: some orders are fulfilled through the older/other process
+// and never get a manual scan at this app's station — for those, Sameday's
+// own tracking is the only proof they actually shipped. The live poller
+// already does this gradually every 30s (see applySamedayUpdate above); this
+// sweeps everything currently unpacked right now, for an immediate catch-up
+// instead of waiting on the poll cycle. Same dry-run-first pattern as
+// /admin/fix-false-packed. Usage: /admin/reconcile-sameday?secret=...
+// (add &apply=1 once the list looks right; &minAgeMin=N to change the "must
+// be at least this old" safety window, default 30 — matches
+// MIN_AWB_AGE_FOR_AUTO_PACK_MS).
+app.get('/admin/reconcile-sameday', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const minAgeMin = Math.max(1, Math.min(1440, parseInt(req.query.minAgeMin, 10) || 30));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = reconcileWithSameday(minAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        minAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to mark these packed.',
+      });
+    }
+    const whenIso = new Date().toISOString();
+    const updated = candidates.map((r) => db.markPackedFromReconciliation(r.awb, r.sameday_checked_at || whenIso));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, minAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
