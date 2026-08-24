@@ -141,4 +141,35 @@ async function findOrderIdByName(orderName) {
   return edge.node.id.split('/').pop();
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName };
+// Shopify's Admin API has no mutation to post a staff "comment" into an
+// order's Cronologie/Timeline the way a human does from the admin UI — that
+// CommentEvent type is read-only from the API side. The closest workable
+// substitute: append a timestamped line to the order's Note field (visible
+// on the order page, and Shopify itself logs the note change as a timeline
+// event) and add a tag. Both `note` and `tags` on orderUpdate OVERWRITE the
+// existing value, so we read the current note/tags first and merge.
+async function markOrderScanned(orderGid) {
+  const data = await shopifyGraphql(
+    `query($id: ID!) { order(id: $id) { note tags } }`,
+    { id: orderGid }
+  );
+  const o = data.order;
+  if (!o) return;
+  const stamp = new Date().toLocaleString('ro-RO', {
+    timeZone: 'Europe/Bucharest',
+    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  const line = `Scanat la depozit: ${stamp}`;
+  const newNote = o.note ? `${o.note}\n${line}` : line;
+  const SCAN_TAG = 'scanat-depozit';
+  const tags = Array.isArray(o.tags) ? o.tags.slice() : [];
+  if (!tags.includes(SCAN_TAG)) tags.push(SCAN_TAG);
+  const result = await shopifyGraphql(
+    `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { field message } } }`,
+    { input: { id: orderGid, note: newNote, tags } }
+  );
+  const errors = result.orderUpdate && result.orderUpdate.userErrors;
+  if (errors && errors.length) throw new Error('orderUpdate userErrors: ' + JSON.stringify(errors));
+}
+
+module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, markOrderScanned };
