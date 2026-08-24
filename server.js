@@ -46,14 +46,31 @@ function samedayIndicatesPickedUp(status) {
   return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
 }
 
+// Safety net for samedayIndicatesPickedUp()'s "fail-open" design: it treats
+// ANY status text it doesn't recognize as "already picked up" (only two
+// known phrases mean "still with us"). If Sameday ever returns a new/unknown
+// status for a freshly created AWB — which is exactly what happened, causing
+// every AWB to show as packed within seconds of printing the label — that
+// blacklist match fails and the AWB gets auto-marked packed immediately.
+// A courier physically cannot have picked up a parcel seconds after its AWB
+// was generated, so refuse to auto-pack anything younger than this, no
+// matter what status text comes back. This is a hard backstop independent of
+// whatever wording Sameday uses.
+const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 10 * 60 * 1000; // 10 minutes
+
 // Applies a fresh Sameday status to a row, auto-marking it packed if the
 // status shows the courier already has it (see markPackedFromCourier), then
 // broadcasts the final state once.
 function applySamedayUpdate(awb, result) {
   let row = db.updateSameday(awb, result);
   if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
-    row = db.markPackedFromCourier(awb, row.sameday_checked_at || new Date().toISOString());
-    console.log(`[sameday] ${awb} marked packed automatically (courier status: ${row.sameday_status})`);
+    const ageMs = Date.now() - new Date(row.awb_created_at).getTime();
+    if (ageMs >= MIN_AWB_AGE_FOR_AUTO_PACK_MS) {
+      row = db.markPackedFromCourier(awb, row.sameday_checked_at || new Date().toISOString());
+      console.log(`[sameday] ${awb} marked packed automatically (courier status: ${row.sameday_status})`);
+    } else {
+      console.log(`[sameday] ${awb} looks picked-up per status "${row.sameday_status}" but is only ${Math.round(ageMs / 1000)}s old — skipping auto-pack (too soon to be real; likely an unrecognized status string)`);
+    }
   }
   broadcast({ type: 'awb:update', awb: row });
   return row;
@@ -257,6 +274,20 @@ app.get('/api/today', (req, res) => {
 
 app.get('/api/day/:day', (req, res) => {
   res.json({ day: req.params.day, rows: db.listForDay(req.params.day) });
+});
+
+// --- Dashboard "packed/shipped" view (grouped by pack date, not AWB
+// creation date — see db.js listPackedDays/listPackedForDay) -------------
+app.get('/api/packed-days', (req, res) => {
+  res.json({ days: db.listPackedDays() });
+});
+
+app.get('/api/packed-day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listPackedForDay(req.params.day) });
+});
+
+app.get('/api/unpacked-count', (req, res) => {
+  res.json({ count: db.countUnpacked() });
 });
 
 app.get('/api/lookup/:code', (req, res) => {
