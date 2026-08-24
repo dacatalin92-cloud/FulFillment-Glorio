@@ -182,7 +182,7 @@
       </div>
       <div class="picklist-scroll">
         <table>
-          <thead><tr><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
+          <thead><tr><th>#</th><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
           <tbody id="picklistBody"></tbody>
         </table>
       </div>
@@ -294,11 +294,12 @@
     const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
     document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
     if (!list.length){
-      picklistBody.innerHTML = '<tr><td colspan="5" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
+      picklistBody.innerHTML = '<tr><td colspan="6" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
       return;
     }
-    picklistBody.innerHTML = list.map(row => `
+    picklistBody.innerHTML = list.map((row, i) => `
       <tr data-awb="${escapeAttr(row.awb)}">
+        <td>${i + 1}</td>
         <td>${escapeHtml(row.order_name)}</td>
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
         <td>${productsText(row)}</td>
