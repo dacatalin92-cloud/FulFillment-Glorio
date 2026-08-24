@@ -662,6 +662,13 @@ app.get('/api/packed-day/:day', (req, res) => {
   res.json({ day: req.params.day, rows: db.listPackedForDay(req.params.day) });
 });
 
+// Per-day summary — how many parcels got packed each day and their total
+// value, pre-aggregated server-side (see db.listPackedSummary). Powers the
+// "sumar pe zile" list on the dashboard, newest day first.
+app.get('/api/packed-summary', (req, res) => {
+  res.json({ days: db.listPackedSummary() });
+});
+
 app.get('/api/unpacked-count', (req, res) => {
   res.json({ count: db.countUnpacked() });
 });
@@ -844,7 +851,7 @@ async function backfillToday() {
             id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
           } }
           pageInfo { hasNextPage endCursor }
         }
@@ -876,6 +883,7 @@ async function backfillToday() {
             title: e.node.title,
             qty: e.node.quantity,
             sku: e.node.sku,
+            variant: e.node.variantTitle || '',
             img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
           })),
         });
@@ -909,7 +917,7 @@ async function backfillRange(daysBack, debug) {
             id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku image { url } variant { image { url } } } } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
           } }
           pageInfo { hasNextPage endCursor }
         }
@@ -944,6 +952,7 @@ async function backfillRange(daysBack, debug) {
             title: e.node.title,
             qty: e.node.quantity,
             sku: e.node.sku,
+            variant: e.node.variantTitle || '',
             img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
           })),
         });
