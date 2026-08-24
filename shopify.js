@@ -148,20 +148,22 @@ async function findOrderIdByName(orderName) {
 // on the order page, and Shopify itself logs the note change as a timeline
 // event) and add a tag. Both `note` and `tags` on orderUpdate OVERWRITE the
 // existing value, so we read the current note/tags first and merge.
-async function markOrderScanned(orderGid) {
+//
+// The note LINE itself (e.g. "Scanat la depozit: 24.08.2026 14:32") is
+// computed by the CALLER (server.js), at the moment of the scan, and passed
+// in here as `line` — not generated inside this function. That's what lets
+// server.js hand the exact same text straight back to the scan station in
+// the HTTP response, instantly, instead of waiting on this Shopify
+// round-trip (which still runs, but in the background — see server.js).
+const SCAN_TAG = 'scanat-depozit';
+async function appendOrderScanNote(orderGid, line) {
   const data = await shopifyGraphql(
     `query($id: ID!) { order(id: $id) { note tags } }`,
     { id: orderGid }
   );
   const o = data.order;
   if (!o) return;
-  const stamp = new Date().toLocaleString('ro-RO', {
-    timeZone: 'Europe/Bucharest',
-    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
-  const line = `Scanat la depozit: ${stamp}`;
   const newNote = o.note ? `${o.note}\n${line}` : line;
-  const SCAN_TAG = 'scanat-depozit';
   const tags = Array.isArray(o.tags) ? o.tags.slice() : [];
   if (!tags.includes(SCAN_TAG)) tags.push(SCAN_TAG);
   const result = await shopifyGraphql(
@@ -172,4 +174,4 @@ async function markOrderScanned(orderGid) {
   if (errors && errors.length) throw new Error('orderUpdate userErrors: ' + JSON.stringify(errors));
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, markOrderScanned };
+module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote };
