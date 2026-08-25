@@ -117,6 +117,12 @@
   .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
   .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
 
+  .stock-missing-row{ background:var(--amber-soft) !important; }
+  .stock-missing-row td{ color:var(--amber); }
+  .status-banner.stockmissing{ background:var(--amber-soft); color:var(--amber); font-weight:700; }
+  .clear-stock-missing-btn{ font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--amber); background:var(--surface); color:var(--amber); cursor:pointer; margin-left:0.6rem; }
+  .needs-row .needs-blocked{ margin-top:0.3rem; font-size:0.76rem; color:var(--amber); }
+
   .needs-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; white-space:nowrap; }
 
   .needs-modal{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; padding:0; }
@@ -237,10 +243,16 @@
 <script>
   const tz = 'Europe/Bucharest';
   const REGISTRY_HIDE_AFTER_MS = 60000;
+  // Payload of the fixed "stoc lipsă" QR code — print this text as a QR code
+  // and tape it to the packing table. Scanning it right after an AWB (whose
+  // product isn't in stock) flags that AWB, instead of being looked up as
+  // an AWB itself.
+  const STOCK_MISSING_MARKER = 'GLORIO-STOC-LIPSA';
   let rows = {}; // awb -> row object, current in-memory state
   let returnRows = {}; // awb -> row object, AWBs Sameday shows as "in return" and not yet confirmed received
   let unknownReturns = {}; // id -> entry, return-mode scans that matched no known AWB at all
   let returnMode = false; // when true, the scan input confirms return receipt instead of packing
+  let lastScannedAwb = null; // most recent AWB successfully looked up — target of the next stoc-lipsă marker scan
 
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
   function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -298,9 +310,9 @@
       return;
     }
     picklistBody.innerHTML = list.map((row, i) => `
-      <tr data-awb="${escapeAttr(row.awb)}">
+      <tr data-awb="${escapeAttr(row.awb)}" class="${row.stock_missing ? 'stock-missing-row' : ''}">
         <td>${i + 1}</td>
-        <td>${escapeHtml(row.order_name)}</td>
+        <td>${row.stock_missing ? '⚠️ ' : ''}${escapeHtml(row.order_name)}</td>
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
         <td>${productsText(row)}</td>
         <td>${samedayChip(row)}</td>
@@ -393,6 +405,20 @@
     }
   });
   document.addEventListener('click', async e => {
+    if (e.target.classList.contains('clear-stock-missing-btn')){
+      const awb = e.target.dataset.awb;
+      try {
+        const res = await fetch('/api/stock-missing/clear', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb }) });
+        const data = await res.json();
+        if (data.found){
+          rows[data.row.awb] = data.row;
+          renderAll();
+          if (data.row.awb === lastScannedAwb) renderFound(data.row, null);
+        }
+      } catch (err) { console.error('clear stock-missing failed', err); }
+    }
+  });
+  document.addEventListener('click', async e => {
     if (e.target.classList.contains('resolve-btn')){
       const id = e.target.dataset.id;
       try {
@@ -413,7 +439,7 @@
   const needsSubcount = document.getElementById('needsSubcount');
   function computeProductNeeds(){
     const list = Object.values(rows).filter(isPickable);
-    const agg = new Map(); // key -> { title, img, qty }
+    const agg = new Map(); // key -> { title, img, qty, blockedOrders }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
@@ -422,8 +448,9 @@
         if (existing) {
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
+          if (row.stock_missing && !existing.blockedOrders.includes(row.order_name)) existing.blockedOrders.push(row.order_name);
         } else {
-          agg.set(key, { title: it.title, variant: it.variant || '', img: it.img || null, qty: it.qty });
+          agg.set(key, { title: it.title, variant: it.variant || '', img: it.img || null, qty: it.qty, blockedOrders: row.stock_missing ? [row.order_name] : [] });
         }
       });
     });
@@ -439,7 +466,9 @@
     needsList.innerHTML = items.map(it => `
       <div class="needs-row">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}${it.variant ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.variant)})</span>` : ''}</div>
+        <div class="needs-title">${escapeHtml(it.title)}${it.variant ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.variant)})</span>` : ''}
+          ${it.blockedOrders.length ? `<div class="needs-blocked">⚠️ Stoc lipsă — blocat pentru: ${it.blockedOrders.map(escapeHtml).join(', ')}</div>` : ''}
+        </div>
         <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
       </div>
     `).join('');
@@ -549,7 +578,7 @@
   setInterval(() => { if (!needsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
-    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned' }[kind] || 'first';
+    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned', stockmissing:'stockmissing' }[kind] || 'first';
     return `<div class="status-banner ${cls}">${text}</div>`;
   }
 
@@ -568,8 +597,12 @@
     idleState.style.display = 'none';
     const items = JSON.parse(row.items_json || '[]');
     const totalQty = items.reduce((s,i) => s + i.qty, 0);
+    const stockMissingBanner = row.stock_missing
+      ? `<div class="status-banner stockmissing">⚠️ STOC LIPSĂ — marcat ${fmtTime(row.stock_missing_at)}.<button type="button" class="clear-stock-missing-btn" data-awb="${escapeAttr(row.awb)}">✅ Am adus stocul</button></div>`
+      : '';
     main.innerHTML = `
       ${bannerHtml || ''}
+      ${stockMissingBanner}
       <div class="result">
         <div class="result-head">
           <div class="order-tag">${escapeHtml(row.order_name)}</div>
@@ -609,6 +642,32 @@
     const code = raw.trim();
     if (!code) return;
     input.value = '';
+    // The fixed "stoc lipsă" QR code taped to the packing table — not an
+    // AWB at all, so it's checked BEFORE the returnMode branch and before
+    // any AWB lookup. It flags whichever AWB was last successfully scanned.
+    if (code === STOCK_MISSING_MARKER){
+      if (!lastScannedAwb){
+        idleState.style.display = 'none';
+        main.innerHTML = `
+          <div class="not-found">
+            <div class="glyph">⚠️</div>
+            <h2>Scanează întâi AWB-ul</h2>
+            <p>Codul de „stoc lipsă" trebuie scanat imediat după AWB-ul comenzii care nu poate fi împachetată.</p>
+          </div>
+        `;
+        return;
+      }
+      try {
+        const res = await fetch('/api/stock-missing/flag', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb: lastScannedAwb }) });
+        const data = await res.json();
+        if (data.found){
+          rows[data.row.awb] = data.row;
+          renderAll();
+          renderFound(data.row, null);
+        }
+      } catch (err) { console.error('flag stock-missing failed', err); }
+      return;
+    }
     if (returnMode){
       try {
         const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
@@ -636,9 +695,10 @@
     }
     try {
       const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-      if (res.status === 404){ renderNotFound(code); return; }
+      if (res.status === 404){ lastScannedAwb = null; renderNotFound(code); return; }
       const data = await res.json();
       rows[data.row.awb] = data.row;
+      lastScannedAwb = data.row.awb;
       renderAll();
       const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
       if (data.kind === 'first'){
