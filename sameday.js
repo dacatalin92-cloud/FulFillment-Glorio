@@ -62,6 +62,47 @@ async function ensureToken() {
   return token;
 }
 
+// ---- Read-only lookups needed to build/confirm an AWB-creation payload ----
+// (pickup points, delivery services, counties/cities for the recipient
+// address). Each one re-authenticates via ensureToken() and retries once on
+// a 401, same as getStatus() above.
+async function authedGet(pathAndQuery) {
+  const t = await ensureToken();
+  let res = await fetch(`${BASE}${pathAndQuery}`, {
+    headers: { 'X-Auth-Token': t, 'User-Agent': UA, Accept: 'application/json' },
+  });
+  if (res.status === 401) {
+    token = null;
+    tokenExpiresAt = 0;
+    await ensureToken();
+    res = await fetch(`${BASE}${pathAndQuery}`, {
+      headers: { 'X-Auth-Token': token, 'User-Agent': UA, Accept: 'application/json' },
+    });
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function getPickupPoints() {
+  const data = await authedGet('/api/client/pickup-points');
+  return data.data || data.pickupPoints || data;
+}
+
+async function getServices() {
+  const data = await authedGet('/api/client/services');
+  return data.data || data.services || data;
+}
+
+async function getCounties(countryCode) {
+  const data = await authedGet(`/api/geolocation/county?countryCode=${encodeURIComponent(countryCode || 'RO')}`);
+  return data.data || data.counties || data;
+}
+
+async function getCities(countyId) {
+  const data = await authedGet(`/api/geolocation/city?countyId=${encodeURIComponent(countyId)}`);
+  return data.data || data.cities || data;
+}
+
 async function getStatus(awb) {
   const t = await ensureToken();
   let res = await fetch(`${BASE}/api/client/awb/${encodeURIComponent(awb)}/status`, {
@@ -140,4 +181,4 @@ function startPoller(db, onUpdate, intervalMs) {
   return setInterval(tick, intervalMs);
 }
 
-module.exports = { authenticate, getStatus, startPoller, pollOnce };
+module.exports = { authenticate, getStatus, startPoller, pollOnce, getPickupPoints, getServices, getCounties, getCities };
