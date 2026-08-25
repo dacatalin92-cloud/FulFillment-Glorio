@@ -19,6 +19,10 @@ const PACK_WINDOW_MS = 30000;
 // minutes, without hammering Sameday's API or the DB nonstop.
 const SAMEDAY_POLL_MS = 30 * 1000;
 const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
+// Payload of the fixed "stoc lipsă" QR code, printed once and taped to the
+// packing table (see scan.html) — not a real AWB, just a marker staff scan
+// right after an AWB whose product isn't in stock, to flag it. Checked
+// client-side in scan.html; the server side only needs to know the AWB.
 
 const app = express();
 const server = http.createServer(app);
@@ -757,6 +761,32 @@ app.post('/api/note', (req, res) => {
   const row = db.setNote(awb, note || '');
   broadcast({ type: 'awb:update', awb: row });
   res.json({ row });
+});
+
+// --- Stock-missing flag -----------------------------------------------------
+// Staff scan the AWB first (sees the product), then scan the fixed "stoc
+// lipsă" QR code taped to the packing table — scan.html recognizes that
+// marker code client-side and calls this with the AWB it was just showing.
+// The AWB stays in the normal picking list; this only flags it for
+// visibility and feeds the "Necesar produse" panel with which orders are
+// waiting on which product. Cleared automatically when the AWB is actually
+// packed (see db.js setPacked), or manually via /clear below.
+app.post('/api/stock-missing/flag', (req, res) => {
+  const { awb } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.flagStockMissing(awb, new Date().toISOString());
+  if (!row) return res.status(404).json({ found: false });
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ found: true, row });
+});
+
+app.post('/api/stock-missing/clear', (req, res) => {
+  const { awb } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.clearStockMissing(awb);
+  if (!row) return res.status(404).json({ found: false });
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ found: true, row });
 });
 
 // --- Returns --------------------------------------------------------------
