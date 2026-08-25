@@ -509,6 +509,19 @@
     return h >= 8 && h < 18;
   }
   const registryBody = document.getElementById('registryBody');
+  // "Azi" (today) means it — scoped to the current Bucharest calendar day.
+  // Without this, every AWB ever added to `rows` during however long this
+  // tab has been open (the initial /api/unpacked load pulls the WHOLE
+  // cross-day backlog, and awb:update over the WebSocket keeps piling on
+  // more forever, never pruning packed ones) stayed in the "packed" count
+  // permanently — so a station open since yesterday showed yesterday's
+  // packed parcels as if they'd just been scanned today. Packed rows are
+  // scoped by packed_at (when they were actually confirmed), pending ones
+  // by first_scan_at (their only timestamp).
+  function isToday(iso){
+    if (!iso) return false;
+    return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }) === new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  }
   function renderRegistry(){
     if (!isWorkHours()){
       registryPanel.classList.add('hidden');
@@ -519,7 +532,7 @@
     picklistPanel.classList.remove('full-height');
     const now = Date.now();
     const scanned = Object.values(rows)
-      .filter(r => r.first_scan_at)
+      .filter(r => r.first_scan_at && isToday(r.packed ? r.packed_at : r.first_scan_at))
       .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
     let packed = 0, pending = 0;
     const visibleRows = [];
