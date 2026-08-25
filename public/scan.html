@@ -334,21 +334,20 @@
 
   // ---- Picking list --------------------------------------------------
   const picklistBody = document.getElementById('picklistBody');
+  // 2026-08-26: pe cerința expresă a clientului, un colet iese din lista
+  // "De pregătit pentru curier" STRICT când e scanat de 2 ori la stație
+  // (row.packed, setat doar de db.recordScan) sau când comanda chiar a fost
+  // anulată în Shopify (row.cancelled, din webhook-ul orders/cancelled) —
+  // NICIODATĂ doar pe baza textului de status Sameday. Investigația "65 vs
+  // 53" a găsit exact acest tipar: un status Sameday cu cuvântul "anulat"
+  // (care poate însemna doar "AWB-ul a fost anulat/reemis", nu neapărat
+  // "comanda clientului nu se mai trimite") scotea din listă colete încă
+  // fizic neîmpachetate, fără nicio avertizare. Dacă vreodată se dovedește
+  // util un semnal vizual pentru statusuri suspecte, acela trebuie să fie o
+  // ETICHETĂ pe rândul din listă, nu o eliminare silențioasă din listă.
   function isPickable(row){
     if (row.cancelled) return false;
     if (row.packed) return false;
-    // NOTE: we deliberately do NOT hide a row here just because its Sameday
-    // status text *looks* like "already picked up" (tone 'ok'). A brand-new
-    // AWB's status text is often stale/misleading for its first ~30 minutes
-    // (see server.js MIN_AWB_AGE_FOR_AUTO_PACK_MS) — hiding on that signal
-    // alone was making physically-present, not-yet-packed parcels vanish
-    // from this list. `row.packed` (checked above) is the real source of
-    // truth: the server only ever sets it once that same 30-minute guard has
-    // passed, so trusting it here keeps this list and the physical pile in
-    // sync. Sameday explicitly CANCELLING the shipment is the one exception
-    // worth acting on early — that parcel truly isn't going anywhere.
-    const tone = samedayTone(row.sameday_status, row.sameday_error);
-    if (tone === 'crit') return false;
     return true;
   }
   function renderPicklist(){
@@ -487,11 +486,18 @@
   const needsList = document.getElementById('needsList');
   const needsSubcount = document.getElementById('needsSubcount');
   // Aggregation key includes the full spec (variant + custom properties),
-  // not just SKU — two line items sharing a SKU but differing in a custom
-  // property (a personalization app that doesn't split SKUs per option, for
-  // instance) must NOT be summed together into one misleading total.
+  // not just SKU — two line items sharing a SKU but differing in variantă
+  // (mărime/culoare) sau într-o proprietate custom (o aplicație de
+  // personalizare care nu împarte SKU-uri pe opțiune, de exemplu) NU trebuie
+  // sumate într-un singur total înșelător. Variant era omisă aici înainte
+  // ori de câte ori SKU-ul exista (vezi key-ul din computeProductNeeds /
+  // computeStockMissingNeeds mai jos) — două variante diferite cu același
+  // SKU se combinau greșit sub eticheta primei variante întâlnite.
   function specsKey(it){
-    return (it.props || []).map(p => `${p.key}=${p.value}`).sort().join('|');
+    const parts = [];
+    if (it.variant) parts.push(`variant=${it.variant}`);
+    (it.props || []).forEach(p => parts.push(`${p.key}=${p.value}`));
+    return parts.sort().join('|');
   }
   function computeProductNeeds(){
     const list = Object.values(rows).filter(isPickable);
