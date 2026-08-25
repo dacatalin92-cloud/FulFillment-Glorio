@@ -334,20 +334,19 @@
 
   // ---- Picking list --------------------------------------------------
   const picklistBody = document.getElementById('picklistBody');
-  // 2026-08-26: pe cerința expresă a clientului, un colet iese din lista
-  // "De pregătit pentru curier" STRICT când e scanat de 2 ori la stație
-  // (row.packed, setat doar de db.recordScan) sau când comanda chiar a fost
-  // anulată în Shopify (row.cancelled, din webhook-ul orders/cancelled) —
-  // NICIODATĂ doar pe baza textului de status Sameday. Investigația "65 vs
-  // 53" a găsit exact acest tipar: un status Sameday cu cuvântul "anulat"
-  // (care poate însemna doar "AWB-ul a fost anulat/reemis", nu neapărat
-  // "comanda clientului nu se mai trimite") scotea din listă colete încă
-  // fizic neîmpachetate, fără nicio avertizare. Dacă vreodată se dovedește
-  // util un semnal vizual pentru statusuri suspecte, acela trebuie să fie o
-  // ETICHETĂ pe rândul din listă, nu o eliminare silențioasă din listă.
+  // 2026-08-26: un colet iese din lista "De pregătit pentru curier" când e
+  // scanat de 2 ori la stație (row.packed), când comanda a fost anulată în
+  // Shopify (row.cancelled), SAU când Sameday arată AWB-ul ca anulat
+  // ("Comanda anulata" etc. — AWB-ul e nul, nu se poate preda, indiferent
+  // de starea comenzii în Shopify; verificat manual pe export Sameday din
+  // 26.08.2026 că niciuna din comenzile astfel excluse nu mai era cu
+  // adevărat "în așteptare de ridicare"). NU se mai marchează packed pe baza
+  // statusului Sameday (asta a fost bug-ul din investigația "65 vs 53") —
+  // aici doar se ASCUND din listă, fără să atingă baza de date.
   function isPickable(row){
     if (row.cancelled) return false;
     if (row.packed) return false;
+    if ((row.sameday_status || '').toLowerCase().includes('anulat')) return false;
     return true;
   }
   function renderPicklist(){
