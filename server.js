@@ -337,6 +337,34 @@ app.get('/admin/fix-false-packed', (req, res) => {
   }
 });
 
+// Diagnostic (nu modifică nimic): AWB-uri încă NEÎMPACHETATE (packed=0,
+// cancelled=0 în baza de date — deci FAC parte din /api/unpacked) al căror
+// text de status Sameday conține "anulat". scan.html le ascunde din tabelul
+// "De pregătit pentru curier" (vezi isPickable()) considerându-le "cursă
+// anulată de curier", DAR asta e diferit de order.cancelled (care vine doar
+// din webhook-ul orders/cancelled din Shopify) — dacă Sameday zice "anulat"
+// dintr-un motiv care nu înseamnă că marfa nu mai trebuie ambalată (ex. un
+// AWB anulat și refăcut, sau un text ambiguu), comanda dispare vizual din
+// listă deși contează încă drept "neîmpachetată" — exact tiparul "65 vs 53".
+// Usage: /admin/diagnose-hidden-unpacked?secret=...
+app.get('/admin/diagnose-hidden-unpacked', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const unpacked = db.listUnpackedNotCancelled();
+    const hidden = unpacked.filter((r) => (r.sameday_status || '').toLowerCase().includes('anulat'));
+    res.json({
+      totalUnpackedNotCancelled: unpacked.length,
+      hiddenByAnulatFilter: hidden.length,
+      hidden: hidden.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status, sameday_checked_at: r.sameday_checked_at })),
+      hint: 'Astea sunt "neîmpachetate" în baza de date, dar NU apar în tabelul de pe scan.html din cauza cuvântului "anulat" în statusul Sameday. Verifică manual dacă chiar sunt anulate.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // Reconciliation: some orders are fulfilled through the older/other process
 // and never get a manual scan at this app's station — for those, Sameday's
 // own tracking is the only proof they actually shipped. The live poller
