@@ -177,6 +177,20 @@
   </div>
 </div>
 
+<div class="history-section">
+  <button type="button" class="history-toggle" id="reconToggle">🔍 Reconciliere: ridicat de curier vs scanat în depozit — click pentru a deschide</button>
+  <div class="history-panels" id="reconPanels">
+    <div class="history-card">
+      <h4>⚠️ Ridicate de curier, dar NEscanate în depozit</h4>
+      <div class="history-list" id="reconPickedUpList"><div class="empty-row">—</div></div>
+    </div>
+    <div class="history-card">
+      <h4>⚠️ Scanate în depozit, dar Sameday nu arată ridicare</h4>
+      <div class="history-list" id="reconScannedList"><div class="empty-row">—</div></div>
+    </div>
+  </div>
+</div>
+
 <div class="table-wrap">
   <table>
     <thead><tr>
@@ -353,6 +367,54 @@
     if (open && !historyLoaded) loadHistory();
   });
 
+  // ---- Reconciliere: ridicat de curier vs scanat în depozit ---------------
+  // Two mismatch shapes, both worth a human's attention:
+  //   1. Sameday shows the courier already has it, but nobody ever scanned
+  //      it at the station (packed here only via the reconciliation pass,
+  //      first_scan_at is NULL) — it left the warehouse without our own
+  //      confirmation, which is exactly the gap this whole app exists to
+  //      close.
+  //   2. Staff scanned it (a real station confirmation) and it's been
+  //      packed for a while, but Sameday still doesn't show a courier
+  //      pickup — could be normal lag, could be a parcel that's still
+  //      physically sitting there.
+  // Not day-scoped (like returns) — an anomaly from 2 days ago is still an
+  // anomaly worth surfacing, not just today's.
+  const reconToggle = document.getElementById('reconToggle');
+  const reconPanels = document.getElementById('reconPanels');
+  const reconPickedUpList = document.getElementById('reconPickedUpList');
+  const reconScannedList = document.getElementById('reconScannedList');
+  let reconLoaded = false;
+  function renderReconRow(r, whenLabel){
+    return `
+      <div class="history-row">
+        <span class="awb-cell">${escapeHtml(r.awb)}</span>
+        <span class="order-name">${escapeHtml(r.order_name)}</span>
+        <span class="note-txt">${escapeHtml(r.sameday_status || '—')}</span>
+        <span class="when">${whenLabel}</span>
+      </div>
+    `;
+  }
+  async function loadReconciliation(){
+    const res = await fetch('/api/reconciliation?minAgeHours=3');
+    const data = await res.json();
+    reconPickedUpList.innerHTML = data.pickedUpNotScanned.length
+      ? data.pickedUpNotScanned.map(r => renderReconRow(r, 'împachetat ' + fmtTime(r.packed_at))).join('')
+      : '<div class="empty-row">Nimic — tot ce a ridicat curierul a fost și scanat la stație. 🎉</div>';
+    reconScannedList.innerHTML = data.scannedNotPickedUp.length
+      ? data.scannedNotPickedUp.map(r => renderReconRow(r, 'scanat ' + fmtTime(r.packed_at))).join('')
+      : '<div class="empty-row">Nimic — tot ce s-a scanat a fost și ridicat de curier. 🎉</div>';
+    const total = data.pickedUpNotScanned.length + data.scannedNotPickedUp.length;
+    reconToggle.textContent = total
+      ? `🔍 Reconciliere: ridicat de curier vs scanat în depozit — ${total} nepotrivire${total === 1 ? '' : 'ri'} — click pentru listă`
+      : '🔍 Reconciliere: ridicat de curier vs scanat în depozit — totul se potrivește 🎉';
+    reconLoaded = true;
+  }
+  reconToggle.addEventListener('click', () => {
+    const open = reconPanels.classList.toggle('open');
+    if (open && !reconLoaded) loadReconciliation();
+  });
+
   // ---- Filters -----------------------------------------------------------
   document.querySelectorAll('.filter-btn[data-age]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -511,6 +573,7 @@
       loadUnpackedCount();
       loadReturnsCount();
       if (summaryWrap.style.display !== 'none') loadPackedSummary();
+      loadReconciliation();
     }, 400);
   }
 
@@ -556,6 +619,7 @@
     await loadDay(daySelect.value);
     await loadUnpackedCount();
     await loadReturnsCount();
+    await loadReconciliation();
     connectWs();
   })();
 </script>
