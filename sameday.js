@@ -103,6 +103,38 @@ async function getCities(countyId) {
   return data.data || data.cities || data;
 }
 
+// Creates a real AWB against Sameday's API. Same auth/retry-on-401 pattern
+// as everything else here. Sameday's own validation errors (missing/wrong
+// field, bad county name, etc.) come back as a non-2xx JSON body — we surface
+// that raw message to the caller rather than swallowing it, since it's the
+// fastest way to fix a field name/value without guessing blind.
+async function createAwb(payload) {
+  const t = await ensureToken();
+  const doPost = async (tok) =>
+    fetch(`${BASE}/api/awb`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Token': tok,
+        'Content-Type': 'application/json',
+        'User-Agent': UA,
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  let res = await doPost(t);
+  if (res.status === 401) {
+    token = null;
+    tokenExpiresAt = 0;
+    await ensureToken();
+    res = await doPost(token);
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Sameday createAwb failed: HTTP ${res.status} — ${JSON.stringify(body)}`);
+  }
+  return body; // expected to include the new AWB number
+}
+
 async function getStatus(awb) {
   const t = await ensureToken();
   let res = await fetch(`${BASE}/api/client/awb/${encodeURIComponent(awb)}/status`, {
@@ -181,4 +213,4 @@ function startPoller(db, onUpdate, intervalMs) {
   return setInterval(tick, intervalMs);
 }
 
-module.exports = { authenticate, getStatus, startPoller, pollOnce, getPickupPoints, getServices, getCounties, getCities };
+module.exports = { authenticate, getStatus, startPoller, pollOnce, getPickupPoints, getServices, getCounties, getCities, createAwb };
