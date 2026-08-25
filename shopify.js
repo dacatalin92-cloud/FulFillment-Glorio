@@ -211,4 +211,119 @@ async function fetchOrderNote(orderGid) {
   return (data.order && data.order.note) || '';
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote, extractProperties };
+// ---- AWB-creation support (replacing Xconnector) --------------------------
+// Lists Shopify orders that still need an AWB: not fulfilled, not cancelled.
+// Paged with `after`; caller decides how many pages to walk.
+async function listUnfulfilledOrders(after) {
+  const data = await shopifyGraphql(
+    `query($after: String) {
+      orders(first: 25, after: $after, query: "fulfillment_status:unfulfilled AND status:open", sortKey: CREATED_AT, reverse: true) {
+        edges { node {
+          id name createdAt note phone email
+          displayFinancialStatus
+          totalPriceSet { shopMoney { amount currencyCode } }
+          shippingAddress { name firstName lastName address1 address2 city provinceCode province zip countryCodeV2 phone }
+          lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
+        } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`,
+    { after: after || null }
+  );
+  return {
+    orders: data.orders.edges.map(({ node: o }) => mapOrderForAwb(o)),
+    hasNextPage: data.orders.pageInfo.hasNextPage,
+    endCursor: data.orders.pageInfo.endCursor,
+  };
+}
+
+function mapOrderForAwb(o) {
+  const sa = o.shippingAddress || {};
+  return {
+    orderId: o.id.split('/').pop(),
+    orderGid: o.id,
+    name: o.name,
+    note: o.note || '',
+    createdAt: o.createdAt,
+    phone: sa.phone || o.phone || '',
+    email: o.email || '',
+    isPaid: o.displayFinancialStatus === 'PAID',
+    financialStatus: o.displayFinancialStatus,
+    total: parseFloat(o.totalPriceSet.shopMoney.amount),
+    currency: o.totalPriceSet.shopMoney.currencyCode,
+    shipping: {
+      name: sa.name || [sa.firstName, sa.lastName].filter(Boolean).join(' '),
+      address: [sa.address1, sa.address2].filter(Boolean).join(', '),
+      city: sa.city || '',
+      county: sa.province || '',
+      countyCode: sa.provinceCode || '',
+      postalCode: sa.zip || '',
+      country: sa.countryCodeV2 || 'RO',
+    },
+    items: o.lineItems.edges.map((e) => ({
+      title: e.node.title,
+      qty: e.node.quantity,
+      sku: e.node.sku,
+      variant: e.node.variantTitle || '',
+      props: extractProperties(e.node.customAttributes),
+      img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+    })),
+  };
+}
+
+// Single-order fetch, same shape as listUnfulfilledOrders' entries — used
+// right before actually creating an AWB, so we always work off the freshest
+// address/note/payment-status rather than whatever was cached in a list view
+// a minute earlier.
+async function fetchOrderForAwb(orderGid) {
+  const data = await shopifyGraphql(
+    `query($id: ID!) {
+      order(id: $id) {
+        id name createdAt note phone email
+        displayFinancialStatus
+        totalPriceSet { shopMoney { amount currencyCode } }
+        shippingAddress { name firstName lastName address1 address2 city provinceCode province zip countryCodeV2 phone }
+        lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
+      }
+    }`,
+    { id: orderGid }
+  );
+  if (!data.order) return null;
+  return mapOrderForAwb(data.order);
+}
+
+// After a successful Sameday AWB creation, mark the order fulfilled in
+// Shopify with the tracking number — same end state Xconnector produced,
+// so the customer still sees proper tracking on their order status page.
+async function createFulfillmentWithTracking(orderGid, awbNumber) {
+  const foData = await shopifyGraphql(
+    `query($id: ID!) {
+      order(id: $id) {
+        fulfillmentOrders(first: 5) { edges { node { id status } } }
+      }
+    }`,
+    { id: orderGid }
+  );
+  const fo = (foData.order.fulfillmentOrders.edges.find((e) => e.node.status === 'OPEN') || foData.order.fulfillmentOrders.edges[0]);
+  if (!fo) throw new Error('No open fulfillment order found for this order');
+  const result = await shopifyGraphql(
+    `mutation($fulfillment: FulfillmentInput!) {
+      fulfillmentCreateV2(fulfillment: $fulfillment) {
+        fulfillment { id }
+        userErrors { field message }
+      }
+    }`,
+    {
+      fulfillment: {
+        lineItemsByFulfillmentOrder: [{ fulfillmentOrderId: fo.node.id }],
+        trackingInfo: { number: awbNumber, company: 'Sameday' },
+        notifyCustomer: true,
+      },
+    }
+  );
+  const errors = result.fulfillmentCreateV2 && result.fulfillmentCreateV2.userErrors;
+  if (errors && errors.length) throw new Error('fulfillmentCreateV2 userErrors: ' + JSON.stringify(errors));
+  return result.fulfillmentCreateV2.fulfillment;
+}
+
+module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote, extractProperties, listUnfulfilledOrders, fetchOrderForAwb, createFulfillmentWithTracking };
