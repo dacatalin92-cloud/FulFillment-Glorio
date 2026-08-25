@@ -337,6 +337,58 @@ app.get('/admin/fix-false-packed', (req, res) => {
   }
 });
 
+// Diagnostic ONE-OFF (nu modifică nimic): primește lista reală de AWB-uri
+// "în așteptare de ridicare" direct din exportul Sameday (69 AWB / 67
+// comenzi, dat de utilizator pe 26.08.2026) și verifică, unul câte unul, ce
+// știe baza noastră de date despre fiecare — găsit/negăsit, împachetat sau
+// nu, anulat sau nu, ar apărea sau nu în tabelul din scan.html. Așa vedem
+// exact unde diverge realitatea fizică (exportul Sameday) de ce arată
+// aplicația. Usage: /admin/check-sameday-export?secret=...
+const SAMEDAY_EXPORT_AWBS_260826 = ['1ONB24528264540', '1ONBCS528264074', '1ONB24528264073', '1ONBCS528263826', '1ONB24528257796', '1ONB24528252751', '1ONB24528246046', '1ONB24528246023', '1ONB24528225110', '1ONB24528223355', '1ONB24528223243', '1ONB24528223201', '1ONB24528223152', '1ONB24528181253', '1ONB24528181237', '1ONB24528181215', '1ONB24528181076', '1ONB24528114507', '1ONB24528111569', '1ONB24528111455', '1ONB24528092675', '1ONB24528092662', '1ONB24528087234', '1ONB24528083761', '1ONB24528083687', '1ONB24528083634', '1ONB24528083607', '1ONB24527906874', '1ONB24527890249', '1ONB24527883152', '1ONB24527875435', '1ONB24527874098', '1ONB24527866812', '1ONB24527861220', '1ONB24527860447', '1ONB24527860201', '1ONB24527840087', '1ONBLN527838962', '1ONBRS527837980', '1ONB24527799935', '1ONB24527799861', '1ONB24527699680', '1ONB24527556205', '1ONB24527556147', '1ONB24527554182', '1ONB24527554092', '1ONB24527553473', '1ONB24527553455', '1ONB24527553443', '1ONB24527553436', '1ONB24527553360', '1ONB24527200573', '1ONB24527195552', '1ONB24527189831', '1ONB24527181127', '1ONB24527179315', '1ONB24527148331', '1ONB24527036861', '1ONB24526881809', '1ONB24526879573', '1ONB24526878187', '1ONB24526840036', '1ONB24526829642', '1ONB24526829529', '1ONB24526776835', '1ONB24526776816', '1ONB24526145919', '1ONB24525798837', '1ONB24517558158'];
+app.get('/admin/check-sameday-export', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    function samedayToneCrit(status) {
+      const t = (status || '').toLowerCase();
+      return t.includes('anulat');
+    }
+    const results = SAMEDAY_EXPORT_AWBS_260826.map((awb) => {
+      const row = db.getAwb(awb);
+      if (!row) return { awb, found: false };
+      const wouldShowInPicklist = !row.cancelled && !row.packed && !samedayToneCrit(row.sameday_status);
+      return {
+        awb,
+        found: true,
+        order_name: row.order_name,
+        packed: !!row.packed,
+        cancelled: !!row.cancelled,
+        sameday_status: row.sameday_status,
+        first_scan_at: row.first_scan_at,
+        wouldShowInPicklist,
+      };
+    });
+    const notFound = results.filter((r) => !r.found);
+    const packedNotScanned = results.filter((r) => r.found && r.packed && !r.first_scan_at);
+    const hiddenAsAnulat = results.filter((r) => r.found && !r.packed && !r.cancelled && samedayToneCrit(r.sameday_status));
+    const shouldShowButMissing = results.filter((r) => r.found && !r.wouldShowInPicklist && !r.packed);
+    res.json({
+      totalChecked: results.length,
+      notFoundCount: notFound.length,
+      notFound,
+      packedNotScannedCount: packedNotScanned.length,
+      packedNotScanned,
+      hiddenAsAnulatCount: hiddenAsAnulat.length,
+      hiddenAsAnulat,
+      all: results,
+      hint: 'notFound = AWB-uri din exportul Sameday care lipsesc complet din baza noastră (niciodată sincronizate din Shopify). packedNotScanned = marcate greșit "împachetat" fără scanare reală, deși Sameday încă le arată ca așteptând ridicare.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // Diagnostic (nu modifică nimic): AWB-uri încă NEÎMPACHETATE (packed=0,
 // cancelled=0 în baza de date — deci FAC parte din /api/unpacked) al căror
 // text de status Sameday conține "anulat". scan.html le ascunde din tabelul
