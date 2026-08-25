@@ -150,6 +150,7 @@
   <button class="filter-btn active" data-age="all">Toate</button>
   <button class="filter-btn" data-age="3">&gt; 3 ore</button>
   <button class="filter-btn" data-age="6">&gt; 6 ore</button>
+  <button type="button" class="filter-btn" id="exportCsvBtn">⬇️ Exportă CSV</button>
 </div>
 
 <div class="summary-section">
@@ -179,7 +180,7 @@
 <div class="table-wrap">
   <table>
     <thead><tr>
-      <th>Comandă</th><th>Ora comenzii</th><th>Ora generării AWB</th><th>AWB</th>
+      <th>#</th><th>Comandă</th><th>Ora comenzii</th><th>Ora generării AWB</th><th>AWB</th>
       <th>Valoare</th><th>Ramburs</th><th>Vârstă</th><th>Ora împachetării</th><th>Status Sameday</th><th>Notițe</th>
     </tr></thead>
     <tbody id="tableBody"></tbody>
@@ -393,8 +394,13 @@
   // Only packed/shipped orders show here — anything still owed to a
   // customer and not yet packed belongs to the scanning station's picking
   // list, not this dashboard. Cancelled orders stay excluded too.
+  //
+  // getFilteredSortedRows() is the single source of truth for "what's on
+  // screen right now" (search + age filter + sort) — both the table render
+  // and the CSV export read from it, so the exported file always matches
+  // exactly what's visible, in the same order, with the same row numbers.
   const tableBody = document.getElementById('tableBody');
-  function renderTable(){
+  function getFilteredSortedRows(){
     const q = document.getElementById('searchInput').value.trim().toLowerCase();
     let list = Object.values(rows).filter(r => r.packed && !r.cancelled);
     if (ageFilter !== 'all') list = list.filter(r => ageHours(r) >= Number(ageFilter));
@@ -406,13 +412,17 @@
       });
     }
     list.sort((a,b) => (b.packed_at || b.awb_created_at).localeCompare(a.packed_at || a.awb_created_at));
-
+    return list;
+  }
+  function renderTable(){
+    const list = getFilteredSortedRows();
     if (!list.length){
-      tableBody.innerHTML = '<tr><td colspan="10" class="empty-row">Nicio comandă împachetată încă pentru ziua asta.</td></tr>';
+      tableBody.innerHTML = '<tr><td colspan="11" class="empty-row">Nicio comandă împachetată încă pentru ziua asta.</td></tr>';
       return;
     }
-    tableBody.innerHTML = list.map(row => `
+    tableBody.innerHTML = list.map((row, i) => `
       <tr>
+        <td class="num" data-label="#">${i + 1}</td>
         <td data-label="Comandă">${escapeHtml(row.order_name)}${!row.return_received && isReturnStatus(row.sameday_status) ? ' <span class="chip warn">Retur</span>' : ''}</td>
         <td class="num" data-label="Ora comenzii">${fmtTime(row.order_created_at)}</td>
         <td class="num" data-label="Ora generării AWB">${fmtTime(row.awb_created_at)}</td>
@@ -426,6 +436,49 @@
       </tr>
     `).join('');
   }
+
+  // ---- CSV export ----------------------------------------------------
+  // Exports exactly what's on screen (same filters, same order, same row
+  // numbers) as a CSV a plain double-click opens straight into Excel —
+  // semicolon-separated (Excel's default list separator under Romanian
+  // regional settings) and UTF-8 BOM-prefixed so diacritics (ă, â, î, ș, ț)
+  // render correctly instead of as garbled characters.
+  function csvField(v){
+    const s = String(v ?? '');
+    return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function exportCsv(){
+    const list = getFilteredSortedRows();
+    const header = ['#', 'Comandă', 'Ora comenzii', 'Ora generării AWB', 'AWB', 'Valoare', 'Moneda', 'Ramburs', 'Vârstă (h)', 'Ora împachetării', 'Status Sameday', 'Notițe'];
+    const lines = [header.map(csvField).join(';')];
+    list.forEach((row, i) => {
+      lines.push([
+        i + 1,
+        row.order_name,
+        fmtTime(row.order_created_at),
+        fmtTime(row.awb_created_at),
+        row.awb,
+        row.total != null ? row.total.toFixed(2) : '',
+        row.currency || 'RON',
+        row.cod ? row.cod.toFixed(2) : '',
+        ageHours(row).toFixed(1),
+        fmtTime(row.packed_at),
+        row.sameday_status || '',
+        row.note || '',
+      ].map(csvField).join(';'));
+    });
+    const csv = '﻿' + lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `awb-glorio-${currentDay || 'export'}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+  document.getElementById('exportCsvBtn').addEventListener('click', exportCsv);
 
   function renderAll(){ renderStats(); renderTable(); }
   setInterval(renderAll, 15000); // keep countdown/age chips fresh even with no new events
