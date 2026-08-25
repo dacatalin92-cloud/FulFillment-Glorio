@@ -14,13 +14,48 @@
     --shadow: 0 1px 2px rgba(35,32,25,0.06), 0 8px 24px -12px rgba(35,32,25,0.12);
   }
   @media (prefers-color-scheme: dark){
-    :root:not([data-theme="light"]){
+    :root:not([data-theme="light"]):not([data-color-theme]){
       --bg:#171511; --surface:#1F1C17; --surface-2:#26221B; --border:#38332A;
       --text:#EDE8DD; --text-dim:#A79E8C; --accent:#4FC3AA; --accent-soft:#1B3831;
       --amber:#E0A05C; --amber-soft:#3A2E1B; --red:#E38079; --red-soft:#3D2320;
       --green:#7FCB9A; --green-soft:#1E3625;
     }
   }
+  /* ---- Teme de culoare alternative (2026-08-26) ------------------------
+     Fiecare temă suprascrie complet paleta de mai sus. Se aplică prin
+     [data-color-theme="..."] pe <html>, setat din JS (buton în topbar) și
+     ținut minte în localStorage — implicit rămâne tema "cald" (originală). */
+  :root[data-color-theme="vibrant"]{
+    --bg:#FFF9F2; --surface:#FFFFFF; --surface-2:#FFEADA; --border:#FFCE9E;
+    --text:#241408; --text-dim:#93582C; --accent:#FF6B35; --accent-soft:#FFE1CC;
+    --amber:#F2A900; --amber-soft:#FFF0C2; --red:#E63946; --red-soft:#FBD6D9;
+    --green:#2A9D8F; --green-soft:#D2F1EC;
+    --shadow: 0 1px 2px rgba(150,60,10,0.08), 0 8px 24px -12px rgba(150,60,10,0.18);
+  }
+  :root[data-color-theme="oceanic"]{
+    --bg:#EAF4FB; --surface:#FFFFFF; --surface-2:#D6EAF8; --border:#AAD4EE;
+    --text:#0B2540; --text-dim:#3F6E90; --accent:#0077B6; --accent-soft:#CCE9F8;
+    --amber:#E09F3E; --amber-soft:#FBE7C6; --red:#D62839; --red-soft:#F8D3D7;
+    --green:#2EC4B6; --green-soft:#CFF5F0;
+    --shadow: 0 1px 2px rgba(4,60,94,0.08), 0 8px 24px -12px rgba(4,60,94,0.2);
+  }
+  :root[data-color-theme="padure"]{
+    --bg:#F1EEDF; --surface:#FFFFFF; --surface-2:#E4DEBF; --border:#C7BC86;
+    --text:#1E2A1B; --text-dim:#586B47; --accent:#386641; --accent-soft:#D4E4CB;
+    --amber:#BC6C25; --amber-soft:#F1DCC0; --red:#9A3B3B; --red-soft:#F0D5D5;
+    --green:#588157; --green-soft:#D9EAD8;
+    --shadow: 0 1px 2px rgba(30,42,27,0.08), 0 8px 24px -12px rgba(30,42,27,0.2);
+  }
+  :root[data-color-theme="noapte"]{
+    --bg:#0D0F14; --surface:#161923; --surface-2:#1F2430; --border:#2E3444;
+    --text:#EDEFF5; --text-dim:#8D93A6; --accent:#00E5C7; --accent-soft:#0F3D38;
+    --amber:#FFB86B; --amber-soft:#3D2A15; --red:#FF6B81; --red-soft:#3D171E;
+    --green:#5CE1A0; --green-soft:#12332A;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+  }
+  .theme-switcher{ display:flex; align-items:center; gap:0.35rem; }
+  .theme-dot{ width:1.35rem; height:1.35rem; border-radius:50%; border:2px solid var(--border); cursor:pointer; padding:0; background:var(--dot-bg); }
+  .theme-dot.active{ border-color:var(--text); box-shadow:0 0 0 2px var(--surface), 0 0 0 3px var(--text); }
   *{box-sizing:border-box;} html,body{height:100%;}
   body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; display:flex; flex-direction:column; }
   .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex:0 0 auto; }
@@ -173,7 +208,16 @@
     <span class="mark">Glorio</span>
     <span class="eyebrow">Stație scanare</span>
   </div>
-  <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
+  <div style="display:flex; align-items:center; gap:0.9rem;">
+    <div class="theme-switcher" id="themeSwitcher">
+      <button type="button" class="theme-dot" data-color-theme="cald" style="--dot-bg:#F6F4EF;" title="Cald (implicit)"></button>
+      <button type="button" class="theme-dot" data-color-theme="vibrant" style="--dot-bg:#FF6B35;" title="Vibrant"></button>
+      <button type="button" class="theme-dot" data-color-theme="oceanic" style="--dot-bg:#0077B6;" title="Oceanic"></button>
+      <button type="button" class="theme-dot" data-color-theme="padure" style="--dot-bg:#386641;" title="Pădure"></button>
+      <button type="button" class="theme-dot" data-color-theme="noapte" style="--dot-bg:#0D0F14;" title="Noapte"></button>
+    </div>
+    <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
+  </div>
 </div>
 
 <div class="returns-bar hidden" id="returnsBar">
@@ -271,6 +315,31 @@
 </div>
 
 <script>
+  // ---- Teme de culoare ---------------------------------------------------
+  // "cald" e tema originală (nu setează atributul deloc, ca să rămână și
+  // modul întunecat automat din CSS pentru ea). Alegerea se ține minte per
+  // stație (localStorage), separat de orice alt dispozitiv.
+  const THEME_STORAGE_KEY = 'awb-glorio-color-theme';
+  function applyColorTheme(theme){
+    if (!theme || theme === 'cald') document.documentElement.removeAttribute('data-color-theme');
+    else document.documentElement.setAttribute('data-color-theme', theme);
+    document.querySelectorAll('.theme-dot').forEach(btn => {
+      btn.classList.toggle('active', (btn.dataset.colorTheme || 'cald') === (theme || 'cald'));
+    });
+  }
+  (function initColorTheme(){
+    let saved = 'cald';
+    try { saved = localStorage.getItem(THEME_STORAGE_KEY) || 'cald'; } catch (err) { /* private mode etc. */ }
+    applyColorTheme(saved);
+    document.getElementById('themeSwitcher').addEventListener('click', e => {
+      const btn = e.target.closest('.theme-dot');
+      if (!btn) return;
+      const theme = btn.dataset.colorTheme || 'cald';
+      applyColorTheme(theme);
+      try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (err) { /* ignore */ }
+    });
+  })();
+
   const tz = 'Europe/Bucharest';
   const REGISTRY_HIDE_AFTER_MS = 60000;
   // Payload of the fixed "stoc lipsă" QR code — print this text as a QR code
