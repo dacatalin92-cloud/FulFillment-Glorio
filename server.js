@@ -905,6 +905,140 @@ app.get('/api/unknown-returns/history', (req, res) => {
   res.json({ rows: db.listResolvedUnknownReturns() });
 });
 
+// --- Create AWB from our own platform (replacing Xconnector) -------------
+// Confirmed against the real Sameday account (see /admin/sameday-lookup):
+// pickup point "Mihai" = id 498340, contact person "Mihai"; service "24H"
+// = id 7. Hardcoded here rather than env vars since this is a one-warehouse
+// operation and changing it is a code change either way.
+const AWB_PICKUP_POINT_ID = 498340;
+const AWB_CONTACT_PERSON = 'Mihai';
+const AWB_SERVICE_ID = 7;
+const AWB_DEFAULT_WEIGHT_KG = 1;
+const AWB_PACKAGE_TYPE = 1; // 1 = Colet (matches packageType seen on normal parcels in /admin/sameday-lookup)
+
+// Lists Shopify orders that still need an AWB (not fulfilled, not
+// cancelled) — the picking pool for the new "Creează AWB" screen. Excludes
+// anything that already has an AWB in our own DB (covers orders someone
+// already fulfilled through Xconnector in the meantime).
+app.get('/api/orders-needing-awb', async (req, res) => {
+  try {
+    const { orders, hasNextPage, endCursor } = await shopify.listUnfulfilledOrders(req.query.after || null);
+    const filtered = orders.filter((o) => !db.hasAwbForOrder(o.orderId));
+    res.json({ orders: filtered, hasNextPage, endCursor });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Easy browser-testable dry run: /admin/awb-preview?secret=...&order=%2316265
+// Never creates anything — just resolves the order by its Shopify name and
+// shows the exact payload /api/create-awb would send. Use this to sanity
+// check a real order's data before the "Generează AWB" button exists.
+app.get('/admin/awb-preview', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const orderName = req.query.order;
+    if (!orderName) return res.status(400).json({ error: 'lipsește ?order=%23NNNNN' });
+    const orderId = await shopify.findOrderIdByName(orderName);
+    if (!orderId) return res.status(404).json({ error: 'comanda nu a fost găsită' });
+    const order = await shopify.fetchOrderForAwb(`gid://shopify/Order/${orderId}`);
+    const weight = Number(req.query.weight) > 0 ? Number(req.query.weight) : AWB_DEFAULT_WEIGHT_KG;
+    const isCod = !order.isPaid;
+    const payload = {
+      pickupPoint: AWB_PICKUP_POINT_ID,
+      contactPerson: AWB_CONTACT_PERSON,
+      packageType: AWB_PACKAGE_TYPE,
+      packageNumber: 1,
+      packageWeight: weight,
+      service: AWB_SERVICE_ID,
+      awbPayment: 1,
+      cashOnDelivery: isCod ? order.total : 0,
+      thirdPartyPickup: 0,
+      observation: order.note || '',
+      clientInternalReference: order.name,
+      awbRecipient: {
+        name: order.shipping.name,
+        phoneNumber: order.phone || '',
+        email: order.email || '',
+        personType: 0,
+        countyString: order.shipping.county,
+        cityString: order.shipping.city,
+        address: order.shipping.address,
+        postalCode: order.shipping.postalCode,
+      },
+    };
+    res.json({ order, payload });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Builds the exact payload we'd send to Sameday for one order, without
+// necessarily sending it — pass &confirm=1 to actually create the AWB.
+// Without confirm, this is a safe dry-run: nothing is created, nothing is
+// charged, nothing touches Shopify. Use it to eyeball the payload / diagnose
+// a Sameday validation error before flipping confirm on.
+app.post('/api/create-awb', async (req, res) => {
+  const confirm = req.body.confirm === true;
+  try {
+    const order = await shopify.fetchOrderForAwb(req.body.orderGid);
+    if (!order) return res.status(404).json({ error: 'order not found' });
+    const weight = Number(req.body.weight) > 0 ? Number(req.body.weight) : AWB_DEFAULT_WEIGHT_KG;
+    const isCod = typeof req.body.isCod === 'boolean' ? req.body.isCod : !order.isPaid;
+    const codAmount = isCod ? order.total : 0;
+    const payload = {
+      pickupPoint: AWB_PICKUP_POINT_ID,
+      contactPerson: AWB_CONTACT_PERSON,
+      packageType: AWB_PACKAGE_TYPE,
+      packageNumber: 1,
+      packageWeight: weight,
+      service: AWB_SERVICE_ID,
+      awbPayment: 1, // 1 = client (Glorio) pays the courier fee — same as Xconnector's default billing
+      cashOnDelivery: codAmount,
+      thirdPartyPickup: 0,
+      observation: order.note || '',
+      clientInternalReference: order.name,
+      awbRecipient: {
+        name: order.shipping.name,
+        phoneNumber: order.phone || '',
+        email: order.email || '',
+        personType: 0,
+        countyString: order.shipping.county,
+        cityString: order.shipping.city,
+        address: order.shipping.address,
+        postalCode: order.shipping.postalCode,
+      },
+    };
+    if (!confirm) {
+      return res.json({ dryRun: true, payload, order });
+    }
+    const result = await sameday.createAwb(payload);
+    const awbNumber = result.awbNumber || result.awb || (Array.isArray(result.parcels) && result.parcels[0] && result.parcels[0].awbNumber);
+    if (!awbNumber) {
+      return res.status(502).json({ error: 'Sameday nu a întors un număr de AWB', raw: result });
+    }
+    await shopify.createFulfillmentWithTracking(order.orderGid, awbNumber);
+    const nowIso = new Date().toISOString();
+    db.upsertAwb({
+      awb: awbNumber,
+      order_name: order.name,
+      order_created_at: order.createdAt,
+      awb_created_at: nowIso,
+      total: order.total,
+      currency: order.currency,
+      order_id: order.orderId,
+      client_note: order.note || '',
+      items: order.items,
+    });
+    broadcast({ type: 'refresh' });
+    res.json({ dryRun: false, awb: awbNumber, order, raw: result });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // --- Sameday polling (courier status for open AWBs) ----------------------
 // Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
 // entirely (e.g. while investigating a block/lockout on the Sameday side)
