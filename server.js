@@ -373,6 +373,43 @@ app.get('/admin/reconcile-sameday', (req, res) => {
   }
 });
 
+// Diagnostic (nu modifică nimic): găsește AWB-urile marcate "împachetat" DAR
+// niciodată scanate fizic la stație (first_scan_at gol) — adică au fost
+// "împachetate" automat de reconcilierea cu Sameday (applySamedayUpdate ->
+// markPackedFromReconciliation), pe baza textului de status. Unele sunt
+// corecte (comenzi onorate prin celălalt proces, mai vechi). Altele pot fi
+// FALSE POZITIVE: coletul stă încă fizic neîmpachetat, dar Sameday are un
+// text de status care nu se potrivește cu PENDING_PICKUP_PHRASES, deci a
+// fost interpretat greșit ca "ridicat de curier". Grupat pe text de status
+// exact, ca să se vadă rapid ce formulare lipsește din listă.
+// Usage: /admin/diagnose-false-packed?secret=...
+app.get('/admin/diagnose-false-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const allPacked = db.listAllPacked ? db.listAllPacked() : db.db.prepare('SELECT * FROM awbs WHERE packed = 1 AND cancelled = 0').all();
+    const neverScanned = allPacked.filter((r) => r.packed && !r.cancelled && !r.first_scan_at);
+    const byStatus = new Map();
+    for (const r of neverScanned) {
+      const key = r.sameday_status || '(fără status)';
+      if (!byStatus.has(key)) byStatus.set(key, []);
+      byStatus.get(key).push({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at });
+    }
+    const groups = [...byStatus.entries()]
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([status, rows]) => ({ sameday_status: status, count: rows.length, sample: rows.slice(0, 15) }));
+    res.json({
+      totalPackedNotCancelled: allPacked.filter((r) => !r.cancelled).length,
+      neverScannedCount: neverScanned.length,
+      groups,
+      hint: 'Verifică manual dacă comenzile din grupurile de mai jos chiar au plecat. Dacă nu, adaugă formularea lor de status în PENDING_PICKUP_PHRASES din server.js.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // The live poller (see startPoller below) only checks Sameday status for
 // AWBs created today/yesterday — on purpose, so it doesn't hammer Sameday's
 // API with thousands of requests every 30s for orders that settled long ago.
