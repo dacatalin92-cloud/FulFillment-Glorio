@@ -113,6 +113,15 @@
   .unknown-returns-row .note-input{ flex:1 1 auto; }
   .resolve-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--green); background:var(--green-soft); color:var(--green); cursor:pointer; }
 
+  .stock-missing-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
+  .stock-missing-bar.hidden{ display:none; }
+  .stock-missing-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--amber); font-weight:600; font-size:0.88rem; }
+  .stock-missing-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:220px; overflow-y:auto; }
+  .stock-missing-list-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .stock-missing-list-row .order-name{ flex:0 0 auto; font-weight:500; }
+  .stock-missing-list-row .products-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
+  .stock-missing-list-row .flagged-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
+
   .scan-mode-row{ display:flex; gap:0.6rem; align-items:center; }
   .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
   .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -176,6 +185,13 @@
     <span>⚠️ <span id="unknownReturnsCount">0</span> retur(uri) neidentificate (nu sunt în sistem) — click pentru listă</span>
   </div>
   <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
+</div>
+
+<div class="stock-missing-bar hidden" id="stockMissingBar">
+  <div class="stock-missing-bar-head" id="stockMissingBarHead">
+    <span>⚠️ <span id="stockMissingCount">0</span> comandă(comenzi) cu stoc lipsă — click pentru listă</span>
+  </div>
+  <div class="stock-missing-list" id="stockMissingList" style="display:none;"></div>
 </div>
 
 <div class="layout">
@@ -527,10 +543,38 @@
   }
   setInterval(renderRegistry, 5000);
 
+  // ---- Stock-missing list (separate from the picking list) --------------
+  // A dedicated view of every currently-flagged AWB, regardless of where it
+  // sits in the picking list — computed straight from `rows` (no separate
+  // fetch/endpoint needed, since stock_missing rides along on every awb:new/
+  // awb:update the WebSocket already delivers). Cleared entries drop off
+  // automatically the next renderAll() after their flag is cleared (manually
+  // or by getting packed).
+  const stockMissingBar = document.getElementById('stockMissingBar');
+  const stockMissingList = document.getElementById('stockMissingList');
+  function renderStockMissingBar(){
+    const list = Object.values(rows).filter(r => r.stock_missing).sort((a,b) => (b.stock_missing_at || '').localeCompare(a.stock_missing_at || ''));
+    document.getElementById('stockMissingCount').textContent = list.length;
+    stockMissingBar.classList.toggle('hidden', list.length === 0);
+    stockMissingList.innerHTML = list.map(row => `
+      <div class="stock-missing-list-row">
+        <span class="order-name">${escapeHtml(row.order_name)}</span>
+        <span class="awb-cell">${escapeHtml(row.awb)}</span>
+        <span class="products-txt">${productsText(row)}</span>
+        <span class="flagged-at">${fmtTime(row.stock_missing_at)}</span>
+        <button type="button" class="clear-stock-missing-btn" data-awb="${escapeAttr(row.awb)}">✅ Am adus stocul</button>
+      </div>
+    `).join('');
+  }
+  document.getElementById('stockMissingBarHead').addEventListener('click', () => {
+    stockMissingList.style.display = stockMissingList.style.display === 'none' ? 'flex' : 'none';
+  });
+
   function renderAll(){
     document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
     renderPicklist();
     renderRegistry();
+    renderStockMissingBar();
     if (needsModal.classList.contains('open')) renderNeeds();
   }
 
