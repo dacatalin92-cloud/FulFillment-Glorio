@@ -354,6 +354,15 @@ function listPackedSummary() {
   return Array.from(byDay.values()).sort((a, b) => b.day.localeCompare(a.day));
 }
 
+// Every currently packed (not cancelled) AWB, across all days — the same
+// raw set backing listPackedDays/listPackedForDay/listPackedSummary above,
+// exposed directly for backend logic that needs the whole packed set at
+// once instead of one pack-day at a time. Used by the dashboard's courier-
+// vs-warehouse-scan reconciliation view (see server.js /api/reconciliation).
+function listPackedNotCancelled() {
+  return stmts.listPackedRaw.all();
+}
+
 // Count of AWBs still not packed (and not cancelled) — used by the dashboard
 // stat card now that its main row-fetch is scoped to a single packed day and
 // can no longer be used to derive this count itself.
@@ -452,4 +461,4 @@ function clearStockMissing(awb) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
