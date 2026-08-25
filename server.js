@@ -677,6 +677,38 @@ app.get('/api/unpacked-count', (req, res) => {
   res.json({ count: db.countUnpacked() });
 });
 
+// --- Reconciliation: courier pickup vs warehouse scan --------------------
+// Two distinct mismatch shapes, both surfaced for the dashboard's
+// "Reconciliere" panel:
+//   - pickedUpNotScanned: Sameday's own status shows the courier already
+//     has it, but this row was never scanned at the station (packed here
+//     only via the background Sameday reconciliation pass — first_scan_at
+//     is NULL). It left the warehouse without our own confirmation.
+//   - scannedNotPickedUp: a REAL station scan confirmed it packed (first_
+//     scan_at is set) a while ago (minAgeHours, default 3h — long enough
+//     that this isn't just normal courier-status lag), but Sameday still
+//     doesn't show a pickup.
+// Reuses samedayIndicatesPickedUp(), the same status-text rule the live
+// poller and /admin/reconcile-sameday already use, so "picked up" means the
+// same thing everywhere in this app. Not day-scoped — an anomaly from a
+// couple of days ago is still worth a human's attention, not just today's.
+app.get('/api/reconciliation', (req, res) => {
+  const minAgeHours = Math.max(0, Math.min(72, parseFloat(req.query.minAgeHours) || 3));
+  const minAgeMs = minAgeHours * 3600 * 1000;
+  const now = Date.now();
+  const packed = db.listPackedNotCancelled();
+
+  const pickedUpNotScanned = packed
+    .filter((r) => !r.first_scan_at && samedayIndicatesPickedUp(r.sameday_status))
+    .sort((a, b) => (b.packed_at || '').localeCompare(a.packed_at || ''));
+
+  const scannedNotPickedUp = packed
+    .filter((r) => r.first_scan_at && r.packed_at && !samedayIndicatesPickedUp(r.sameday_status) && now - new Date(r.packed_at).getTime() >= minAgeMs)
+    .sort((a, b) => (a.packed_at || '').localeCompare(b.packed_at || ''));
+
+  res.json({ minAgeHours, pickedUpNotScanned, scannedNotPickedUp });
+});
+
 // Full list of every AWB that exists (has a printed label) but is neither
 // packed nor cancelled — across ALL days, not just today. This is the real
 // "still owed to a courier" backlog: unlike /api/today (which is scoped to
