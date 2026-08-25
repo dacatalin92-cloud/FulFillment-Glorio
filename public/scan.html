@@ -75,6 +75,8 @@
   .item-info{ flex:1 1 auto; min-width:0; }
   .item-info .title{ font-size:1.02rem; font-weight:500; line-height:1.35; margin:0 0 0.4rem; }
   .item-info .sku{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); }
+  .specs-row{ display:flex; flex-wrap:wrap; gap:0.35rem; margin:0 0 0.5rem; }
+  .spec-chip{ display:inline-block; font-size:0.88rem; font-weight:700; padding:0.22rem 0.6rem; border-radius:6px; background:var(--accent); color:#fff; }
   .qty-badge{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:12px; padding:0.6rem 1.1rem; min-width:64px; }
   .qty-badge .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.7rem; line-height:1; }
   .qty-badge .lbl{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.06em; margin-top:0.15rem; }
@@ -312,9 +314,22 @@
     return `<span class="chip ${tone}" title="${escapeAttr(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
   }
 
+  // Combines the Shopify VARIANT (size/color/etc. chosen as an actual
+  // product variant) with any custom line-item PROPERTIES (specs some
+  // products carry a different way — a personalization/options app, or
+  // manual entry at checkout — that never show up in variantTitle at all).
+  // Both are shown together everywhere a product is listed, since either
+  // one missing at the packing station is exactly the kind of mix-up that
+  // can't happen.
+  function specsText(it){
+    const parts = [];
+    if (it.variant) parts.push(it.variant);
+    (it.props || []).forEach(p => parts.push(`${p.key}: ${p.value}`));
+    return parts.join(' · ');
+  }
   function productsText(row){
     const items = JSON.parse(row.items_json || '[]');
-    return items.map(it => `${it.qty}× ${escapeHtml(it.title)}${it.variant ? ' (' + escapeHtml(it.variant) + ')' : ''}`).join(', ') || '—';
+    return items.map(it => { const s = specsText(it); return `${it.qty}× ${escapeHtml(it.title)}${s ? ' (' + escapeHtml(s) + ')' : ''}`; }).join(', ') || '—';
   }
 
   // ---- Picking list --------------------------------------------------
@@ -465,20 +480,28 @@
   const needsModal = document.getElementById('needsModal');
   const needsList = document.getElementById('needsList');
   const needsSubcount = document.getElementById('needsSubcount');
+  // Aggregation key includes the full spec (variant + custom properties),
+  // not just SKU — two line items sharing a SKU but differing in a custom
+  // property (a personalization app that doesn't split SKUs per option, for
+  // instance) must NOT be summed together into one misleading total.
+  function specsKey(it){
+    return (it.props || []).map(p => `${p.key}=${p.value}`).sort().join('|');
+  }
   function computeProductNeeds(){
     const list = Object.values(rows).filter(isPickable);
-    const agg = new Map(); // key -> { title, img, qty, blockedOrders }
+    const agg = new Map(); // key -> { title, specs, img, qty, blockedOrders }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
-        const key = (it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`;
+        const sk = specsKey(it);
+        const key = ((it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`) + '::' + sk;
         const existing = agg.get(key);
         if (existing) {
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
           if (row.stock_missing && !existing.blockedOrders.includes(row.order_name)) existing.blockedOrders.push(row.order_name);
         } else {
-          agg.set(key, { title: it.title, variant: it.variant || '', img: it.img || null, qty: it.qty, blockedOrders: row.stock_missing ? [row.order_name] : [] });
+          agg.set(key, { title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty, blockedOrders: row.stock_missing ? [row.order_name] : [] });
         }
       });
     });
@@ -494,7 +517,7 @@
     needsList.innerHTML = items.map(it => `
       <div class="needs-row">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}${it.variant ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.variant)})</span>` : ''}
+        <div class="needs-title">${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
           ${it.blockedOrders.length ? `<div class="needs-blocked">⚠️ Stoc lipsă — blocat pentru: ${it.blockedOrders.map(escapeHtml).join(', ')}</div>` : ''}
         </div>
         <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
@@ -520,17 +543,18 @@
   const stockMissingNeedsSubcount = document.getElementById('stockMissingNeedsSubcount');
   function computeStockMissingNeeds(){
     const list = Object.values(rows).filter(r => r.stock_missing);
-    const agg = new Map(); // key -> { title, img, qty }
+    const agg = new Map(); // key -> { title, specs, img, qty }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
-        const key = (it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`;
+        const sk = specsKey(it);
+        const key = ((it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`) + '::' + sk;
         const existing = agg.get(key);
         if (existing) {
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
         } else {
-          agg.set(key, { title: it.title, variant: it.variant || '', img: it.img || null, qty: it.qty });
+          agg.set(key, { title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty });
         }
       });
     });
@@ -546,7 +570,7 @@
     stockMissingNeedsList.innerHTML = items.map(it => `
       <div class="needs-row">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}${it.variant ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.variant)})</span>` : ''}</div>
+        <div class="needs-title">${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}</div>
         <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
       </div>
     `).join('');
@@ -733,7 +757,10 @@
             ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
             <div class="item-info">
               <p class="title">${escapeHtml(it.title)}</p>
-              ${it.variant ? `<span class="sku" style="display:block;">${escapeHtml(it.variant)}</span>` : ''}
+              ${(it.variant || (it.props && it.props.length)) ? `<div class="specs-row">
+                ${it.variant ? `<span class="spec-chip">${escapeHtml(it.variant)}</span>` : ''}
+                ${(it.props || []).map(p => `<span class="spec-chip">${escapeHtml(p.key)}: ${escapeHtml(p.value)}</span>`).join('')}
+              </div>` : ''}
               ${it.sku ? `<span class="sku">SKU: ${escapeHtml(it.sku)}</span>` : ''}
               ${idx === 0 && row.client_note ? `<div style="margin-top:0.35rem; font-size:0.82rem; color:var(--amber); background:var(--amber-soft); border-radius:6px; padding:0.35rem 0.55rem;">💬 Notă client: ${escapeHtml(row.client_note).replace(/\n/g, '<br>')}</div>` : ''}
             </div>
