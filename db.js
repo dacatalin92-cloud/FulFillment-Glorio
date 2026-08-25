@@ -44,6 +44,8 @@ for (const stmt of [
   'ALTER TABLE awbs ADD COLUMN return_received_at TEXT',
   'ALTER TABLE awbs ADD COLUMN scan_note TEXT',
   'ALTER TABLE awbs ADD COLUMN client_note TEXT',
+  'ALTER TABLE awbs ADD COLUMN stock_missing INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE awbs ADD COLUMN stock_missing_at TEXT',
 ]) {
   try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
 }
@@ -87,7 +89,10 @@ const stmts = {
     WHERE awb = ?
   `),
   setFirstScan: db.prepare('UPDATE awbs SET first_scan_at = ? WHERE awb = ?'),
-  setPacked: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
+  // Packing a parcel is proof the stock was actually there after all — clear
+  // any stale "stoc lipsă" flag at the same time so it can't outlive the
+  // problem it was flagging.
+  setPacked: db.prepare('UPDATE awbs SET packed = 1, packed_at = ?, stock_missing = 0, stock_missing_at = NULL WHERE awb = ?'),
   // Used for the Sameday reconciliation pass — marks packed WITHOUT touching
   // first_scan_at (unlike the old, removed setPackedFromCourier), so a
   // reconciled row is never mistaken for a manually-scanned one again (see
@@ -147,6 +152,12 @@ const stmts = {
   // (our own "Scanat la depozit..." line) so packing staff can see the
   // client's actual instructions distinctly from our own confirmation text.
   setClientNote: db.prepare('UPDATE awbs SET client_note = ? WHERE awb = ? AND (client_note IS NULL OR client_note = \'\')'),
+  // "Stoc lipsă" flag: set when staff scan the fixed QR code taped to the
+  // packing table right after an AWB whose product isn't available. Cleared
+  // either manually (a "found the stock" button) or automatically the moment
+  // that AWB actually gets packed (see setPacked above).
+  setStockMissing: db.prepare('UPDATE awbs SET stock_missing = 1, stock_missing_at = ? WHERE awb = ?'),
+  clearStockMissing: db.prepare('UPDATE awbs SET stock_missing = 0, stock_missing_at = NULL WHERE awb = ?'),
 };
 
 const upsertStmt = db.prepare(`
@@ -418,4 +429,27 @@ function setClientNoteIfEmpty(awb, note) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty };
+// Flags an AWB as blocked on missing stock — triggered when staff scan the
+// fixed "stoc lipsă" QR code right after the AWB itself (see server.js
+// /api/stock-missing/flag). The AWB stays in the normal picking list (it
+// still needs to ship eventually); this only marks it for visibility and
+// feeds the "Necesar produse" panel in scan.html so staff can see exactly
+// which orders are waiting on which product.
+function flagStockMissing(awb, whenIso) {
+  const row = getAwb(awb);
+  if (!row) return null;
+  stmts.setStockMissing.run(whenIso, awb);
+  return getAwb(awb);
+}
+
+// Manual "found the stock after all" clear — independent of packing, so
+// staff can un-flag an order the moment stock comes back in even before
+// it's actually packed.
+function clearStockMissing(awb) {
+  const row = getAwb(awb);
+  if (!row) return null;
+  stmts.clearStockMissing.run(awb);
+  return getAwb(awb);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
