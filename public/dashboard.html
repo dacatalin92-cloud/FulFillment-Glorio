@@ -83,6 +83,17 @@
   .history-row .note-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.76rem; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .history-row .when{ flex:0 0 auto; font-family:"IBM Plex Mono", monospace; font-size:0.74rem; color:var(--text-dim); }
 
+  .awb-create-list{ display:flex; flex-direction:column; gap:0.7rem; }
+  .awb-create-card{ background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); padding:0.9rem 1rem; display:flex; flex-wrap:wrap; gap:0.8rem; align-items:center; justify-content:space-between; }
+  .awb-create-card .info{ flex:1 1 260px; min-width:0; }
+  .awb-create-card .info .name{ font-weight:600; }
+  .awb-create-card .info .addr{ font-size:0.8rem; color:var(--text-dim); margin-top:0.15rem; }
+  .awb-create-card .info .items{ font-size:0.78rem; color:var(--text-dim); margin-top:0.2rem; }
+  .awb-create-card .actions{ display:flex; align-items:center; gap:0.5rem; flex:0 0 auto; }
+  .awb-create-card input.weight-input{ width:4.5rem; font-family:"IBM Plex Mono", monospace; padding:0.35rem 0.5rem; border-radius:6px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .awb-create-card button.gen-btn{ font-family:"IBM Plex Mono", monospace; font-size:0.8rem; font-weight:600; padding:0.5rem 0.9rem; border-radius:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; }
+  .awb-create-card button.gen-btn:disabled{ opacity:0.6; cursor:default; }
+
   .summary-section{ margin:0 1.5rem 1.4rem; }
   .summary-table-wrap{ background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); overflow:hidden; margin-top:0.7rem; }
   table.summary-table{ width:100%; border-collapse:collapse; font-size:0.84rem; }
@@ -188,6 +199,13 @@
       <h4>⚠️ Scanate în depozit, dar Sameday nu arată ridicare</h4>
       <div class="history-list" id="reconScannedList"><div class="empty-row">—</div></div>
     </div>
+  </div>
+</div>
+
+<div class="history-section">
+  <button type="button" class="history-toggle" id="awbCreateToggle">📦 Creează AWB — comenzi fără AWB — click pentru a deschide</button>
+  <div id="awbCreatePanel" style="display:none; margin-top:0.9rem;">
+    <div id="awbCreateList"></div>
   </div>
 </div>
 
@@ -614,12 +632,107 @@
     };
   }
 
+  // ---- Creează AWB (înlocuiește Xconnector) -------------------------------
+  // Lists Shopify orders that still need an AWB, lets staff generate a real
+  // one right from here. Every generate click asks for an explicit browser
+  // confirm() first — this is a real, billable, irreversible action against
+  // Sameday (creates a real shipment, real cost) and against Shopify (marks
+  // the order fulfilled with tracking), so no accidental double-clicks.
+  const awbCreateToggle = document.getElementById('awbCreateToggle');
+  const awbCreatePanel = document.getElementById('awbCreatePanel');
+  const awbCreateList = document.getElementById('awbCreateList');
+  let awbCandidates = [];
+
+  async function loadAwbCandidates(){
+    try {
+      const res = await fetch('/api/orders-needing-awb');
+      const data = await res.json();
+      awbCandidates = data.orders || [];
+    } catch (err) {
+      console.error('loadAwbCandidates failed', err);
+      awbCandidates = [];
+    }
+    renderAwbCandidates();
+  }
+
+  function renderAwbCandidates(){
+    awbCreateToggle.textContent = awbCandidates.length
+      ? `📦 Creează AWB — ${awbCandidates.length} comand${awbCandidates.length === 1 ? 'ă' : 'ă'} fără AWB — click pentru listă`
+      : '📦 Creează AWB — nicio comandă în așteptare 🎉';
+    if (!awbCandidates.length){
+      awbCreateList.innerHTML = '<div class="empty-row">Nicio comandă fără AWB momentan.</div>';
+      return;
+    }
+    awbCreateList.innerHTML = `<div class="awb-create-list">${awbCandidates.map(o => `
+      <div class="awb-create-card" data-order="${escapeHtml(o.orderGid)}">
+        <div class="info">
+          <div class="name">${escapeHtml(o.name)} — ${escapeHtml(o.shipping.name || '—')}</div>
+          <div class="addr">${escapeHtml(o.shipping.address)}, ${escapeHtml(o.shipping.city)} (${escapeHtml(o.shipping.county)}) · ${escapeHtml(o.phone || 'fără telefon')}</div>
+          <div class="items">${o.items.map(it => `${it.qty}× ${escapeHtml(it.title)}`).join(', ') || '—'}</div>
+        </div>
+        <div class="actions">
+          <span class="chip ${o.isPaid ? 'ok' : 'warn'}">${o.isPaid ? 'Plătit' : 'Ramburs ' + fmtMoney(o.total, o.currency)}</span>
+          <input type="number" class="weight-input" value="1" min="0.1" step="0.1" title="Greutate (kg)">
+          <button type="button" class="gen-btn">Generează AWB</button>
+        </div>
+      </div>
+    `).join('')}</div>`;
+    awbCreateList.querySelectorAll('.gen-btn').forEach(btn => {
+      btn.addEventListener('click', () => handleGenerateAwb(btn));
+    });
+  }
+
+  async function handleGenerateAwb(btn){
+    const card = btn.closest('.awb-create-card');
+    const orderGid = card.dataset.order;
+    const order = awbCandidates.find(o => o.orderGid === orderGid);
+    if (!order) return;
+    const weight = parseFloat(card.querySelector('.weight-input').value) || 1;
+    const codLine = order.isPaid ? 'Plătit online' : `Ramburs ${fmtMoney(order.total, order.currency)}`;
+    const ok = confirm(
+      `Generezi AWB REAL pentru ${order.name}?\n\n` +
+      `${order.shipping.name}\n${order.shipping.address}, ${order.shipping.city}\n` +
+      `${codLine}\nGreutate: ${weight} kg\n\n` +
+      `Asta creează un AWB adevărat la Sameday (cost real) și marchează comanda ca expediată în Shopify.`
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    btn.textContent = 'Se generează…';
+    try {
+      const res = await fetch('/api/create-awb', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderGid, weight, confirm: true }),
+      });
+      const data = await res.json();
+      if (data.error){
+        alert('Eroare Sameday:\n' + data.error);
+        btn.disabled = false;
+        btn.textContent = 'Generează AWB';
+        return;
+      }
+      alert(`AWB creat: ${data.awb}`);
+      awbCandidates = awbCandidates.filter(o => o.orderGid !== orderGid);
+      renderAwbCandidates();
+    } catch (err) {
+      alert('Eroare de rețea: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = 'Generează AWB';
+    }
+  }
+
+  awbCreateToggle.addEventListener('click', () => {
+    const opening = awbCreatePanel.style.display === 'none';
+    awbCreatePanel.style.display = opening ? 'block' : 'none';
+  });
+
   (async function init(){
     await loadDays();
     await loadDay(daySelect.value);
     await loadUnpackedCount();
     await loadReturnsCount();
     await loadReconciliation();
+    await loadAwbCandidates();
     connectWs();
   })();
 </script>
