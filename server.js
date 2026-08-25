@@ -881,7 +881,7 @@ async function backfillToday() {
             id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
           } }
           pageInfo { hasNextPage endCursor }
         }
@@ -914,6 +914,7 @@ async function backfillToday() {
             qty: e.node.quantity,
             sku: e.node.sku,
             variant: e.node.variantTitle || '',
+            props: shopify.extractProperties(e.node.customAttributes),
             img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
           })),
         });
@@ -947,7 +948,7 @@ async function backfillRange(daysBack, debug) {
             id name createdAt updatedAt note
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } } } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
           } }
           pageInfo { hasNextPage endCursor }
         }
@@ -983,6 +984,7 @@ async function backfillRange(daysBack, debug) {
             qty: e.node.quantity,
             sku: e.node.sku,
             variant: e.node.variantTitle || '',
+            props: shopify.extractProperties(e.node.customAttributes),
             img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
           })),
         });
