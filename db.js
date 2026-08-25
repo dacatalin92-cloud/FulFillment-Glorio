@@ -100,10 +100,6 @@ const stmts = {
   // first_scan_at === packed_at). Reconciled rows keep first_scan_at NULL.
   setPackedFromReconciliation: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
   cancelledAwbsForOrder: db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0'),
-  // Used by the new "Creează AWB" screen (server.js /api/orders-needing-awb)
-  // to hide Shopify orders that already have a live AWB in our own DB — e.g.
-  // fulfilled moments ago through Xconnector, or through this same feature.
-  anyAwbForOrder: db.prepare('SELECT 1 FROM awbs WHERE order_id = ? AND cancelled = 0 LIMIT 1'),
   cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
   setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
   findByCodeFuzzy: db.prepare("SELECT * FROM awbs WHERE ? LIKE awb || '%' OR awb LIKE ? || '%' LIMIT 1"),
@@ -257,11 +253,6 @@ function markOrderCancelled(orderId) {
 function setNote(awb, note) {
   stmts.setNote.run(note, awb);
   return getAwb(awb);
-}
-
-function hasAwbForOrder(orderId) {
-  if (!orderId) return false;
-  return !!stmts.anyAwbForOrder.get(String(orderId));
 }
 
 function findByCode(code) {
@@ -480,4 +471,4 @@ function clearStockMissing(awb) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, hasAwbForOrder };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
