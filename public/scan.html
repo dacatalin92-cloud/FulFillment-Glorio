@@ -133,6 +133,7 @@
   .needs-row .needs-blocked{ margin-top:0.3rem; font-size:0.76rem; color:var(--amber); }
 
   .needs-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; white-space:nowrap; }
+  .needs-btn.stock-missing-needs-btn{ border-color:var(--amber); background:var(--amber-soft); color:var(--amber); }
 
   .needs-modal{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; padding:0; }
   .needs-modal.open{ display:flex; }
@@ -200,6 +201,7 @@
       <div class="picklist-head">
         <h3>De pregătit pentru curier</h3>
         <button type="button" class="needs-btn" id="needsBtn">📋 Necesar produse</button>
+        <button type="button" class="needs-btn stock-missing-needs-btn" id="stockMissingNeedsBtn">🚫 Produse lipsă</button>
         <span class="count-pill" id="picklistCount">0 comenzi</span>
       </div>
       <div class="picklist-scroll">
@@ -253,6 +255,16 @@
       <button type="button" class="needs-close" id="needsCloseBtn" aria-label="Închide">✕</button>
     </div>
     <div class="needs-list" id="needsList"></div>
+  </div>
+</div>
+
+<div class="needs-modal" id="stockMissingNeedsModal">
+  <div class="needs-panel">
+    <div class="needs-header">
+      <h3>🚫 Produse lipsă — <span id="stockMissingNeedsSubcount">0</span> comenzi blocate</h3>
+      <button type="button" class="needs-close" id="stockMissingNeedsCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="needs-list" id="stockMissingNeedsList"></div>
   </div>
 </div>
 
@@ -498,6 +510,56 @@
   });
   needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
 
+  // ---- Stock-missing product needs (image + quantity only) ----------------
+  // Same aggregation idea as "Necesar produse" above, but scoped ONLY to
+  // orders currently flagged stoc lipsă — a quick "what do I actually need
+  // to go buy/restock right now" view, stripped down to just the picture
+  // and the quantity so it reads at a glance.
+  const stockMissingNeedsModal = document.getElementById('stockMissingNeedsModal');
+  const stockMissingNeedsList = document.getElementById('stockMissingNeedsList');
+  const stockMissingNeedsSubcount = document.getElementById('stockMissingNeedsSubcount');
+  function computeStockMissingNeeds(){
+    const list = Object.values(rows).filter(r => r.stock_missing);
+    const agg = new Map(); // key -> { title, img, qty }
+    list.forEach(row => {
+      const items = JSON.parse(row.items_json || '[]');
+      items.forEach(it => {
+        const key = (it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`;
+        const existing = agg.get(key);
+        if (existing) {
+          existing.qty += it.qty;
+          if (!existing.img && it.img) existing.img = it.img;
+        } else {
+          agg.set(key, { title: it.title, variant: it.variant || '', img: it.img || null, qty: it.qty });
+        }
+      });
+    });
+    return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
+  }
+  function renderStockMissingNeeds(){
+    const { orderCount, items } = computeStockMissingNeeds();
+    stockMissingNeedsSubcount.textContent = orderCount;
+    if (!items.length){
+      stockMissingNeedsList.innerHTML = '<div class="empty-row">Nimic marcat stoc lipsă în acest moment. 🎉</div>';
+      return;
+    }
+    stockMissingNeedsList.innerHTML = items.map(it => `
+      <div class="needs-row">
+        ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
+        <div class="needs-title">${escapeHtml(it.title)}${it.variant ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.variant)})</span>` : ''}</div>
+        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+      </div>
+    `).join('');
+  }
+  document.getElementById('stockMissingNeedsBtn').addEventListener('click', () => {
+    renderStockMissingNeeds();
+    stockMissingNeedsModal.classList.add('open');
+  });
+  document.getElementById('stockMissingNeedsCloseBtn').addEventListener('click', () => {
+    stockMissingNeedsModal.classList.remove('open');
+  });
+  stockMissingNeedsModal.addEventListener('click', e => { if (e.target === stockMissingNeedsModal) stockMissingNeedsModal.classList.remove('open'); });
+
   // ---- Registry --------------------------------------------------------
   // Only useful while the warehouse is actually staffed — outside 08:00-18:00
   // (Bucharest time) we hide it and let the picking list use the full column,
@@ -589,6 +651,7 @@
     renderRegistry();
     renderStockMissingBar();
     if (needsModal.classList.contains('open')) renderNeeds();
+    if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
   }
 
   // Every ~30s Sameday poll cycle broadcasts one awb:update message PER AWB
@@ -630,9 +693,9 @@
   const main = document.getElementById('main');
   const idleState = document.getElementById('idleState');
   function keepFocus(){ input.focus(); }
-  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal')) keepFocus(); });
+  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal') && !e.target.closest('#stockMissingNeedsModal')) keepFocus(); });
   window.addEventListener('load', keepFocus);
-  setInterval(() => { if (!needsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
+  setInterval(() => { if (!needsModal.classList.contains('open') && !stockMissingNeedsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
     const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned', stockmissing:'stockmissing' }[kind] || 'first';
