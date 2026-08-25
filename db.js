@@ -100,6 +100,10 @@ const stmts = {
   // first_scan_at === packed_at). Reconciled rows keep first_scan_at NULL.
   setPackedFromReconciliation: db.prepare('UPDATE awbs SET packed = 1, packed_at = ? WHERE awb = ?'),
   cancelledAwbsForOrder: db.prepare('SELECT awb FROM awbs WHERE order_id = ? AND cancelled = 0'),
+  // Used by the new "Creează AWB" screen (server.js /api/orders-needing-awb)
+  // to hide Shopify orders that already have a live AWB in our own DB — e.g.
+  // fulfilled moments ago through Xconnector, or through this same feature.
+  anyAwbForOrder: db.prepare('SELECT 1 FROM awbs WHERE order_id = ? AND cancelled = 0 LIMIT 1'),
   cancelOrder: db.prepare('UPDATE awbs SET cancelled = 1 WHERE order_id = ?'),
   setNote: db.prepare('UPDATE awbs SET note = ? WHERE awb = ?'),
   findByCodeFuzzy: db.prepare("SELECT * FROM awbs WHERE ? LIKE awb || '%' OR awb LIKE ? || '%' LIMIT 1"),
@@ -216,6 +220,16 @@ function recordScan(awb, nowIso, packWindowMs) {
   if (row.packed) {
     return { found: true, row, kind: 'already', };
   }
+  if (row.stock_missing) {
+    // Flagged "stoc lipsă" — never let ANY scan (first or a would-be
+    // confirming second one) progress this to packed while the flag is
+    // still on, even if it's already past its first scan and technically
+    // inside the normal confirm window. Nothing about first_scan_at is
+    // touched here, so the state staff left it in stays exactly as it was.
+    // Staff must clear the flag (via the "am adus stocul" button, once the
+    // product is actually back) before this AWB can be packed at all.
+    return { found: true, row, kind: 'blocked' };
+  }
   if (!row.first_scan_at) {
     stmts.setFirstScan.run(nowIso, awb);
     return { found: true, row: getAwb(awb), kind: 'first' };
@@ -243,6 +257,11 @@ function markOrderCancelled(orderId) {
 function setNote(awb, note) {
   stmts.setNote.run(note, awb);
   return getAwb(awb);
+}
+
+function hasAwbForOrder(orderId) {
+  if (!orderId) return false;
+  return !!stmts.anyAwbForOrder.get(String(orderId));
 }
 
 function findByCode(code) {
@@ -461,4 +480,4 @@ function clearStockMissing(awb) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, hasAwbForOrder };
