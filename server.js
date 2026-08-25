@@ -62,15 +62,18 @@ function samedayIndicatesPickedUp(status) {
 // soon as they age past this window and Sameday shows real movement.
 const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
 
+// 2026-08-26: dezactivat auto-pack-ul din reconciliere pe cerința expresă a
+// clientului — lista de "De pregătit pentru curier" trebuie să reflecte
+// STRICT scanările reale de la stație (db.recordScan), niciodată textul de
+// status Sameday. Investigația "65 vs 53" a arătat că reconcilierea automată
+// bazată pe status (orice text în afara celor 2 fraze "încă e la noi" conta
+// ca "ridicat") e prea riscantă — un text de status neprevăzut poate scoate
+// din listă un colet încă fizic neîmpachetat. markPackedFromReconciliation
+// și reconcileWithSameday rămân disponibile ca unelte manuale de admin
+// (/admin/reconcile-sameday), pentru curățare punctuală de backlog vechi,
+// dar NU mai rulează automat din poller-ul de 30s.
 function applySamedayUpdate(awb, result) {
-  let row = db.updateSameday(awb, result);
-  if (row && !row.packed && !row.cancelled && samedayIndicatesPickedUp(row.sameday_status)) {
-    const ageMs = Date.now() - new Date(row.awb_created_at).getTime();
-    if (ageMs >= MIN_AWB_AGE_FOR_AUTO_PACK_MS) {
-      row = db.markPackedFromReconciliation(awb, row.sameday_checked_at || new Date().toISOString());
-      console.log(`[sameday] ${awb} reconciled as packed (courier status: ${row.sameday_status})`);
-    }
-  }
+  const row = db.updateSameday(awb, result);
   broadcast({ type: 'awb:update', awb: row });
   return row;
 }
