@@ -337,12 +337,18 @@
   function isPickable(row){
     if (row.cancelled) return false;
     if (row.packed) return false;
+    // NOTE: we deliberately do NOT hide a row here just because its Sameday
+    // status text *looks* like "already picked up" (tone 'ok'). A brand-new
+    // AWB's status text is often stale/misleading for its first ~30 minutes
+    // (see server.js MIN_AWB_AGE_FOR_AUTO_PACK_MS) — hiding on that signal
+    // alone was making physically-present, not-yet-packed parcels vanish
+    // from this list. `row.packed` (checked above) is the real source of
+    // truth: the server only ever sets it once that same 30-minute guard has
+    // passed, so trusting it here keeps this list and the physical pile in
+    // sync. Sameday explicitly CANCELLING the shipment is the one exception
+    // worth acting on early — that parcel truly isn't going anywhere.
     const tone = samedayTone(row.sameday_status, row.sameday_error);
-    // 'ok' = courier already has it (in transit/delivered/etc — nothing left
-    // to pack). 'crit' = Sameday itself shows the shipment cancelled — it's
-    // never going anywhere, so it doesn't belong on an actionable packing
-    // list either, even though nobody has touched our own `cancelled` flag.
-    if (tone === 'ok' || tone === 'crit') return false;
+    if (tone === 'crit') return false;
     return true;
   }
   function renderPicklist(){
@@ -858,6 +864,13 @@
         renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
       } else if (data.kind === 'cancelled'){
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
+      } else if (data.kind === 'blocked'){
+        // Nu mai afișăm niciun banner special de "blocat" — comanda arată
+        // exact ca de obicei, iar singurul semnal e banner-ul galben
+        // persistent de mai jos (redat automat de renderFound când
+        // row.stock_missing e activ), care rămâne acolo indiferent câte
+        // scanări se mai fac, până se apasă „Am adus stocul".
+        renderFound(data.row, noteLine ? renderStatusBanner('first', noteLine) : '');
       }
     } catch (err) {
       console.error('scan failed', err);
