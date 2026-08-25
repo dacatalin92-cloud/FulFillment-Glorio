@@ -916,6 +916,64 @@ const AWB_SERVICE_ID = 7;
 const AWB_DEFAULT_WEIGHT_KG = 1;
 const AWB_PACKAGE_TYPE = 1; // 1 = Colet (matches packageType seen on normal parcels in /admin/sameday-lookup)
 
+// Shared payload builder — every route below (dry-run preview, GET test
+// route, real POST route) constructs the exact same shape from the exact
+// same inputs, so a fix here fixes all three call sites at once.
+function buildAwbPayload(order, weightOverride, isCodOverride) {
+  const weight = Number(weightOverride) > 0 ? Number(weightOverride) : AWB_DEFAULT_WEIGHT_KG;
+  const isCod = typeof isCodOverride === 'boolean' ? isCodOverride : !order.isPaid;
+  return {
+    pickupPoint: AWB_PICKUP_POINT_ID,
+    contactPerson: AWB_CONTACT_PERSON,
+    packageType: AWB_PACKAGE_TYPE,
+    packageNumber: 1,
+    packageWeight: weight,
+    service: AWB_SERVICE_ID,
+    awbPayment: 1, // 1 = client (Glorio) pays the courier fee — same as Xconnector's default billing
+    cashOnDelivery: isCod ? order.total : 0,
+    thirdPartyPickup: 0,
+    observation: order.note || '',
+    clientInternalReference: order.name,
+    awbRecipient: {
+      name: order.shipping.name,
+      phoneNumber: order.phone || '',
+      email: order.email || '',
+      personType: 0,
+      countyString: order.shipping.county,
+      cityString: order.shipping.city,
+      address: order.shipping.address,
+      postalCode: order.shipping.postalCode,
+    },
+  };
+}
+
+// After Sameday accepts the payload, finishes the job: marks the Shopify
+// order fulfilled with tracking + saves the AWB locally + tells connected
+// clients to refresh. Shared by the GET test route and the real POST route.
+async function finishAwbCreation(order, samedayResult) {
+  const awbNumber = samedayResult.awbNumber || samedayResult.awb ||
+    (Array.isArray(samedayResult.parcels) && samedayResult.parcels[0] && samedayResult.parcels[0].awbNumber);
+  if (!awbNumber) {
+    const err = new Error('Sameday nu a întors un număr de AWB — vezi raw');
+    err.raw = samedayResult;
+    throw err;
+  }
+  await shopify.createFulfillmentWithTracking(order.orderGid, awbNumber);
+  db.upsertAwb({
+    awb: awbNumber,
+    order_name: order.name,
+    order_created_at: order.createdAt,
+    awb_created_at: new Date().toISOString(),
+    total: order.total,
+    currency: order.currency,
+    order_id: order.orderId,
+    client_note: order.note || '',
+    items: order.items,
+  });
+  broadcast({ type: 'refresh' });
+  return awbNumber;
+}
+
 // Lists Shopify orders that still need an AWB (not fulfilled, not
 // cancelled) — the picking pool for the new "Creează AWB" screen. Excludes
 // anything that already has an AWB in our own DB (covers orders someone
@@ -944,98 +1002,59 @@ app.get('/admin/awb-preview', async (req, res) => {
     const orderId = await shopify.findOrderIdByName(orderName);
     if (!orderId) return res.status(404).json({ error: 'comanda nu a fost găsită' });
     const order = await shopify.fetchOrderForAwb(`gid://shopify/Order/${orderId}`);
-    const weight = Number(req.query.weight) > 0 ? Number(req.query.weight) : AWB_DEFAULT_WEIGHT_KG;
-    const isCod = !order.isPaid;
-    const payload = {
-      pickupPoint: AWB_PICKUP_POINT_ID,
-      contactPerson: AWB_CONTACT_PERSON,
-      packageType: AWB_PACKAGE_TYPE,
-      packageNumber: 1,
-      packageWeight: weight,
-      service: AWB_SERVICE_ID,
-      awbPayment: 1,
-      cashOnDelivery: isCod ? order.total : 0,
-      thirdPartyPickup: 0,
-      observation: order.note || '',
-      clientInternalReference: order.name,
-      awbRecipient: {
-        name: order.shipping.name,
-        phoneNumber: order.phone || '',
-        email: order.email || '',
-        personType: 0,
-        countyString: order.shipping.county,
-        cityString: order.shipping.city,
-        address: order.shipping.address,
-        postalCode: order.shipping.postalCode,
-      },
-    };
+    const payload = buildAwbPayload(order, req.query.weight, null);
     res.json({ order, payload });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-// Builds the exact payload we'd send to Sameday for one order, without
-// necessarily sending it — pass &confirm=1 to actually create the AWB.
-// Without confirm, this is a safe dry-run: nothing is created, nothing is
-// charged, nothing touches Shopify. Use it to eyeball the payload / diagnose
-// a Sameday validation error before flipping confirm on.
+// The FIRST real-creation test, browser-friendly like awb-preview above, but
+// this one actually calls Sameday, actually fulfills the Shopify order with
+// tracking, and actually saves the AWB — same effect as pressing a real
+// "Generează AWB" button. Requires &confirm=1 as a second, explicit
+// deliberate step (never triggered by just loading /admin/awb-preview).
+// Usage: /admin/awb-create-test?secret=...&order=%2319634&confirm=1
+app.get('/admin/awb-create-test', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const orderName = req.query.order;
+    if (!orderName) return res.status(400).json({ error: 'lipsește ?order=%23NNNNN' });
+    if (req.query.confirm !== '1') {
+      return res.status(400).json({ error: 'adaugă &confirm=1 ca să confirmi că vrei să creezi un AWB REAL pentru această comandă' });
+    }
+    const orderId = await shopify.findOrderIdByName(orderName);
+    if (!orderId) return res.status(404).json({ error: 'comanda nu a fost găsită' });
+    const order = await shopify.fetchOrderForAwb(`gid://shopify/Order/${orderId}`);
+    const payload = buildAwbPayload(order, req.query.weight, null);
+    const samedayResult = await sameday.createAwb(payload);
+    const awbNumber = await finishAwbCreation(order, samedayResult);
+    res.json({ awb: awbNumber, order, payload, raw: samedayResult });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err), raw: err.raw });
+  }
+});
+
+// Real route the future "Generează AWB" button will call. Pass confirm:true
+// in the body to actually create; without it, returns the same dry-run
+// preview as /admin/awb-preview (kept here too so the UI can show a
+// confirmation screen before the user commits).
 app.post('/api/create-awb', async (req, res) => {
   const confirm = req.body.confirm === true;
   try {
     const order = await shopify.fetchOrderForAwb(req.body.orderGid);
     if (!order) return res.status(404).json({ error: 'order not found' });
-    const weight = Number(req.body.weight) > 0 ? Number(req.body.weight) : AWB_DEFAULT_WEIGHT_KG;
-    const isCod = typeof req.body.isCod === 'boolean' ? req.body.isCod : !order.isPaid;
-    const codAmount = isCod ? order.total : 0;
-    const payload = {
-      pickupPoint: AWB_PICKUP_POINT_ID,
-      contactPerson: AWB_CONTACT_PERSON,
-      packageType: AWB_PACKAGE_TYPE,
-      packageNumber: 1,
-      packageWeight: weight,
-      service: AWB_SERVICE_ID,
-      awbPayment: 1, // 1 = client (Glorio) pays the courier fee — same as Xconnector's default billing
-      cashOnDelivery: codAmount,
-      thirdPartyPickup: 0,
-      observation: order.note || '',
-      clientInternalReference: order.name,
-      awbRecipient: {
-        name: order.shipping.name,
-        phoneNumber: order.phone || '',
-        email: order.email || '',
-        personType: 0,
-        countyString: order.shipping.county,
-        cityString: order.shipping.city,
-        address: order.shipping.address,
-        postalCode: order.shipping.postalCode,
-      },
-    };
+    const payload = buildAwbPayload(order, req.body.weight, req.body.isCod);
     if (!confirm) {
       return res.json({ dryRun: true, payload, order });
     }
-    const result = await sameday.createAwb(payload);
-    const awbNumber = result.awbNumber || result.awb || (Array.isArray(result.parcels) && result.parcels[0] && result.parcels[0].awbNumber);
-    if (!awbNumber) {
-      return res.status(502).json({ error: 'Sameday nu a întors un număr de AWB', raw: result });
-    }
-    await shopify.createFulfillmentWithTracking(order.orderGid, awbNumber);
-    const nowIso = new Date().toISOString();
-    db.upsertAwb({
-      awb: awbNumber,
-      order_name: order.name,
-      order_created_at: order.createdAt,
-      awb_created_at: nowIso,
-      total: order.total,
-      currency: order.currency,
-      order_id: order.orderId,
-      client_note: order.note || '',
-      items: order.items,
-    });
-    broadcast({ type: 'refresh' });
-    res.json({ dryRun: false, awb: awbNumber, order, raw: result });
+    const samedayResult = await sameday.createAwb(payload);
+    const awbNumber = await finishAwbCreation(order, samedayResult);
+    res.json({ dryRun: false, awb: awbNumber, order, raw: samedayResult });
   } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
+    res.status(500).json({ error: String(err.message || err), raw: err.raw });
   }
 });
 
