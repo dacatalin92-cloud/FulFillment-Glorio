@@ -304,6 +304,26 @@ app.get('/admin/backfill-old', async (req, res) => {
   }
 });
 
+// Step 1 of the "create AWB from our own platform" feature (replacing
+// Xconnector): a read-only lookup so we can see the REAL Sameday IDs behind
+// the dropdown labels Xconnector shows (e.g. pickup point "Mihai", service
+// "24 de ore") before wiring an actual "Generează AWB" button anywhere.
+// Usage: /admin/sameday-lookup?secret=...
+app.get('/admin/sameday-lookup', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const [pickupPoints, services] = await Promise.all([
+      sameday.getPickupPoints(),
+      sameday.getServices(),
+    ]);
+    res.json({ pickupPoints, services });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // One-off cleanup for the now-removed auto-pack-from-courier bug: some AWBs
 // got marked packed within moments of their label being printed, without
 // anyone actually scanning them (see db.js findFalsePackedCandidates for the
@@ -781,7 +801,10 @@ app.post('/api/scan', async (req, res) => {
       console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
     }
   }
-  if (result.kind && result.kind !== 'already') {
+  // 'already' and 'blocked' both mean nothing about the row actually
+  // changed on this scan — no need to broadcast a state nobody's state
+  // just changed to.
+  if (result.kind && result.kind !== 'already' && result.kind !== 'blocked') {
     broadcast({ type: 'awb:update', awb: result.row });
   }
   res.json({ found: true, kind: result.kind, row: result.row });
