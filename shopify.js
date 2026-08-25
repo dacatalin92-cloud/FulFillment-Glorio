@@ -105,11 +105,25 @@ const ORDER_QUERY = `
       createdAt
       totalPriceSet { shopMoney { amount currencyCode } }
       lineItems(first: 20) {
-        edges { node { title quantity sku image { url } variant { image { url } } } }
+        edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } }
       }
     }
   }
 `;
+
+// Some products carry their real specification (color, size, engraving text,
+// etc.) not as a Shopify VARIANT at all, but as custom line-item PROPERTIES
+// — set by a personalization app, a custom options app, or manual entry at
+// checkout. variantTitle stays empty/"Default Title" for those, which is
+// exactly the case reported as "specs not showing at the scan station" even
+// after variant support was added. customAttributes carries that data — an
+// internal bookkeeping key some apps add starts with "_" and is never meant
+// for a human to see, so those are filtered out.
+function extractProperties(customAttributes) {
+  return (customAttributes || [])
+    .filter((a) => a.key && !a.key.startsWith('_') && a.value)
+    .map((a) => ({ key: a.key, value: a.value }));
+}
 
 async function fetchOrderDetails(orderGid) {
   const data = await shopifyGraphql(ORDER_QUERY, { id: orderGid });
@@ -125,6 +139,8 @@ async function fetchOrderDetails(orderGid) {
       title: e.node.title,
       qty: e.node.quantity,
       sku: e.node.sku,
+      variant: e.node.variantTitle || '',
+      props: extractProperties(e.node.customAttributes),
       img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
     })),
   };
@@ -195,4 +211,4 @@ async function fetchOrderNote(orderGid) {
   return (data.order && data.order.note) || '';
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote };
+module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote, extractProperties };
