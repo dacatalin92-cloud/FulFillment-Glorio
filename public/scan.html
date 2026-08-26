@@ -958,11 +958,11 @@
       } else if (data.kind === 'cancelled'){
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
       } else if (data.kind === 'blocked'){
-        // Nu mai afișăm niciun banner special de "blocat" — comanda arată
-        // exact ca de obicei, iar singurul semnal e banner-ul galben
-        // persistent de mai jos (redat automat de renderFound când
-        // row.stock_missing e activ), care rămâne acolo indiferent câte
-        // scanări se mai fac, până se apasă „Am adus stocul".
+        // 2026-08-26: db.recordScan nu mai întoarce 'blocked' pentru un AWB
+        // marcat "stoc lipsă" — a doua scanare îl trece direct la
+        // 'packed' (vezi comentariul din db.js). Ramura asta rămâne doar ca
+        // plasă de siguranță, în caz că o versiune veche de server mai e
+        // încă live undeva.
         renderFound(data.row, noteLine ? renderStatusBanner('first', noteLine) : '');
       }
     } catch (err) {
