@@ -217,14 +217,18 @@ function recordScan(awb, nowIso, packWindowMs) {
     return { found: true, row, kind: 'already', };
   }
   if (row.stock_missing) {
-    // Flagged "stoc lipsă" — never let ANY scan (first or a would-be
-    // confirming second one) progress this to packed while the flag is
-    // still on, even if it's already past its first scan and technically
-    // inside the normal confirm window. Nothing about first_scan_at is
-    // touched here, so the state staff left it in stays exactly as it was.
-    // Staff must clear the flag (via the "am adus stocul" button, once the
-    // product is actually back) before this AWB can be packed at all.
-    return { found: true, row, kind: 'blocked' };
+    // 2026-08-26, pe cerința clientului: scanarea AWB-ului (nu butonul "am
+    // adus stocul") e acum chiar confirmarea de împachetare — stoful a
+    // revenit, staff-ul a împachetat efectiv coletul și îl scanează din nou.
+    // Asta ESTE a doua scanare reală a acestui AWB (prima a fost cea
+    // dinaintea marcării "stoc lipsă"), deci trece direct la "împachetat",
+    // indiferent cât a trecut de la prima scanare. setPacked de mai jos
+    // curăță și el singur flag-ul stock_missing. Butonul "✅ Am adus
+    // stocul" rămâne disponibil separat, pentru cazul în care cineva vrea
+    // doar să șteargă flag-ul fără să scaneze (stocul a revenit, dar
+    // coletul încă nu s-a împachetat efectiv).
+    stmts.setPacked.run(nowIso, awb);
+    return { found: true, row: getAwb(awb), kind: 'packed' };
   }
   if (!row.first_scan_at) {
     stmts.setFirstScan.run(nowIso, awb);
