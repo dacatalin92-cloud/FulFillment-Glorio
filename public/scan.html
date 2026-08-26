@@ -198,6 +198,7 @@
   .registry-stats .pill{ border-radius:999px; padding:0.22rem 0.65rem; border:1px solid var(--border); }
   .registry-stats .pill.packed{ background:var(--green-soft); color:var(--green); border-color:transparent; }
   .registry-stats .pill.pending{ background:var(--amber-soft); color:var(--amber); border-color:transparent; }
+  .registry-filter-btn{ font-size:0.72rem; padding:0.3rem 0.6rem; }
   .registry-scroll{ overflow-y:auto; flex:1 1 auto; }
 </style>
 </head>
@@ -262,6 +263,9 @@
       <div class="registry-head">
         <h3>Registru scanare — azi</h3>
         <div class="registry-stats">
+          <button type="button" class="mode-toggle registry-filter-btn active" data-filter="all">Toate</button>
+          <button type="button" class="mode-toggle registry-filter-btn" data-filter="packed">✓ Împachetate</button>
+          <button type="button" class="mode-toggle registry-filter-btn" data-filter="pending">🔶 În așteptare</button>
           <span class="pill packed" id="packedCount">0 împachetate</span>
           <span class="pill pending" id="pendingCount">0 în așteptare</span>
         </div>
@@ -688,6 +692,15 @@
     if (!iso) return false;
     return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }) === new Date().toLocaleDateString('en-CA', { timeZone: tz });
   }
+  // 2026-08-26: pe cerința clientului ("vreau sa am posibilitatea sa vad
+  // care sunt impachetate si care sunt in asteptare"), lista nu mai ascunde
+  // rândurile "în așteptare" mai vechi de 60s (REGISTRY_HIDE_AFTER_MS rămâne
+  // definit mai sus dar nu se mai folosește aici) — înainte, doar CONTORUL
+  // de sus mai reflecta corect câte erau în așteptare, dar rândurile chiar
+  // dispăreau din tabel după un minut, deci nu se putea vedea CARE anume.
+  // Acum toate rămân vizibile toată ziua, plus 3 butoane de filtru
+  // (Toate / Împachetate / În așteptare) ca lista să rămână ușor de citit.
+  let registryFilter = 'all';
   function renderRegistry(){
     if (!isWorkHours()){
       registryPanel.classList.add('hidden');
@@ -696,19 +709,18 @@
     }
     registryPanel.classList.remove('hidden');
     picklistPanel.classList.remove('full-height');
-    const now = Date.now();
     const scanned = Object.values(rows)
       .filter(r => r.first_scan_at && isToday(r.packed ? r.packed_at : r.first_scan_at))
       .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
     let packed = 0, pending = 0;
-    const visibleRows = [];
-    scanned.forEach(row => {
-      if (row.packed) packed++; else pending++;
-      const age = now - new Date(row.first_scan_at).getTime();
-      if (row.packed || age <= REGISTRY_HIDE_AFTER_MS) visibleRows.push(row);
-    });
+    scanned.forEach(row => { if (row.packed) packed++; else pending++; });
     document.getElementById('packedCount').textContent = packed + ' împachetate';
     document.getElementById('pendingCount').textContent = pending + ' în așteptare';
+    const visibleRows = scanned.filter(row => {
+      if (registryFilter === 'packed') return row.packed;
+      if (registryFilter === 'pending') return !row.packed;
+      return true;
+    });
     registryBody.innerHTML = visibleRows.map(row => `
       <tr data-awb="${escapeAttr(row.awb)}">
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
@@ -721,6 +733,13 @@
     `).join('');
   }
   setInterval(renderRegistry, 5000);
+  document.querySelectorAll('.registry-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      registryFilter = btn.dataset.filter;
+      document.querySelectorAll('.registry-filter-btn').forEach(b => b.classList.toggle('active', b === btn));
+      renderRegistry();
+    });
+  });
 
   // ---- Stock-missing list (separate from the picking list) --------------
   // A dedicated view of every currently-flagged AWB, regardless of where it
