@@ -288,7 +288,7 @@
       <div class="idle" id="idleState">
         <div class="glyph">📦</div>
         <h2>Gata de scanare</h2>
-        <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 30 de secunde distanță, ca să-l confirmi „împachetat, predat la curier".</p>
+        <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 10 minute distanță, ca să-l confirmi „împachetat, predat la curier".</p>
       </div>
     </main>
   </div>
@@ -929,13 +929,13 @@
       renderAll();
       const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
       if (data.kind === 'first'){
-        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 30 secunde ca să confirmi „împachetat".' + noteLine));
+        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'packed'){
         renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
       } else if (data.kind === 'already'){
         renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
       } else if (data.kind === 'reset'){
-        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 30 de secunde de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
+        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 10 minute de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
       } else if (data.kind === 'cancelled'){
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
       } else if (data.kind === 'blocked'){
@@ -958,11 +958,30 @@
   // Loads EVERY AWB that's neither packed nor cancelled, regardless of when
   // it was created — not just today's — so the picking list surfaces the
   // whole backlog still owed to a courier, not only what printed today.
+  //
+  // 2026-08-26: this used to be the ONLY source that populates `rows`, and
+  // it resets rows = {} every time (on load AND on every websocket "refresh"
+  // message). Since /api/unpacked only ever returns UNPACKED rows, any AWB
+  // already packed earlier today — before this tab's current session —
+  // never made it back into `rows`, so "Registru scanare — azi" undercounted
+  // "împachetate" (a reload right after packing #13/#14 today would drop
+  // both from the count, showing 12 instead of 14 even though the DB had it
+  // right). Fetching today's already-packed rows too and merging them in
+  // fixes that — isPickable() still keeps them out of the picking list
+  // (row.packed === true), only the registry benefits.
+  function bucharestToday(){
+    return new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  }
   async function loadUnpacked(){
     const res = await fetch('/api/unpacked');
     const data = await res.json();
     rows = {};
     data.rows.forEach(r => { rows[r.awb] = r; });
+    try {
+      const packedRes = await fetch(`/api/packed-day/${bucharestToday()}`);
+      const packedData = await packedRes.json();
+      (packedData.rows || []).forEach(r => { if (!r.cancelled) rows[r.awb] = r; });
+    } catch (err) { console.error('load packed-today failed', err); }
     renderAll();
   }
 
