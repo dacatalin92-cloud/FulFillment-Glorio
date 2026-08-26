@@ -10,7 +10,15 @@ const sameday = require('./sameday');
 const shopify = require('./shopify');
 
 const PORT = process.env.PORT || 3000;
-const PACK_WINDOW_MS = 30000;
+// 2026-08-26: era 30000 (30 secunde) — prea scurt pentru fluxul real de
+// împachetare (scanezi AWB-ul, pui efectiv produsul în cutie, lipești
+// eticheta, scanezi din nou). Cu 30s, a doua scanare venea aproape mereu
+// prea târziu și era tratată ca RESET (o nouă "primă scanare"), nu ca
+// CONFIRMARE — comanda rămânea blocată la "Scanat 1×" deși fusese scanată
+// de 2 ori. 10 minute lasă timp de împachetare real, păstrând totuși
+// protecția inițială (nu confirmă un scan izolat, la întâmplare, ore mai
+// târziu).
+const PACK_WINDOW_MS = 10 * 60 * 1000;
 // 5 seconds caused the server to crash-loop in production (a native SQLite
 // assertion, from creating/destroying prepared statements at very high
 // frequency — fixed separately in db.js by caching statements, but running
