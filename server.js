@@ -1041,6 +1041,23 @@ app.get('/api/unknown-returns/history', (req, res) => {
   res.json({ rows: db.listResolvedUnknownReturns() });
 });
 
+// --- Checklist de achiziție pentru "🚫 Produse lipsă" ----------------------
+// Cheia (agg_key) e cheia de agregare calculată în scan.html (SKU sau
+// titlu+variantă + specsKey) — un produs lipsă e comun mai multor comenzi,
+// deci bifa "achiziționat" + cantitatea cumpărată se țin per produs, nu per
+// AWB. Broadcast pe websocket, ca toate stațiile deschise să rămână
+// sincronizate când cineva bifează de pe alt calculator/telefon.
+app.get('/api/stock-purchases', (req, res) => {
+  res.json({ rows: db.listStockPurchases() });
+});
+app.post('/api/stock-purchases', (req, res) => {
+  const { key, checked, qty } = req.body || {};
+  if (!key) return res.status(400).json({ error: 'lipsește "key"' });
+  const row = db.setStockPurchase(key, !!checked, qty, new Date().toISOString());
+  broadcast({ type: 'stock-purchase:update', row });
+  res.json({ row });
+});
+
 // --- Sameday polling (courier status for open AWBs) ----------------------
 // Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
 // entirely (e.g. while investigating a block/lockout on the Sameday side)
