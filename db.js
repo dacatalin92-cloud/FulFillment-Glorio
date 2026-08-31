@@ -66,6 +66,20 @@ CREATE TABLE IF NOT EXISTS unknown_returns (
 );
 `);
 
+// 2026-08-27: bifă + cantitate achiziționată pentru panoul "🚫 Produse
+// lipsă" din scan.html — cheia e aceeași cheie de agregare calculată în
+// scan.html (SKU sau titlu+variantă, plus specsKey pentru proprietăți
+// custom), NU un AWB — un produs lipsă e comun mai multor comenzi, deci
+// bifa "am cumpărat" trebuie ținută per produs/variantă, nu per comandă.
+db.exec(`
+CREATE TABLE IF NOT EXISTS stock_purchases (
+  agg_key TEXT PRIMARY KEY,
+  checked INTEGER NOT NULL DEFAULT 0,
+  qty_purchased REAL,
+  updated_at TEXT
+);
+`);
+
 function bucharestDay(isoString) {
   // en-CA locale formats as YYYY-MM-DD, which is exactly the sortable key we want.
   return new Date(isoString).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
@@ -483,4 +497,26 @@ function listStockMissing() {
   return listStockMissingStmt.all();
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing };
+// ---- Checklist de achiziție pentru "Produse lipsă" -----------------------
+const stockPurchaseStmts = {
+  list: db.prepare('SELECT * FROM stock_purchases'),
+  upsert: db.prepare(`
+    INSERT INTO stock_purchases (agg_key, checked, qty_purchased, updated_at)
+    VALUES (@agg_key, @checked, @qty_purchased, @updated_at)
+    ON CONFLICT(agg_key) DO UPDATE SET checked = excluded.checked, qty_purchased = excluded.qty_purchased, updated_at = excluded.updated_at
+  `),
+};
+function listStockPurchases() {
+  return stockPurchaseStmts.list.all();
+}
+function setStockPurchase(aggKey, checked, qtyPurchased, whenIso) {
+  stockPurchaseStmts.upsert.run({
+    agg_key: aggKey,
+    checked: checked ? 1 : 0,
+    qty_purchased: qtyPurchased === '' || qtyPurchased === null || qtyPurchased === undefined ? null : Number(qtyPurchased),
+    updated_at: whenIso,
+  });
+  return stockPurchaseStmts.list.all().find((r) => r.agg_key === aggKey);
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing, listStockPurchases, setStockPurchase };
