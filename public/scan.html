@@ -957,12 +957,17 @@
         renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 10 minute de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
       } else if (data.kind === 'cancelled'){
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
+      } else if (data.kind === 'restocked'){
+        // 2026-08-27: scanarea unui AWB marcat "stoc lipsă" șterge flagul și
+        // repornește ciclul normal (ca o primă scanare) — mai e nevoie de
+        // ÎNCĂ o scanare, în fereastra normală, ca să confirme împachetat.
+        renderFound(data.row, renderStatusBanner('first', '📦 Stocul a revenit — flag șters. Scanare 2/3, mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'blocked'){
         // 2026-08-26: db.recordScan nu mai întoarce 'blocked' pentru un AWB
-        // marcat "stoc lipsă" — a doua scanare îl trece direct la
-        // 'packed' (vezi comentariul din db.js). Ramura asta rămâne doar ca
-        // plasă de siguranță, în caz că o versiune veche de server mai e
-        // încă live undeva.
+        // marcat "stoc lipsă" — scanarea îl trece la 'restocked' (vezi
+        // comentariul din db.js). Ramura asta rămâne doar ca plasă de
+        // siguranță, în caz că o versiune veche de server mai e încă live
+        // undeva.
         renderFound(data.row, noteLine ? renderStatusBanner('first', noteLine) : '');
       }
     } catch (err) {
