@@ -663,7 +663,18 @@
     });
     return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
   }
+  // 2026-08-27: fiecare re-randare înlocuia tot innerHTML-ul listei — la
+  // fiecare mesaj WebSocket (poll Sameday la 30s, sau chiar bifa/cantitatea
+  // pe care tocmai o completai, care se întoarce înapoi prin broadcast),
+  // ceea ce arunca scroll-ul din listă la 0 și întrerupea tastarea într-un
+  // câmp de cantitate — de-aia "sare" scroll-ul și nu poți opri unde vrei.
+  // Fix: dacă utilizatorul are focus pe un checkbox/câmp DIN listă chiar
+  // acum, sărim peste re-randare (datele oricum ajung corect la următoarea
+  // randare, după ce dă click în altă parte); și, oricum, păstrăm poziția
+  // de scroll în loc s-o resetăm.
   function renderStockMissingNeeds(){
+    if (stockMissingNeedsList.contains(document.activeElement)) return;
+    const scrollPos = stockMissingNeedsList.scrollTop;
     const { orderCount, items } = computeStockMissingNeeds();
     stockMissingNeedsSubcount.textContent = orderCount;
     if (!items.length){
@@ -686,6 +697,7 @@
       </div>
     `;
     }).join('');
+    stockMissingNeedsList.scrollTop = scrollPos;
   }
   async function saveStockPurchase(key, checked, qty){
     try {
