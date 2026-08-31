@@ -475,4 +475,12 @@ function clearStockMissing(awb) {
   return getAwb(awb);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing };
+// Toate AWB-urile marcate curent "stoc lipsă" — folosit pentru reset în
+// masă (vezi server.js /admin/clear-stock-missing), ca să nu fie nevoie de
+// apăsat butonul "Am adus stocul" unul câte unul.
+const listStockMissingStmt = db.prepare('SELECT * FROM awbs WHERE stock_missing = 1');
+function listStockMissing() {
+  return listStockMissingStmt.all();
+}
+
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing };
