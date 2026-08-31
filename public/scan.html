@@ -189,6 +189,11 @@
   .needs-row .needs-qty{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:10px; padding:0.4rem 0.8rem; min-width:48px; }
   .needs-row .needs-qty .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.3rem; line-height:1; }
   .needs-row .needs-qty .lbl{ font-size:0.6rem; text-transform:uppercase; letter-spacing:0.05em; margin-top:0.1rem; }
+  .needs-row.purchased{ opacity:0.6; }
+  .needs-purchase{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:0.3rem; }
+  .needs-purchase label{ display:flex; align-items:center; gap:0.35rem; font-size:0.72rem; color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .needs-purchase input[type="checkbox"]{ width:1.05rem; height:1.05rem; accent-color:var(--accent); cursor:pointer; }
+  .needs-purchase-qty{ width:4.2rem; font-family:"IBM Plex Mono", monospace; font-size:0.8rem; padding:0.25rem 0.4rem; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); text-align:center; }
 
   .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .registry.hidden{ display:none; }
@@ -625,9 +630,23 @@
   const stockMissingNeedsModal = document.getElementById('stockMissingNeedsModal');
   const stockMissingNeedsList = document.getElementById('stockMissingNeedsList');
   const stockMissingNeedsSubcount = document.getElementById('stockMissingNeedsSubcount');
+  // 2026-08-27: bifă "Achiziționat" + câmp de cantitate cumpărată pe fiecare
+  // produs, ca staff-ul care face achizițiile să poată bifa pe măsură ce
+  // cumpără — persistă pe server (/api/stock-purchases), sincronizat live
+  // prin WebSocket pe toate stațiile deschise. Cheia ține de produs/
+  // variantă (aceeași cheie de agregare de mai jos), nu de un AWB anume.
+  let stockPurchases = {}; // agg_key -> { checked, qty_purchased }
+  async function loadStockPurchases(){
+    try {
+      const res = await fetch('/api/stock-purchases');
+      const data = await res.json();
+      stockPurchases = {};
+      (data.rows || []).forEach(r => { stockPurchases[r.agg_key] = r; });
+    } catch (err) { console.error('load stock-purchases failed', err); }
+  }
   function computeStockMissingNeeds(){
     const list = Object.values(rows).filter(r => r.stock_missing);
-    const agg = new Map(); // key -> { title, specs, img, qty }
+    const agg = new Map(); // key -> { key, title, specs, img, qty }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
@@ -638,7 +657,7 @@
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
         } else {
-          agg.set(key, { title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty });
+          agg.set(key, { key, title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty });
         }
       });
     });
@@ -651,15 +670,49 @@
       stockMissingNeedsList.innerHTML = '<div class="empty-row">Nimic marcat stoc lipsă în acest moment. 🎉</div>';
       return;
     }
-    stockMissingNeedsList.innerHTML = items.map(it => `
-      <div class="needs-row">
+    stockMissingNeedsList.innerHTML = items.map(it => {
+      const purchase = stockPurchases[it.key] || {};
+      const checked = !!purchase.checked;
+      const qtyVal = purchase.qty_purchased === null || purchase.qty_purchased === undefined ? '' : purchase.qty_purchased;
+      return `
+      <div class="needs-row${checked ? ' purchased' : ''}" data-key="${escapeAttr(it.key)}">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
         <div class="needs-title">${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}</div>
-        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">necesar</span></div>
+        <div class="needs-purchase">
+          <label><input type="checkbox" class="purchase-check" data-key="${escapeAttr(it.key)}" ${checked ? 'checked' : ''}> Achiziționat</label>
+          <input type="number" min="0" step="1" class="needs-purchase-qty purchase-qty" data-key="${escapeAttr(it.key)}" placeholder="cant." value="${escapeAttr(qtyVal)}">
+        </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
   }
-  document.getElementById('stockMissingNeedsBtn').addEventListener('click', () => {
+  async function saveStockPurchase(key, checked, qty){
+    try {
+      const res = await fetch('/api/stock-purchases', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, checked, qty: qty === '' ? null : qty }),
+      });
+      const data = await res.json();
+      if (data.row) stockPurchases[data.row.agg_key] = data.row;
+    } catch (err) { console.error('save stock-purchase failed', err); }
+  }
+  stockMissingNeedsList.addEventListener('change', e => {
+    if (e.target.classList.contains('purchase-check')){
+      const key = e.target.dataset.key;
+      const row = e.target.closest('.needs-row');
+      const qtyInput = row.querySelector('.purchase-qty');
+      row.classList.toggle('purchased', e.target.checked);
+      saveStockPurchase(key, e.target.checked, qtyInput.value);
+    } else if (e.target.classList.contains('purchase-qty')){
+      const key = e.target.dataset.key;
+      const row = e.target.closest('.needs-row');
+      const checkInput = row.querySelector('.purchase-check');
+      saveStockPurchase(key, checkInput.checked, e.target.value);
+    }
+  });
+  document.getElementById('stockMissingNeedsBtn').addEventListener('click', async () => {
+    await loadStockPurchases();
     renderStockMissingNeeds();
     stockMissingNeedsModal.classList.add('open');
   });
@@ -1034,6 +1087,9 @@
       } else if (msg.type === 'unknown-return:resolved'){
         delete unknownReturns[msg.entry.id];
         renderUnknownReturnsBar();
+      } else if (msg.type === 'stock-purchase:update'){
+        if (msg.row) stockPurchases[msg.row.agg_key] = msg.row;
+        if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
       } else if (msg.type === 'refresh'){
         loadUnpacked();
         loadReturns();
