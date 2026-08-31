@@ -348,6 +348,34 @@ app.get('/admin/fix-false-packed', (req, res) => {
   }
 });
 
+// Reset în masă al flagului "stoc lipsă" — șterge marcajul de pe TOATE
+// AWB-urile curent flagate (nu le împachetează, doar le scoate din
+// panoul "🚫 Produse lipsă" / bara galbenă din scan.html). Dry-run by
+// default — arată ce ar șterge; adaugă &apply=1 ca să chiar aplice.
+// Usage: /admin/clear-stock-missing?secret=...  (apoi &apply=1)
+app.get('/admin/clear-stock-missing', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = db.listStockMissing();
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, stock_missing_at: r.stock_missing_at })),
+        hint: 'Arată bine? Rulează același link cu &apply=1 ca să chiar șteargă flagurile.',
+      });
+    }
+    const updated = candidates.map((r) => db.clearStockMissing(r.awb));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // Diagnostic ONE-OFF (nu modifică nimic): primește lista reală de AWB-uri
 // "în așteptare de ridicare" direct din exportul Sameday (69 AWB / 67
 // comenzi, dat de utilizator pe 26.08.2026) și verifică, unul câte unul, ce
