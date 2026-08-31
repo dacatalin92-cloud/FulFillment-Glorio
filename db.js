@@ -217,18 +217,18 @@ function recordScan(awb, nowIso, packWindowMs) {
     return { found: true, row, kind: 'already', };
   }
   if (row.stock_missing) {
-    // 2026-08-26, pe cerința clientului: scanarea AWB-ului (nu butonul "am
-    // adus stocul") e acum chiar confirmarea de împachetare — stoful a
-    // revenit, staff-ul a împachetat efectiv coletul și îl scanează din nou.
-    // Asta ESTE a doua scanare reală a acestui AWB (prima a fost cea
-    // dinaintea marcării "stoc lipsă"), deci trece direct la "împachetat",
-    // indiferent cât a trecut de la prima scanare. setPacked de mai jos
-    // curăță și el singur flag-ul stock_missing. Butonul "✅ Am adus
-    // stocul" rămâne disponibil separat, pentru cazul în care cineva vrea
-    // doar să șteargă flag-ul fără să scaneze (stocul a revenit, dar
-    // coletul încă nu s-a împachetat efectiv).
-    stmts.setPacked.run(nowIso, awb);
-    return { found: true, row: getAwb(awb), kind: 'packed' };
+    // 2026-08-27, ajustat pe cerința clientului: scanarea AWB-ului (nu
+    // butonul "am adus stocul") ȘTERGE flagul de stoc lipsă și repornește
+    // ciclul normal de confirmare (ca o primă scanare nouă) — NU
+    // împachetează direct pe loc. Fluxul complet, strict din scaner, fără
+    // mouse: scanare AWB (1, primă) → scanare cod "stoc lipsă" (flag) →
+    // scanare AWB (2, șterge flagul, repornește cronometrul) → scanare AWB
+    // (3, în max packWindowMs, confirmă "împachetat") = 3 scanări ale
+    // AWB-ului în total. Butonul "✅ Am adus stocul" rămâne disponibil
+    // separat, pentru cine vrea doar să șteargă flag-ul fără să scaneze.
+    stmts.clearStockMissing.run(awb);
+    stmts.setFirstScan.run(nowIso, awb);
+    return { found: true, row: getAwb(awb), kind: 'restocked' };
   }
   if (!row.first_scan_at) {
     stmts.setFirstScan.run(nowIso, awb);
