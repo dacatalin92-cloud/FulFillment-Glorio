@@ -995,6 +995,16 @@ app.get('/api/returns/history', (req, res) => {
   res.json({ rows: db.listReturnHistory() });
 });
 
+// Retururi grupate pe zi (ziua în care au fost scanate ca primite fizic în
+// depozit) — vezi db.listReturnDays/listReturnsForDay. Zilele sunt string
+// "YYYY-MM-DD" (fus București), la fel ca /api/packed-days.
+app.get('/api/return-days', (req, res) => {
+  res.json({ days: db.listReturnDays() });
+});
+app.get('/api/return-day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listReturnsForDay(req.params.day) });
+});
+
 // Manual confirmation scan: the box physically arrived back at the
 // warehouse. Deliberately separate from /api/scan's pack-confirmation flow
 // — scanning a returned AWB here never touches `packed`, only `return_received`.
