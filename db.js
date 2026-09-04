@@ -46,6 +46,9 @@ for (const stmt of [
   'ALTER TABLE awbs ADD COLUMN client_note TEXT',
   'ALTER TABLE awbs ADD COLUMN stock_missing INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE awbs ADD COLUMN stock_missing_at TEXT',
+  // 2026-08-27: telefon destinatar — nu era stocat deloc înainte; necesar
+  // pentru exportul PDF (nr. comandă, produs, cantitate, telefon).
+  'ALTER TABLE awbs ADD COLUMN phone TEXT',
 ]) {
   try { db.exec(stmt); } catch (err) { /* column already exists — fine */ }
 }
@@ -179,8 +182,8 @@ const stmts = {
 };
 
 const upsertStmt = db.prepare(`
-INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id, client_note)
-VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id, @client_note)
+INSERT INTO awbs (awb, day, order_name, order_created_at, awb_created_at, total, currency, items_json, order_id, client_note, phone)
+VALUES (@awb, @day, @order_name, @order_created_at, @awb_created_at, @total, @currency, @items_json, @order_id, @client_note, @phone)
 ON CONFLICT(awb) DO UPDATE SET
   order_name = excluded.order_name,
   order_created_at = excluded.order_created_at,
@@ -189,7 +192,8 @@ ON CONFLICT(awb) DO UPDATE SET
   currency = excluded.currency,
   items_json = excluded.items_json,
   order_id = COALESCE(excluded.order_id, awbs.order_id),
-  client_note = COALESCE(NULLIF(awbs.client_note, ''), excluded.client_note)
+  client_note = COALESCE(NULLIF(awbs.client_note, ''), excluded.client_note),
+  phone = COALESCE(NULLIF(excluded.phone, ''), awbs.phone)
 `);
 
 function upsertAwb(rec) {
@@ -204,6 +208,7 @@ function upsertAwb(rec) {
     items_json: JSON.stringify(rec.items || []),
     order_id: rec.order_id ? String(rec.order_id) : null,
     client_note: rec.client_note || '',
+    phone: rec.phone || '',
   });
   return getAwb(rec.awb);
 }
