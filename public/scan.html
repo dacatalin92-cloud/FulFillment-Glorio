@@ -263,7 +263,6 @@
         <button type="button" class="needs-btn" id="needsBtn">📋 Necesar produse</button>
         <button type="button" class="needs-btn stock-missing-needs-btn" id="stockMissingNeedsBtn">🚫 Produse lipsă</button>
         <button type="button" class="needs-btn" id="picklistExportBtn">⬇️ Export CSV</button>
-        <button type="button" class="needs-btn" id="picklistExportPdfBtn">🖨️ Export PDF</button>
         <span class="count-pill" id="picklistCount">0 comenzi</span>
       </div>
       <div class="picklist-scroll">
@@ -340,7 +339,6 @@
     <div class="needs-header">
       <h3>📅 Istoric retururi — <span id="returnHistoryDayLabel">azi</span> (<span id="returnHistoryCount">0</span>)</h3>
       <button type="button" class="needs-btn" id="returnHistoryExportBtn" style="margin-right:0.4rem;">⬇️ Export CSV</button>
-      <button type="button" class="needs-btn" id="returnHistoryExportPdfBtn" style="margin-right:0.4rem;">🖨️ Export PDF</button>
       <button type="button" class="needs-close" id="returnHistoryCloseBtn" aria-label="Închide">✕</button>
     </div>
     <div class="return-history-days" id="returnHistoryDays"></div>
@@ -506,93 +504,12 @@
     exportCsv(`de-pregatit-${bucharestToday()}.csv`, list, [
       { label: 'Comandă', get: r => r.order_name },
       { label: 'AWB', get: r => r.awb },
-      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Produse', get: r => productsTextPlain(r) },
       { label: 'Status Sameday', get: r => r.sameday_status || '' },
       { label: 'Stoc lipsă', get: r => r.stock_missing ? 'DA' : '' },
       { label: 'Notă', get: r => r.note || '' },
       { label: 'AWB generat la', get: r => r.awb_created_at || '' },
     ]);
-  });
-
-  // Export PDF: nr. comandă, produs, cantitate, telefon — un rând per produs
-  // (nu per comandă), pentru că o comandă poate avea mai multe produse.
-  // Nu folosim o librărie PDF externă — deschidem o fereastră nouă cu un
-  // tabel simplu, gata de print, și lăsăm browserul să facă "Salvează ca PDF"
-  // (Ctrl+P → Destinație: Salvează ca PDF), exact ca la o listă de imprimat.
-  function escapeHtmlPdf(s){
-    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-  // Deschide o fereastră nouă cu un tabel simplu, gata de print, și lasă
-  // browserul să facă "Salvează ca PDF" (Ctrl+P → Destinație: Salvează ca
-  // PDF) — nu folosim nicio librărie PDF externă. Reutilizat de toate
-  // butoanele "Export PDF" din pagină.
-  // IMPORTANT: secvența "<" + "/script>" nu trebuie să apară niciodată lipită
-  // în sursa acestui fișier (nici măcar într-un comentariu sau string JS) —
-  // browserul închide tag-ul <script> AL PAGINII PRINCIPALE de îndată ce vede
-  // acea secvență de caractere, indiferent de context, și tot ce urmează în
-  // fișier se afișează ca text brut pe pagină (asta s-a întâmplat data
-  // trecută). De-aia mai jos e scrisă spartă în două bucăți concatenate.
-  function openPrintWindow(title, subtitle, theadCells, rowsHtml, rowCount){
-    const html = `<!doctype html>
-<html><head><meta charset="utf-8">
-<title>${title}</title>
-<style>
-  body{ font-family: Arial, sans-serif; padding: 20px; color:#111; }
-  h1{ font-size: 18px; margin: 0 0 4px; }
-  .sub{ color:#555; font-size:12px; margin-bottom:16px; }
-  table{ width:100%; border-collapse: collapse; font-size: 12px; }
-  th, td{ border: 1px solid #999; padding: 5px 7px; text-align: left; vertical-align: top; }
-  th{ background:#eee; }
-  td.qty{ text-align:center; width: 60px; }
-  @media print { body{ padding: 0; } }
-</style>
-</head><body>
-  <h1>${title}</h1>
-  <div class="sub">${subtitle}</div>
-  <table>
-    <thead><tr>${theadCells.map(c => `<th>${c}</th>`).join('')}</tr></thead>
-    <tbody>${rowsHtml}</tbody>
-  </table>
-  <script>window.onload = () => setTimeout(() => window.print(), 200);${'</' + 'script>'}
-</body></html>`;
-    const w = window.open('', '_blank');
-    if (!w){ alert('Browserul a blocat fereastra nouă — permite pop-up-uri pentru această pagină.'); return; }
-    w.document.open(); w.document.write(html); w.document.close();
-  }
-  document.getElementById('picklistExportPdfBtn').addEventListener('click', () => {
-    const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
-    const lines = [];
-    list.forEach(row => {
-      const items = JSON.parse(row.items_json || '[]');
-      if (!items.length){
-        lines.push({ order: row.order_name, produs: '—', qty: '', phone: row.phone || '' });
-      } else {
-        items.forEach(it => {
-          const s = specsText(it);
-          lines.push({
-            order: row.order_name,
-            produs: it.title + (s ? ' (' + s + ')' : ''),
-            qty: it.qty,
-            phone: row.phone || '',
-          });
-        });
-      }
-    });
-    const rowsHtml = lines.map(l => `
-      <tr>
-        <td>${escapeHtmlPdf(l.order)}</td>
-        <td>${escapeHtmlPdf(l.produs)}</td>
-        <td class="qty">${escapeHtmlPdf(l.qty)}</td>
-        <td>${escapeHtmlPdf(l.phone)}</td>
-      </tr>
-    `).join('');
-    openPrintWindow(
-      'De pregătit pentru curier',
-      `${bucharestToday()} · ${lines.length} produse din ${list.length} comenzi`,
-      ['Nr. comandă', 'Produs', 'Cant.', 'Telefon'],
-      rowsHtml
-    );
   });
 
   // ---- Returns ---------------------------------------------------------
@@ -962,7 +879,6 @@
     exportCsv(`registru-scanare-${bucharestToday()}.csv`, scanned, [
       { label: 'AWB', get: r => r.awb },
       { label: 'Comandă', get: r => r.order_name },
-      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Prima scanare', get: r => fmtTime(r.first_scan_at) },
       { label: 'Status', get: r => r.packed ? 'Împachetat' : 'Scanat 1x' },
       { label: 'Confirmat la', get: r => r.packed ? fmtTime(r.packed_at) : '' },
@@ -1134,28 +1050,9 @@
     exportCsv(`retururi-${returnHistoryCurrentDay || bucharestToday()}.csv`, returnHistoryCurrentRows, [
       { label: 'AWB', get: r => r.awb },
       { label: 'Comandă', get: r => r.order_name },
-      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Produse', get: r => productsTextPlain(r) },
       { label: 'Retur primit la', get: r => fmtTime(r.return_received_at) },
     ]);
-  });
-  document.getElementById('returnHistoryExportPdfBtn').addEventListener('click', () => {
-    const label = returnHistoryCurrentDay ? dayLabel(returnHistoryCurrentDay) : 'azi';
-    const rowsHtml = returnHistoryCurrentRows.map(r => `
-      <tr>
-        <td>${escapeHtmlPdf(r.awb)}</td>
-        <td>${escapeHtmlPdf(r.order_name)}</td>
-        <td>${escapeHtmlPdf(r.phone || '')}</td>
-        <td>${escapeHtmlPdf(productsTextPlain(r))}</td>
-        <td>${escapeHtmlPdf(fmtTime(r.return_received_at))}</td>
-      </tr>
-    `).join('');
-    openPrintWindow(
-      `Istoric retururi — ${label}`,
-      `${returnHistoryCurrentDay || bucharestToday()} · ${returnHistoryCurrentRows.length} retururi`,
-      ['AWB', 'Comandă', 'Telefon', 'Produse', 'Retur primit la'],
-      rowsHtml
-    );
   });
   function renderFound(row, bannerHtml){
     idleState.style.display = 'none';
