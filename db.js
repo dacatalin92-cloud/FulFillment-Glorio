@@ -311,6 +311,24 @@ function listReturnHistory() {
   return stmts.listReturnHistory.all();
 }
 
+// 2026-08-27: retururi grupate pe ZIUA în care au fost scanate ca primite
+// (return_received_at), la fel cum listPackedDays/listPackedForDay
+// grupează împachetatele pe zi — cere-le "ce am scanat ieri / alaltăieri"
+// la retururi. Reia listReturnHistory (capată la 200) ca sursă, ca lista
+// de zile să rămână coerentă cu istoricul deja afișat.
+function listReturnDays() {
+  const days = new Set();
+  for (const row of stmts.listReturnHistory.all()) {
+    if (row.return_received_at) days.add(bucharestDay(row.return_received_at));
+  }
+  return Array.from(days).sort().reverse();
+}
+function listReturnsForDay(day) {
+  return stmts.listReturnHistory.all()
+    .filter((row) => row.return_received_at && bucharestDay(row.return_received_at) === day)
+    .sort((a, b) => new Date(b.return_received_at).getTime() - new Date(a.return_received_at).getTime());
+}
+
 // Logged when a return-mode scan doesn't match any known AWB — a physical
 // box arrived at the warehouse for a code the system has no record of at
 // all (different courier, older order, typo, damaged label). Kept separate
@@ -519,4 +537,4 @@ function setStockPurchase(aggKey, checked, qtyPurchased, whenIso) {
   return stockPurchaseStmts.list.all().find((r) => r.agg_key === aggKey);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing, listStockPurchases, setStockPurchase };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, listReturnDays, listReturnsForDay, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing, listStockPurchases, setStockPurchase };
