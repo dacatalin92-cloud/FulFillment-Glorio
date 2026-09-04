@@ -125,6 +125,10 @@ const stmts = {
   // History: returns already confirmed received, most recent first. Capped at
   // 200 — this is a "recent history" view, not a full archive browser.
   listReturnHistory: db.prepare('SELECT * FROM awbs WHERE return_received = 1 ORDER BY return_received_at DESC LIMIT 200'),
+  // Fără limită — sursă pentru vederea pe zile (listReturnDays/
+  // listReturnsForDay), ca istoricul mai vechi de 200 de retururi să tot
+  // apară grupat pe zi, nu doar cele mai recente 200.
+  listAllReturnsReceived: db.prepare('SELECT * FROM awbs WHERE return_received = 1 ORDER BY return_received_at DESC'),
   insertUnknownReturn: db.prepare('INSERT INTO unknown_returns (code, scanned_at) VALUES (?, ?)'),
   getUnknownReturn: db.prepare('SELECT * FROM unknown_returns WHERE id = ?'),
   listUnknownReturns: db.prepare('SELECT * FROM unknown_returns WHERE resolved = 0 ORDER BY scanned_at DESC'),
@@ -313,18 +317,18 @@ function listReturnHistory() {
 
 // 2026-08-27: retururi grupate pe ZIUA în care au fost scanate ca primite
 // (return_received_at), la fel cum listPackedDays/listPackedForDay
-// grupează împachetatele pe zi — cere-le "ce am scanat ieri / alaltăieri"
-// la retururi. Reia listReturnHistory (capată la 200) ca sursă, ca lista
-// de zile să rămână coerentă cu istoricul deja afișat.
+// grupează împachetatele pe zi — cere-le "ce am scanat ieri / alaltăieri /
+// istoric mai vechi" la retururi. Folosește listAllReturnsReceived (FĂRĂ
+// limită de 200) ca sursă, ca istoricul vechi să nu dispară din lista de zile.
 function listReturnDays() {
   const days = new Set();
-  for (const row of stmts.listReturnHistory.all()) {
+  for (const row of stmts.listAllReturnsReceived.all()) {
     if (row.return_received_at) days.add(bucharestDay(row.return_received_at));
   }
   return Array.from(days).sort().reverse();
 }
 function listReturnsForDay(day) {
-  return stmts.listReturnHistory.all()
+  return stmts.listAllReturnsReceived.all()
     .filter((row) => row.return_received_at && bucharestDay(row.return_received_at) === day)
     .sort((a, b) => new Date(b.return_received_at).getTime() - new Date(a.return_received_at).getTime());
 }
