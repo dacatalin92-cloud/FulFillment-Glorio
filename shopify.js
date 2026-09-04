@@ -105,7 +105,6 @@ const ORDER_QUERY = `
       createdAt
       phone
       shippingAddress { phone }
-      customer { phone }
       totalPriceSet { shopMoney { amount currencyCode } }
       lineItems(first: 20) {
         edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } }
@@ -138,8 +137,12 @@ async function fetchOrderDetails(orderGid) {
     createdAt: o.createdAt,
     // Prioritate: telefonul de pe adresa de livrare (cel mai probabil de
     // folosit de curier/staff pentru contact) > telefonul comenzii (cel
-    // introdus la checkout) > telefonul contului clientului.
-    phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
+    // introdus la checkout). NU cerem și telefonul din contul clientului
+    // (customer.phone) — necesită scope-ul `read_customers`, pe care
+    // aplicația asta nu îl are; cererea către Shopify pică ÎN ÎNTREGIME
+    // (nu doar câmpul respectiv) dacă îl includem, ceea ce a blocat sincronizarea
+    // completă a AWB-urilor pentru o vreme (2026-09-04).
+    phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
     total: parseFloat(o.totalPriceSet.shopMoney.amount),
     currency: o.totalPriceSet.shopMoney.currencyCode,
     items: o.lineItems.edges.map((e) => ({
