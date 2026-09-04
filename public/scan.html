@@ -568,7 +568,7 @@
     <thead><tr><th>Nr. comandă</th><th>Produs</th><th>Cant.</th><th>Telefon</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>
-  <script>window.onload = () => setTimeout(() => window.print(), 200);</script>
+  <script>window.onload = () => setTimeout(() => window.print(), 200);${'</' + 'script>'}
 </body></html>`;
     const w = window.open('', '_blank');
     if (!w){ alert('Browserul a blocat fereastra nouă — permite pop-up-uri pentru această pagină.'); return; }
