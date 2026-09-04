@@ -161,6 +161,14 @@ const stmts = {
   // that already exist in the DB) — this lets a one-off admin pass set it
   // directly once looked up by order_name. See shopify.findOrderIdByName.
   setOrderId: db.prepare('UPDATE awbs SET order_id = ? WHERE awb = ?'),
+  // Same backfill idea as setOrderId, but for the phone column added
+  // 2026-08-27 — old rows never got a phone written at all, so a one-off
+  // admin pass (see server.js /admin/backfill-phones) fills it in from
+  // Shopify for rows that already have order_id but no phone yet.
+  setPhone: db.prepare('UPDATE awbs SET phone = ? WHERE awb = ?'),
+  listMissingPhone: db.prepare(
+    "SELECT * FROM awbs WHERE order_id IS NOT NULL AND (phone IS NULL OR phone = '') ORDER BY awb_created_at DESC"
+  ),
   // Persists the "Scanat la depozit: ..." line written to Shopify at first
   // scan (see server.js /api/scan + shopify.appendOrderScanNote), so it's
   // still visible on the "packed" (2nd scan) confirmation screen even when
@@ -479,6 +487,16 @@ function setOrderId(awb, orderId) {
   return getAwb(awb);
 }
 
+function setPhone(awb, phone) {
+  stmts.setPhone.run(phone, awb);
+  return getAwb(awb);
+}
+
+function listMissingPhone(limit) {
+  const rows = stmts.listMissingPhone.all();
+  return limit ? rows.slice(0, limit) : rows;
+}
+
 function setScanNote(awb, note) {
   stmts.setScanNote.run(note, awb);
   return getAwb(awb);
@@ -546,4 +564,4 @@ function setStockPurchase(aggKey, checked, qtyPurchased, whenIso) {
   return stockPurchaseStmts.list.all().find((r) => r.agg_key === aggKey);
 }
 
-module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, listReturnDays, listReturnsForDay, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing, listStockPurchases, setStockPurchase };
+module.exports = { db, bucharestDay, upsertAwb, getAwb, listDays, listForDay, updateSameday, markOrderCancelled, recordScan, setNote, findByCode, listPendingReturns, markReturnReceived, listReturnHistory, listReturnDays, listReturnsForDay, logUnknownReturn, listUnknownReturns, setUnknownReturnNote, resolveUnknownReturn, listResolvedUnknownReturns, listPackedDays, listPackedForDay, listPackedSummary, listPackedNotCancelled, countUnpacked, findFalsePackedCandidates, resetFalsePacked, listUnpackedNotCancelled, markPackedFromReconciliation, setOrderId, setPhone, listMissingPhone, setScanNote, setClientNoteIfEmpty, flagStockMissing, clearStockMissing, listStockMissing, listStockPurchases, setStockPurchase };
