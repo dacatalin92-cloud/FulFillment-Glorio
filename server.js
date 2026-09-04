@@ -1168,7 +1168,6 @@ async function backfillToday() {
           edges { node {
             id name createdAt updatedAt note phone
             shippingAddress { phone }
-            customer { phone }
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
@@ -1199,7 +1198,7 @@ async function backfillToday() {
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
           client_note: o.note || '',
-          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
@@ -1238,7 +1237,6 @@ async function backfillRange(daysBack, debug) {
           edges { node {
             id name createdAt updatedAt note phone
             shippingAddress { phone }
-            customer { phone }
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
@@ -1272,7 +1270,7 @@ async function backfillRange(daysBack, debug) {
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
           client_note: o.note || '',
-          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
