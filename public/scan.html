@@ -177,7 +177,15 @@
   .needs-panel{ background:var(--surface); width:100%; height:100%; max-width:100%; display:flex; flex-direction:column; }
   @media (min-width:640px){
     .needs-panel{ width:min(560px, 92vw); height:min(88vh, 820px); border-radius:16px; box-shadow:var(--shadow); overflow:hidden; }
+    .needs-panel.return-history-panel{ width:min(720px, 94vw); }
   }
+  .return-history-days{ flex:0 0 auto; display:flex; gap:0.4rem; flex-wrap:wrap; padding:0.7rem 1.1rem; border-bottom:1px solid var(--border); }
+  .return-history-day-btn{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; padding:0.35rem 0.7rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .return-history-day-btn.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+  .return-history-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:0.6rem 0.8rem; margin-bottom:0.5rem; font-size:0.84rem; }
+  .return-history-row .order-name{ flex:0 0 auto; font-weight:500; min-width:5.5rem; }
+  .return-history-row .products-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.8rem; }
+  .return-history-row .received-at{ flex:0 0 auto; font-family:"IBM Plex Mono", monospace; color:var(--text-dim); font-size:0.78rem; }
   .needs-header{ flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:0.6rem; padding:1rem 1.1rem; border-bottom:1px solid var(--border); background:var(--surface); }
   .needs-header h3{ font-family:"Fraunces", serif; font-size:1.05rem; font-weight:600; margin:0; }
   .needs-close{ flex:0 0 auto; font-family:inherit; font-size:1.3rem; line-height:1; padding:0.4rem 0.65rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); cursor:pointer; }
@@ -290,6 +298,7 @@
         <input id="scanInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" spellcheck="false"
           placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
         <button type="button" class="mode-toggle" id="returnModeBtn">🔄 Scanează retur primit</button>
+        <button type="button" class="mode-toggle" id="returnHistoryBtn">📅 Istoric retururi pe zile</button>
       </div>
     </div>
 
@@ -320,6 +329,17 @@
       <button type="button" class="needs-close" id="stockMissingNeedsCloseBtn" aria-label="Închide">✕</button>
     </div>
     <div class="needs-list" id="stockMissingNeedsList"></div>
+  </div>
+</div>
+
+<div class="needs-modal" id="returnHistoryModal">
+  <div class="needs-panel return-history-panel">
+    <div class="needs-header">
+      <h3>📅 Istoric retururi — <span id="returnHistoryDayLabel">azi</span> (<span id="returnHistoryCount">0</span>)</h3>
+      <button type="button" class="needs-close" id="returnHistoryCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="return-history-days" id="returnHistoryDays"></div>
+    <div class="needs-list" id="returnHistoryList"></div>
   </div>
 </div>
 
@@ -881,9 +901,9 @@
   const main = document.getElementById('main');
   const idleState = document.getElementById('idleState');
   function keepFocus(){ input.focus(); }
-  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal') && !e.target.closest('#stockMissingNeedsModal')) keepFocus(); });
+  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal') && !e.target.closest('#stockMissingNeedsModal') && !e.target.closest('#returnHistoryModal')) keepFocus(); });
   window.addEventListener('load', keepFocus);
-  setInterval(() => { if (!needsModal.classList.contains('open') && !stockMissingNeedsModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
+  setInterval(() => { if (!needsModal.classList.contains('open') && !stockMissingNeedsModal.classList.contains('open') && !returnHistoryModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
 
   function renderStatusBanner(kind, text){
     const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned', stockmissing:'stockmissing' }[kind] || 'first';
@@ -901,6 +921,67 @@
     returnModeBtn.textContent = returnMode ? '🔄 Mod retur ACTIV' : '🔄 Scanează retur primit';
     input.placeholder = returnMode ? 'Scanează AWB-ul returnat…' : 'Scanează AWB-ul de pe etichetă…';
   });
+
+  // ---- Istoric retururi pe zile (2026-08-27) -------------------------------
+  // "Scanate ca retur primit" grupate pe zi (return_received_at), ca să vezi
+  // rapid ce s-a scanat azi / ieri / alaltăieri, nu doar coada curentă de
+  // retururi neconfirmate (returnsBar de mai sus, care e altceva).
+  const returnHistoryModal = document.getElementById('returnHistoryModal');
+  const returnHistoryDaysEl = document.getElementById('returnHistoryDays');
+  const returnHistoryListEl = document.getElementById('returnHistoryList');
+  const returnHistoryDayLabel = document.getElementById('returnHistoryDayLabel');
+  const returnHistoryCount = document.getElementById('returnHistoryCount');
+  function dayLabel(day){
+    const todayD = new Date(bucharestToday() + 'T00:00:00');
+    const targetD = new Date(day + 'T00:00:00');
+    const diffDays = Math.round((todayD - targetD) / 86400000);
+    if (diffDays === 0) return 'azi';
+    if (diffDays === 1) return 'ieri';
+    if (diffDays === 2) return 'alaltăieri';
+    return targetD.toLocaleDateString('ro-RO', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  }
+  async function loadReturnHistoryDay(day){
+    document.querySelectorAll('.return-history-day-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.day === day));
+    returnHistoryDayLabel.textContent = dayLabel(day);
+    const res = await fetch(`/api/return-day/${day}`);
+    const data = await res.json();
+    const rowsForDay = data.rows || [];
+    returnHistoryCount.textContent = rowsForDay.length;
+    returnHistoryListEl.innerHTML = rowsForDay.length ? rowsForDay.map(row => `
+      <div class="return-history-row">
+        <span class="awb-cell">${escapeHtml(row.awb)}</span>
+        <span class="order-name">${escapeHtml(row.order_name)}</span>
+        <span class="products-txt">${productsText(row)}</span>
+        <span class="received-at">${fmtTime(row.return_received_at)}</span>
+      </div>
+    `).join('') : '<div class="empty-row">Niciun retur confirmat în ziua asta.</div>';
+  }
+  async function loadReturnHistoryDays(){
+    const res = await fetch('/api/return-days');
+    const data = await res.json();
+    const days = data.days || [];
+    if (!days.length){
+      returnHistoryDaysEl.innerHTML = '';
+      returnHistoryListEl.innerHTML = '<div class="empty-row">Niciun retur confirmat încă.</div>';
+      returnHistoryCount.textContent = '0';
+      returnHistoryDayLabel.textContent = '—';
+      return;
+    }
+    returnHistoryDaysEl.innerHTML = days.map(day => `<button type="button" class="return-history-day-btn" data-day="${escapeAttr(day)}">${escapeHtml(dayLabel(day))}</button>`).join('');
+    await loadReturnHistoryDay(days[0]);
+  }
+  returnHistoryDaysEl.addEventListener('click', e => {
+    const btn = e.target.closest('.return-history-day-btn');
+    if (btn) loadReturnHistoryDay(btn.dataset.day);
+  });
+  document.getElementById('returnHistoryBtn').addEventListener('click', async () => {
+    returnHistoryModal.classList.add('open');
+    await loadReturnHistoryDays();
+  });
+  document.getElementById('returnHistoryCloseBtn').addEventListener('click', () => {
+    returnHistoryModal.classList.remove('open');
+  });
+  returnHistoryModal.addEventListener('click', e => { if (e.target === returnHistoryModal) returnHistoryModal.classList.remove('open'); });
   function renderFound(row, bannerHtml){
     idleState.style.display = 'none';
     const items = JSON.parse(row.items_json || '[]');
