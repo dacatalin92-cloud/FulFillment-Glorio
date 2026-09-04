@@ -103,6 +103,9 @@ const ORDER_QUERY = `
       name
       note
       createdAt
+      phone
+      shippingAddress { phone }
+      customer { phone }
       totalPriceSet { shopMoney { amount currencyCode } }
       lineItems(first: 20) {
         edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } }
@@ -133,6 +136,10 @@ async function fetchOrderDetails(orderGid) {
     name: o.name,
     note: o.note || '',
     createdAt: o.createdAt,
+    // Prioritate: telefonul de pe adresa de livrare (cel mai probabil de
+    // folosit de curier/staff pentru contact) > telefonul comenzii (cel
+    // introdus la checkout) > telefonul contului clientului.
+    phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
     total: parseFloat(o.totalPriceSet.shopMoney.amount),
     currency: o.totalPriceSet.shopMoney.currencyCode,
     items: o.lineItems.edges.map((e) => ({
