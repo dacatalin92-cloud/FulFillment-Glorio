@@ -656,6 +656,75 @@ app.get('/admin/backfill-order-ids-result', (req, res) => {
   res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
 });
 
+// /admin/backfill-phones?secret=...  (add &apply=1 once it looks right)
+// The `phone` column was added 2026-08-27 — every AWB row created before
+// that has it blank. This fills it in for old rows that already have an
+// order_id (so we can fetch the order straight by GID, no name lookup
+// needed) but no phone yet. Same background-job + dry-run pattern as
+// backfill-order-ids above.
+async function backfillPhones(rows) {
+  const results = [];
+  for (const row of rows) {
+    try {
+      const order = await shopify.fetchOrderDetails(`gid://shopify/Order/${row.order_id}`);
+      const phone = order && order.phone ? order.phone : '';
+      results.push({ awb: row.awb, order_name: row.order_name, phone, action: phone ? 'set' : 'no-phone' });
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let backfillPhonesRunning = false;
+app.get('/admin/backfill-phones', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillPhonesRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-phones] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listMissingPhone(limit);
+  backfillPhonesRunning = true;
+  (async () => {
+    try {
+      const results = await backfillPhones(rows);
+      const toSet = results.filter((r) => r.action === 'set');
+      const noPhone = results.filter((r) => r.action === 'no-phone');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[backfill-phones] scanned ${results.length} — ${toSet.length} found, ${noPhone.length} fara telefon in Shopify, ${errors.length} erori`);
+      if (apply) {
+        toSet.forEach((r) => db.setPhone(r.awb, r.phone));
+        console.log(`[backfill-phones] applied — set phone on ${toSet.length} AWB(s)`);
+        broadcast({ type: 'refresh' }); // paginile deschise re-fetch ca să vadă telefoanele noi
+      }
+      global.__lastBackfillPhonesResult = { apply, count: results.length, toSet, noPhone, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[backfill-phones] failed', err);
+      global.__lastBackfillPhonesResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      backfillPhonesRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/backfill-phones-result?secret=... for the outcome, or watch Deploy Logs for [backfill-phones].',
+  });
+});
+
+app.get('/admin/backfill-phones-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastBackfillPhonesResult || { hint: 'no run recorded yet in this process' });
+});
+
 // Safety-net revert: undoes an incorrect "packed" mark for a specific list
 // of AWBs, given as a comma-separated query param. Built for the incident
 // where an earlier version of /admin/reconcile-with-shopify wrongly marked
