@@ -139,6 +139,7 @@ async function handleFulfillmentPayload(payload) {
     awb,
     order_name: order.name,
     order_created_at: order.createdAt,
+    phone: order.phone,
     awb_created_at: payload.created_at,
     total: order.total,
     currency: order.currency,
@@ -1096,7 +1097,9 @@ async function backfillToday() {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            id name createdAt updatedAt note
+            id name createdAt updatedAt note phone
+            shippingAddress { phone }
+            customer { phone }
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
@@ -1127,6 +1130,7 @@ async function backfillToday() {
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
           client_note: o.note || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
@@ -1163,7 +1167,9 @@ async function backfillRange(daysBack, debug) {
       `query($cursor: String) {
         orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
           edges { node {
-            id name createdAt updatedAt note
+            id name createdAt updatedAt note phone
+            shippingAddress { phone }
+            customer { phone }
             totalPriceSet { shopMoney { amount currencyCode } }
             fulfillments { status createdAt trackingInfo(first: 1) { number company } }
             lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
@@ -1197,6 +1203,7 @@ async function backfillRange(daysBack, debug) {
           currency: o.totalPriceSet.shopMoney.currencyCode,
           order_id: o.id ? o.id.split('/').pop() : null,
           client_note: o.note || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || (o.customer && o.customer.phone) || '',
           items: o.lineItems.edges.map((e) => ({
             title: e.node.title,
             qty: e.node.quantity,
