@@ -506,6 +506,7 @@
     exportCsv(`de-pregatit-${bucharestToday()}.csv`, list, [
       { label: 'Comandă', get: r => r.order_name },
       { label: 'AWB', get: r => r.awb },
+      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Produse', get: r => productsTextPlain(r) },
       { label: 'Status Sameday', get: r => r.sameday_status || '' },
       { label: 'Stoc lipsă', get: r => r.stock_missing ? 'DA' : '' },
@@ -961,6 +962,7 @@
     exportCsv(`registru-scanare-${bucharestToday()}.csv`, scanned, [
       { label: 'AWB', get: r => r.awb },
       { label: 'Comandă', get: r => r.order_name },
+      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Prima scanare', get: r => fmtTime(r.first_scan_at) },
       { label: 'Status', get: r => r.packed ? 'Împachetat' : 'Scanat 1x' },
       { label: 'Confirmat la', get: r => r.packed ? fmtTime(r.packed_at) : '' },
@@ -1132,6 +1134,7 @@
     exportCsv(`retururi-${returnHistoryCurrentDay || bucharestToday()}.csv`, returnHistoryCurrentRows, [
       { label: 'AWB', get: r => r.awb },
       { label: 'Comandă', get: r => r.order_name },
+      { label: 'Telefon', get: r => r.phone || '' },
       { label: 'Produse', get: r => productsTextPlain(r) },
       { label: 'Retur primit la', get: r => fmtTime(r.return_received_at) },
     ]);
@@ -1142,6 +1145,7 @@
       <tr>
         <td>${escapeHtmlPdf(r.awb)}</td>
         <td>${escapeHtmlPdf(r.order_name)}</td>
+        <td>${escapeHtmlPdf(r.phone || '')}</td>
         <td>${escapeHtmlPdf(productsTextPlain(r))}</td>
         <td>${escapeHtmlPdf(fmtTime(r.return_received_at))}</td>
       </tr>
@@ -1149,7 +1153,7 @@
     openPrintWindow(
       `Istoric retururi — ${label}`,
       `${returnHistoryCurrentDay || bucharestToday()} · ${returnHistoryCurrentRows.length} retururi`,
-      ['AWB', 'Comandă', 'Produse', 'Retur primit la'],
+      ['AWB', 'Comandă', 'Telefon', 'Produse', 'Retur primit la'],
       rowsHtml
     );
   });
