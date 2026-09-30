@@ -70,11 +70,19 @@
   .left-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--border); min-height:0; }
   .right-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; min-height:0; }
 
-  .picklist{ flex:1 1 50%; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .picklist{ flex:0 0 auto; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .picklist.full-height{ flex:1 1 100%; border-bottom:none; }
   .picklist-head{ display:flex; align-items:center; justify-content:space-between; gap:0.6rem; flex-wrap:wrap; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
   .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
-  .picklist-scroll{ overflow-y:auto; flex:1 1 auto; }
+  /* 2026-09-30: pe cerința clientului, tabelul cu AWB-uri al listei "De
+     pregătit pentru curier" nu se mai afișează în stația de scanare —
+     rândurile deveniseră prea multe pentru ecran și nu mai era folosit
+     vizual acolo. Butoanele din header (Necesar produse, Produse lipsă,
+     Export CSV) și contorul rămân — ele nu depind de tabel, citesc direct
+     din `rows`/isPickable(), la fel ca înainte. Ascuns doar vizual (nu
+     șters din DOM), ca restul codului (renderPicklist, export etc.) să
+     rămână neschimbat. */
+  .picklist-scroll{ display:none; }
   table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
   thead th{ position:sticky; top:0; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.4rem 1rem; border-bottom:1px solid var(--border); }
   tbody td{ padding:0.38rem 1rem; border-bottom:1px solid var(--border); vertical-align:top; }
@@ -203,7 +211,7 @@
   .needs-purchase input[type="checkbox"]{ width:1.05rem; height:1.05rem; accent-color:var(--accent); cursor:pointer; }
   .needs-purchase-qty{ width:4.2rem; font-family:"IBM Plex Mono", monospace; font-size:0.8rem; padding:0.25rem 0.4rem; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); text-align:center; }
 
-  .registry{ flex:1 1 50%; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .registry{ flex:1 1 auto; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
   .registry.hidden{ display:none; }
   .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
   .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
@@ -481,6 +489,13 @@
     if ((row.sameday_status || '').toLowerCase().includes('anulat')) return false;
     return true;
   }
+  // 2026-09-30: tabelul propriu-zis (thead/tbody) nu se mai afișează în
+  // pagină — vezi regula CSS .picklist-scroll{ display:none; }. Funcția
+  // rămâne neschimbată intenționat: completează în continuare #picklistBody
+  // (invizibil) și #picklistCount (vizibil, în header), pentru că export
+  // CSV / "Necesar produse" / "Produse lipsă" citesc tot din `rows` +
+  // isPickable(), nu din tabelul randat — simplu de reactivat vizual mai
+  // târziu doar redenumind acea regulă CSS, dacă va fi nevoie.
   function renderPicklist(){
     const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
     document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
