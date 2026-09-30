@@ -43,6 +43,23 @@ function broadcast(msg) {
   });
 }
 
+// Curieri ale căror AWB-uri sunt urmărite de acest sistem. Orice
+// fulfillment Shopify al cărui nume de curier NU conține una din aceste
+// bucăți de text e ignorat complet (nu ajunge în baza de date) — exact
+// mecanismul care ținea sistemul strict pe Sameday până acum. Adăugat
+// "bookurier" 2026-09-30, la cererea clientului, care a început să
+// livreze și prin acest curier — dar DOAR pentru recunoașterea/scanarea
+// AWB-urilor lor; NU se cere și status live de la Bookurier (asta ar
+// necesita propriul client API, ca sameday.js), deci coloana
+// sameday_status rămâne goală pentru AWB-urile Bookurier — inofensiv,
+// codul care citește acel câmp (isPickable, samedayIndicatesPickedUp etc.)
+// tratează un status gol ca "nimic special", nu ca eroare.
+const SUPPORTED_COURIERS = ['sameday', 'bookurier'];
+function isSupportedCourierName(company) {
+  const c = (company || '').toLowerCase();
+  return SUPPORTED_COURIERS.some((name) => c.includes(name));
+}
+
 // "packed" is primarily a warehouse-floor fact confirmed by a scan at the
 // station — but not every order goes through this app's station. Some are
 // fulfilled through the older/other process, and for those Sameday's own
@@ -126,8 +143,8 @@ app.post(
 
 async function handleFulfillmentPayload(payload) {
   if ((payload.status || '').toLowerCase() !== 'success') return;
-  const company = (payload.tracking_company || '').toLowerCase();
-  if (!company.includes('sameday')) return;
+  if (!isSupportedCourierName(payload.tracking_company)) return;
+  const isSameday = (payload.tracking_company || '').toLowerCase().includes('sameday');
   const awb = payload.tracking_number;
   if (!awb) return;
 
@@ -151,9 +168,11 @@ async function handleFulfillmentPayload(payload) {
   console.log(`[webhook] new AWB ${awb} for ${order.name}`);
 
   // Get a first real status right away instead of waiting for the next poll tick
-  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), in which
-  // case skip this too rather than sneaking in auth attempts another way.
-  if (process.env.SAMEDAY_POLL_ENABLED !== 'false') {
+  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), or this
+  // AWB isn't a Sameday one at all (Bookurier has no status-lookup client
+  // built yet — see isSupportedCourierName above), in which case skip this
+  // too rather than calling Sameday's API for an AWB that isn't theirs.
+  if (isSameday && process.env.SAMEDAY_POLL_ENABLED !== 'false') {
     try {
       const status = await sameday.getStatus(awb);
       applySamedayUpdate(awb, status);
@@ -1185,7 +1204,7 @@ async function backfillToday() {
       for (const f of o.fulfillments) {
         if (f.status !== 'SUCCESS') continue;
         const tracking = f.trackingInfo[0];
-        if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
         if (new Date(f.createdAt).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' }) !== todayKey) continue;
         const existing = db.getAwb(tracking.number);
         if (existing) continue;
@@ -1257,7 +1276,7 @@ async function backfillRange(daysBack, debug) {
         if (new Date(f.createdAt).getTime() < cutoffMs) continue;
         stats.fulfillmentsSuccess++;
         const tracking = f.trackingInfo[0];
-        if (!tracking || !/sameday/i.test(tracking.company || '')) continue;
+        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
         stats.samedayMatches++;
         const existing = db.getAwb(tracking.number);
         if (existing) { stats.alreadyInDb++; continue; }
