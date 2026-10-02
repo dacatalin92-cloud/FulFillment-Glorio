@@ -156,6 +156,7 @@
   .unknown-returns-row .awb-cell{ flex:0 0 auto; }
   .unknown-returns-row .scanned-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
   .unknown-returns-row .note-input{ flex:1 1 auto; }
+  .unknown-returns-hint{ padding:0 1.5rem 0.6rem; margin-top:-0.2rem; font-size:0.78rem; color:var(--red); opacity:0.85; }
   .resolve-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--green); background:var(--green-soft); color:var(--green); cursor:pointer; }
 
   .stock-missing-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
@@ -253,6 +254,7 @@
   <div class="unknown-returns-bar-head" id="unknownReturnsBarHead">
     <span>⚠️ <span id="unknownReturnsCount">0</span> retur(uri) neidentificate (nu sunt în sistem) — click pentru listă</span>
   </div>
+  <div class="unknown-returns-hint">De verificat manual — poate fi de la Fan Curier, Cargus, Sameday, Bookurier sau DPD (curieri pe care sistemul nu îi caută automat aici).</div>
   <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
 </div>
 
@@ -1164,6 +1166,7 @@
               <div class="glyph">⚠️</div>
               <h2>Retur neidentificat</h2>
               <p>Codul <code>${escapeHtml(code)}</code> nu există în sistem — a fost adăugat în lista de retururi neidentificate, jos, pentru verificare manuală.</p>
+              <p style="margin-top:0.4rem; font-size:0.82rem;">Verifică manual — poate fi de la Fan Curier, Cargus, Sameday, Bookurier sau DPD.</p>
             </div>
           `;
         }
