@@ -47,14 +47,15 @@ function broadcast(msg) {
 // fulfillment Shopify al cărui nume de curier NU conține una din aceste
 // bucăți de text e ignorat complet (nu ajunge în baza de date) — exact
 // mecanismul care ținea sistemul strict pe Sameday până acum. Adăugat
-// "bookurier" 2026-09-30, la cererea clientului, care a început să
-// livreze și prin acest curier — dar DOAR pentru recunoașterea/scanarea
-// AWB-urilor lor; NU se cere și status live de la Bookurier (asta ar
-// necesita propriul client API, ca sameday.js), deci coloana
-// sameday_status rămâne goală pentru AWB-urile Bookurier — inofensiv,
-// codul care citește acel câmp (isPickable, samedayIndicatesPickedUp etc.)
-// tratează un status gol ca "nimic special", nu ca eroare.
-const SUPPORTED_COURIERS = ['sameday', 'bookurier'];
+// "bookurier" 2026-09-30, apoi "dpd" 2026-10-07, la cererea clientului,
+// care a început să livreze și prin aceste curiere — dar DOAR pentru
+// recunoașterea/scanarea AWB-urilor lor; NU se cere și status live de la
+// Bookurier/DPD (asta ar necesita propriul client API per curier, ca
+// sameday.js), deci coloana sameday_status rămâne goală pentru AWB-urile
+// lor — inofensiv, codul care citește acel câmp (isPickable,
+// samedayIndicatesPickedUp etc.) tratează un status gol ca "nimic
+// special", nu ca eroare.
+const SUPPORTED_COURIERS = ['sameday', 'bookurier', 'dpd'];
 function isSupportedCourierName(company) {
   const c = (company || '').toLowerCase();
   return SUPPORTED_COURIERS.some((name) => c.includes(name));
