@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor Depozit — Glorio</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e8eaf0;
+    --muted: #7a7f96;
+    --green: #22c55e;
+    --blue: #3b82f6;
+    --orange: #f59e0b;
+    --red: #ef4444;
+    --purple: #a855f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    padding: 24px;
+    gap: 20px;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  header h1 {
+    font-size: 1.3rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  #clock {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  #date-label {
+    font-size: 0.9rem;
+    color: var(--muted);
+    text-align: right;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .card .label {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .card .count {
+    font-size: 4rem;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .value {
+    font-size: 1rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .card.total .count { color: var(--green); }
+  .card.bok    .count { color: var(--blue); }
+  .card.dpd    .count { color: var(--orange); }
+  .card.sameday .count { color: var(--purple); }
+  .card.unscan .count { color: var(--red); }
+
+  .section-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 600;
+    margin-bottom: -4px;
+  }
+
+  .feed {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    flex: 1;
+  }
+  .feed-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .feed-list {
+    list-style: none;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .feed-list li {
+    display: grid;
+    grid-template-columns: 60px 110px 1fr auto auto;
+    gap: 12px;
+    align-items: center;
+    padding: 11px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.88rem;
+    transition: background 0.3s;
+  }
+  .feed-list li.new {
+    background: rgba(34, 197, 94, 0.08);
+  }
+  .feed-list li .nr { color: var(--muted); font-size: 0.78rem; }
+  .feed-list li .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .feed-list li .order { font-weight: 700; }
+  .feed-list li .awb {
+    font-family: 'Courier New', monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .badge {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .badge-bok     { background: rgba(59,130,246,0.18); color: #60a5fa; }
+  .badge-dpd     { background: rgba(245,158,11,0.18); color: #fbbf24; }
+  .badge-sameday { background: rgba(168,85,247,0.18); color: #c084fc; }
+  .badge-other   { background: rgba(122,127,150,0.18); color: #a0a5b8; }
+
+  #status {
+    font-size: 0.75rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  #status.ok { color: var(--green); }
+  #status.err { color: var(--red); }
+
+  @media (max-width: 600px) {
+    body { padding: 12px; gap: 12px; }
+    .card .count { font-size: 3rem; }
+    .feed-list li { grid-template-columns: 50px 1fr auto; }
+    .feed-list li .awb, .feed-list li .time { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📦 Monitor Depozit</h1>
+  <div style="text-align:right">
+    <div id="clock">--:--:--</div>
+    <div id="date-label">--</div>
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card total">
+    <div class="label">✅ Total confirmate azi</div>
+    <div class="count" id="cnt-total">—</div>
+    <div class="value" id="val-total"></div>
+  </div>
+  <div class="card bok">
+    <div class="label">🔵 Bookurier</div>
+    <div class="count" id="cnt-bok">—</div>
+    <div class="value" id="val-bok"></div>
+  </div>
+  <div class="card dpd">
+    <div class="label">🟡 DPD</div>
+    <div class="count" id="cnt-dpd">—</div>
+    <div class="value" id="val-dpd"></div>
+  </div>
+  <div class="card sameday">
+    <div class="label">🟣 Sameday</div>
+    <div class="count" id="cnt-smd">—</div>
+    <div class="value" id="val-smd"></div>
+  </div>
+</div>
+
+<div class="section-title">Ultimele scanări confirmate</div>
+
+<div class="feed">
+  <div class="feed-header">Flux live — scanări confirmate (împachetate)</div>
+  <ul class="feed-list" id="feed"></ul>
+</div>
+
+<div id="status">Se conectează…</div>
+
+<script>
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const tz = 'Europe/Bucharest';
+
+  function todayStr() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  }
+
+  function fmtTime(iso) {
+    return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function courierOf(awb) {
+    if (/BOK|B0K/i.test(awb))    return 'bok';
+    if (/^1ONB/i.test(awb))      return 'sameday';
+    if (/^\d{11}$/.test(awb))    return 'dpd';
+    return 'other';
+  }
+
+  function badgeHtml(courier) {
+    const map = { bok: 'Bookurier', dpd: 'DPD', sameday: 'Sameday', other: '?' };
+    return `<span class="badge badge-${courier}">${map[courier] || courier}</span>`;
+  }
+
+  // ── Clock ─────────────────────────────────────────────────────────────────
+  function tickClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent =
+      now.toLocaleTimeString('ro-RO', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    document.getElementById('date-label').textContent =
+      now.toLocaleDateString('ro-RO', { timeZone: tz, day: '2-digit', month: 'long', year: 'numeric' });
+  }
+  setInterval(tickClock, 1000);
+  tickClock();
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  let allPacked = [];   // all confirmed rows for today
+
+  function updateCounters() {
+    const rows = allPacked;
+    const bok = rows.filter(r => courierOf(r.awb) === 'bok');
+    const dpd = rows.filter(r => courierOf(r.awb) === 'dpd');
+    const smd = rows.filter(r => courierOf(r.awb) === 'sameday');
+
+    const sum = arr => arr.reduce((s, r) => s + (r.cod ?? r.total ?? 0), 0);
+
+    document.getElementById('cnt-total').textContent = rows.length;
+    document.getElementById('val-total').textContent = sum(rows).toFixed(2) + ' RON';
+    document.getElementById('cnt-bok').textContent = bok.length;
+    document.getElementById('val-bok').textContent = bok.length ? sum(bok).toFixed(2) + ' RON' : '';
+    document.getElementById('cnt-dpd').textContent = dpd.length;
+    document.getElementById('val-dpd').textContent = dpd.length ? sum(dpd).toFixed(2) + ' RON' : '';
+    document.getElementById('cnt-smd').textContent = smd.length;
+    document.getElementById('val-smd').textContent = smd.length ? sum(smd).toFixed(2) + ' RON' : '';
+  }
+
+  function renderFeed() {
+    const sorted = [...allPacked].sort((a, b) =>
+      (b.packed_at || '').localeCompare(a.packed_at || ''));
+    const recent = sorted.slice(0, 30);
+    const feed = document.getElementById('feed');
+    feed.innerHTML = recent.map((r, i) => {
+      const c = courierOf(r.awb);
+      return `<li>
+        <span class="nr">${allPacked.length - i}</span>
+        <span class="time">${r.packed_at ? fmtTime(r.packed_at) : '—'}</span>
+        <span class="order">${r.order_name || ''}</span>
+        <span class="awb">${r.awb}</span>
+        ${badgeHtml(c)}
+      </li>`;
+    }).join('');
+  }
+
+  // ── Load today's data ─────────────────────────────────────────────────────
+  async function loadToday() {
+    try {
+      const day = todayStr();
+      const res = await fetch(`/api/packed-day/${day}`);
+      const data = await res.json();
+      allPacked = (data.rows || []).filter(r => r.packed && !r.cancelled);
+      updateCounters();
+      renderFeed();
+    } catch (e) {
+      console.error('loadToday error', e);
+    }
+  }
+
+  loadToday();
+  // Refresh full data every 2 minutes as safety net
+  setInterval(loadToday, 120_000);
+
+  // ── WebSocket — real-time updates ─────────────────────────────────────────
+  let ws, wsRetries = 0;
+
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      wsRetries = 0;
+      document.getElementById('status').textContent = '🟢 Live — actualizare în timp real';
+      document.getElementById('status').className = 'ok';
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        // A confirmed pack scan
+        if (msg.result && msg.result.kind === 'packed' && msg.result.row) {
+          const row = msg.result.row;
+          const today = todayStr();
+          const packedDay = row.packed_at
+            ? new Date(row.packed_at).toLocaleDateString('en-CA', { timeZone: tz })
+            : null;
+          if (packedDay === today) {
+            // Add or update in allPacked
+            const idx = allPacked.findIndex(r => r.awb === row.awb);
+            if (idx >= 0) allPacked[idx] = row;
+            else allPacked.push(row);
+            updateCounters();
+            renderFeed();
+            // Flash new row
+            const items = document.querySelectorAll('#feed li');
+            if (items[0]) {
+              items[0].classList.add('new');
+              setTimeout(() => items[0].classList.remove('new'), 3000);
+            }
+          }
+        }
+        // Also reload on any scan to catch edge cases
+        if (msg.result && (msg.result.kind === 'packed' || msg.result.kind === 'already')) {
+          loadToday();
+        }
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      const delay = Math.min(1000 * 2 ** wsRetries++, 30000);
+      document.getElementById('status').textContent = `🔴 Deconectat — reconectare în ${Math.round(delay/1000)}s…`;
+      document.getElementById('status').className = 'err';
+      setTimeout(connectWs, delay);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  connectWs();
+</script>
+</body>
+</html>
