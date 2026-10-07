@@ -9,6 +9,26 @@ const db = require('./db');
 const sameday = require('./sameday');
 const shopify = require('./shopify');
 
+// 2026-10-07: eticheta DPD are pe ea un cod de bare mai lung decât numărul
+// de AWB salvat efectiv pe comandă în Shopify — ex. codul tipărit pe
+// etichetă e "00081382213462", dar xConnector/Shopify ține tracking number
+// "81382213462" (exact același număr, cu un prefix "000" în plus). Scanerul
+// citește codul de pe etichetă, deci o scanare directă cu findByCode() nu
+// găsea comanda, deși AWB-ul chiar există în baza de date — ajungea greșit
+// în "retururi neidentificate" / "AWB negăsit". Acest wrapper încearcă
+// întâi potrivirea exactă (ca înainte), iar dacă eșuează ȘI codul e numeric
+// cu zerouri la început, mai încearcă o dată cu zerourile inițiale scoase.
+// Sigur pentru celelalte AWB-uri (Sameday, Bookurier) — pentru ele a doua
+// încercare pur și simplu nu găsește nimic în plus, deci comportamentul
+// rămâne neschimbat.
+function findByCodeFlexible(code) {
+  const row = db.findByCode(code);
+  if (row) return row;
+  const trimmed = String(code || '').replace(/^0+(?=\d)/, '');
+  if (trimmed && trimmed !== code) return db.findByCode(trimmed);
+  return null;
+}
+
 const PORT = process.env.PORT || 3000;
 // 2026-08-26: era 30000 (30 secunde) — prea scurt pentru fluxul real de
 // împachetare (scanezi AWB-ul, pui efectiv produsul în cutie, lipești
@@ -966,7 +986,7 @@ app.get('/api/unpacked', (req, res) => {
 });
 
 app.get('/api/lookup/:code', (req, res) => {
-  const row = db.findByCode(req.params.code);
+  const row = findByCodeFlexible(req.params.code);
   if (!row) return res.status(404).json({ found: false });
   res.json({ found: true, row });
 });
@@ -974,7 +994,7 @@ app.get('/api/lookup/:code', (req, res) => {
 app.post('/api/scan', async (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: 'missing code' });
-  const row = db.findByCode(code);
+  const row = findByCodeFlexible(code);
   if (!row) return res.status(404).json({ found: false });
   let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
   // First scan at the station → note+tag on the Shopify order. We AWAIT the
@@ -1105,7 +1125,7 @@ app.get('/api/return-day/:day', (req, res) => {
 app.post('/api/scan-return', (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: 'missing code' });
-  const row = db.findByCode(code);
+  const row = findByCodeFlexible(code);
   if (!row) {
     const entry = db.logUnknownReturn(code, new Date().toISOString());
     broadcast({ type: 'unknown-return:new', entry });
