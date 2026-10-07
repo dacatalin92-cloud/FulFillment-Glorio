@@ -9,21 +9,36 @@ const db = require('./db');
 const sameday = require('./sameday');
 const shopify = require('./shopify');
 
-// 2026-10-07: eticheta DPD are pe ea un cod de bare mai lung decât numărul
-// de AWB salvat efectiv pe comandă în Shopify — ex. codul tipărit pe
-// etichetă e "00081382213462", dar xConnector/Shopify ține tracking number
-// "81382213462" (exact același număr, cu un prefix "000" în plus). Scanerul
-// citește codul de pe etichetă, deci o scanare directă cu findByCode() nu
-// găsea comanda, deși AWB-ul chiar există în baza de date — ajungea greșit
-// în "retururi neidentificate" / "AWB negăsit". Acest wrapper încearcă
-// întâi potrivirea exactă (ca înainte), iar dacă eșuează ȘI codul e numeric
-// cu zerouri la început, mai încearcă o dată cu zerourile inițiale scoase.
-// Sigur pentru celelalte AWB-uri (Sameday, Bookurier) — pentru ele a doua
-// încercare pur și simplu nu găsește nimic în plus, deci comportamentul
-// rămâne neschimbat.
+// 2026-10-07: scanerul citește de pe eticheta DPD un cod de bare de 28 de
+// cifre care NU e AWB-ul real — e un cod compus: "1000" (prefix fix) +
+// AWB-ul real, de 11 cifre (acelasi număr ținut de xConnector/Shopify ca
+// tracking number) + încă 13 cifre (verificare/date suplimentare de pe
+// etichetă). Confirmat pe două comenzi reale via /admin/debug-awb:
+//   "1000" + "81382257056" + "9260003870813"  (28 cifre)
+//   "1000" + "81382265004" + "9370000610818"  (28 cifre)
+// Prima variantă a acestui fix (doar "scoate zerourile din față") era
+// greșită — codul scanat efectiv începe cu "1", nu cu "0", deci acel fix nu
+// se activa niciodată pentru scanări reale. Acum extragem exact cifrele
+// 5-15 (poziția AWB-ului real) când codul se potrivește cu formatul de mai
+// sus. Sigur pentru celelalte AWB-uri (Sameday, Bookurier) — niciunul nu are
+// 28 de cifre numerice cu "1000" la început, deci a doua încercare pur și
+// simplu nu se declanșează pentru ele, comportamentul rămâne neschimbat.
+function extractDpdAwbFromScan(code) {
+  const c = String(code || '').trim();
+  if (/^1000\d{24}$/.test(c)) {
+    return c.slice(4, 15);
+  }
+  return null;
+}
+
 function findByCodeFlexible(code) {
   const row = db.findByCode(code);
   if (row) return row;
+  const dpdAwb = extractDpdAwbFromScan(code);
+  if (dpdAwb) {
+    const dpdRow = db.findByCode(dpdAwb);
+    if (dpdRow) return dpdRow;
+  }
   const trimmed = String(code || '').replace(/^0+(?=\d)/, '');
   if (trimmed && trimmed !== code) return db.findByCode(trimmed);
   return null;
