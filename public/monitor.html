@@ -181,9 +181,17 @@
 
 <header>
   <h1>📦 Monitor Depozit</h1>
-  <div style="text-align:right">
-    <div id="clock">--:--:--</div>
-    <div id="date-label">--</div>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end">
+    <div style="display:flex;align-items:center;gap:6px">
+      <button id="btn-prev" onclick="changeDay(-1)" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;font-size:1.1rem;cursor:pointer;">‹</button>
+      <input type="date" id="day-picker" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;font-size:0.9rem;cursor:pointer;" onchange="loadDay(this.value)">
+      <button id="btn-next" onclick="changeDay(1)" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;font-size:1.1rem;cursor:pointer;">›</button>
+      <button onclick="goToday()" id="btn-today" style="background:var(--green);border:none;color:#000;border-radius:8px;padding:6px 12px;font-size:0.8rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">AZI</button>
+    </div>
+    <div style="text-align:right">
+      <div id="clock">--:--:--</div>
+      <div id="date-label">--</div>
+    </div>
   </div>
 </header>
 
@@ -255,7 +263,55 @@
   tickClock();
 
   // ── State ─────────────────────────────────────────────────────────────────
-  let allPacked = [];   // all confirmed rows for today
+  let allPacked = [];   // all confirmed rows for current viewed day
+  let viewedDay = todayStr();  // which day we're looking at
+
+  // ── Day navigation ────────────────────────────────────────────────────────
+  function initPicker() {
+    const picker = document.getElementById('day-picker');
+    picker.value = viewedDay;
+    picker.max = todayStr();
+    updateTodayBtn();
+  }
+
+  function updateTodayBtn() {
+    const isToday = viewedDay === todayStr();
+    const btn = document.getElementById('btn-today');
+    btn.style.opacity = isToday ? '0.4' : '1';
+    btn.style.cursor  = isToday ? 'default' : 'pointer';
+  }
+
+  async function loadDay(dateStr) {
+    viewedDay = dateStr;
+    document.getElementById('day-picker').value = dateStr;
+    document.getElementById('day-picker').max = todayStr();
+    updateTodayBtn();
+    // Clear while loading
+    document.getElementById('cnt-total').textContent = '…';
+    document.getElementById('feed').innerHTML = '';
+    try {
+      const res = await fetch(`/api/packed-day/${dateStr}`);
+      const data = await res.json();
+      allPacked = (data.rows || []).filter(r => r.packed && !r.cancelled);
+      updateCounters();
+      renderFeed();
+    } catch (e) {
+      console.error('loadDay error', e);
+    }
+  }
+
+  function changeDay(delta) {
+    const d = new Date(viewedDay + 'T12:00:00');
+    d.setDate(d.getDate() + delta);
+    const next = d.toLocaleDateString('en-CA', { timeZone: tz });
+    if (next > todayStr()) return;   // can't go into the future
+    loadDay(next);
+  }
+
+  function goToday() {
+    if (viewedDay === todayStr()) return;
+    loadDay(todayStr());
+  }
 
   function updateCounters() {
     const rows = allPacked;
@@ -292,23 +348,13 @@
     }).join('');
   }
 
-  // ── Load today's data ─────────────────────────────────────────────────────
-  async function loadToday() {
-    try {
-      const day = todayStr();
-      const res = await fetch(`/api/packed-day/${day}`);
-      const data = await res.json();
-      allPacked = (data.rows || []).filter(r => r.packed && !r.cancelled);
-      updateCounters();
-      renderFeed();
-    } catch (e) {
-      console.error('loadToday error', e);
-    }
-  }
+  // ── Load data ─────────────────────────────────────────────────────────────
+  function loadToday() { loadDay(todayStr()); }
 
-  loadToday();
-  // Refresh full data every 2 minutes as safety net
-  setInterval(loadToday, 120_000);
+  initPicker();
+  loadDay(viewedDay);
+  // Refresh every 2 minutes — only reloads data for the currently viewed day
+  setInterval(() => loadDay(viewedDay), 120_000);
 
   // ── WebSocket — real-time updates ─────────────────────────────────────────
   let ws, wsRetries = 0;
@@ -324,16 +370,17 @@
     };
 
     ws.onmessage = (evt) => {
+      // Live updates only matter when watching today
+      if (viewedDay !== todayStr()) return;
       try {
         const msg = JSON.parse(evt.data);
         // A confirmed pack scan
         if (msg.result && msg.result.kind === 'packed' && msg.result.row) {
           const row = msg.result.row;
-          const today = todayStr();
           const packedDay = row.packed_at
             ? new Date(row.packed_at).toLocaleDateString('en-CA', { timeZone: tz })
             : null;
-          if (packedDay === today) {
+          if (packedDay === todayStr()) {
             // Add or update in allPacked
             const idx = allPacked.findIndex(r => r.awb === row.awb);
             if (idx >= 0) allPacked[idx] = row;
@@ -348,9 +395,9 @@
             }
           }
         }
-        // Also reload on any scan to catch edge cases
+        // Reload on any scan to catch edge cases
         if (msg.result && (msg.result.kind === 'packed' || msg.result.kind === 'already')) {
-          loadToday();
+          loadDay(todayStr());
         }
       } catch {}
     };
