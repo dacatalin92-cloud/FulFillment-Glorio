@@ -1199,12 +1199,68 @@ app.post('/api/stock-purchases/reset', (req, res) => {
   try {
     db.db.prepare('DELETE FROM stock_purchases').run();
   } catch (e) {
-    // Fallback: dacă db.db nu e expus, încearcă prin metoda publică dacă există
     if (typeof db.clearAllStockPurchases === 'function') db.clearAllStockPurchases();
     else return res.status(500).json({ error: 'Nu pot reseta — db.db inaccesibil' });
   }
   broadcast({ type: 'stock-purchases:reset' });
   res.json({ ok: true });
+});
+
+// --- Pagină reset necesar (link direct, bookmark-abil) --------------------
+app.get('/reset-necesar', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reset Necesar — AWB Glorio</title>
+  <style>
+    body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
+    .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); padding: 2.5rem 2rem; max-width: 380px; width: 90%; text-align: center; }
+    h1 { font-size: 1.3rem; margin: 0 0 0.5rem; }
+    p { color: #666; font-size: 0.9rem; margin: 0 0 2rem; }
+    button { font-family: inherit; font-size: 1rem; font-weight: 600; padding: 0.85rem 2rem; border-radius: 10px; border: none; cursor: pointer; width: 100%; }
+    #btn-reset { background: #dc2626; color: #fff; }
+    #btn-reset:disabled { background: #ccc; cursor: default; }
+    #msg { margin-top: 1.2rem; font-size: 0.9rem; min-height: 1.2em; }
+    .ok { color: #16a34a; font-weight: 600; }
+    .err { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🗑️ Reset Necesar Produse</h1>
+    <p>Șterge toate bifele și cantitățile din „Produse lipsă".<br>Acțiunea nu poate fi anulată.</p>
+    <button id="btn-reset" onclick="doReset()">Resetează necesarul</button>
+    <div id="msg"></div>
+  </div>
+  <script>
+    async function doReset() {
+      const btn = document.getElementById('btn-reset');
+      const msg = document.getElementById('msg');
+      btn.disabled = true;
+      btn.textContent = 'Se resetează…';
+      msg.textContent = '';
+      try {
+        const r = await fetch('/api/stock-purchases/reset', { method: 'POST' });
+        if (r.ok) {
+          msg.innerHTML = '<span class="ok">✅ Resetat cu succes! Toate bifele au fost șterse.</span>';
+          btn.textContent = 'Resetat ✓';
+        } else {
+          const e = await r.json().catch(() => ({}));
+          msg.innerHTML = '<span class="err">Eroare: ' + (e.error || r.status) + '</span>';
+          btn.disabled = false;
+          btn.textContent = 'Resetează necesarul';
+        }
+      } catch(e) {
+        msg.innerHTML = '<span class="err">Eroare rețea: ' + e.message + '</span>';
+        btn.disabled = false;
+        btn.textContent = 'Resetează necesarul';
+      }
+    }
+  </script>
+</body>
+</html>`);
 });
 
 // --- Sameday polling (courier status for open AWBs) ----------------------
