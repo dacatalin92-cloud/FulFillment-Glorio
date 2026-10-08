@@ -169,6 +169,49 @@
   #status.ok { color: var(--green); }
   #status.err { color: var(--red); }
 
+  /* ── Products view ───────────────────────────────────────────────────── */
+  .prod-row {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px 16px;
+    align-items: start;
+  }
+  .prod-row .prod-title {
+    font-weight: 700;
+    font-size: 0.92rem;
+    grid-column: 1;
+  }
+  .prod-row .prod-badge {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+    font-size: 1.6rem;
+    font-weight: 800;
+    color: var(--green);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .prod-row .prod-orders {
+    grid-column: 1;
+    font-size: 0.78rem;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .prod-row .prod-orders .ord-chip {
+    display: inline-block;
+    background: rgba(59,130,246,0.12);
+    color: #60a5fa;
+    border-radius: 6px;
+    padding: 1px 7px;
+    margin: 2px 3px 2px 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .prod-row.dup .prod-title { color: var(--orange); }
+
   @media (max-width: 600px) {
     body { padding: 12px; gap: 12px; }
     .card .count { font-size: 3rem; }
@@ -218,11 +261,22 @@
   </div>
 </div>
 
-<div class="section-title">Ultimele scanări confirmate</div>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+  <div class="section-title" id="section-label">Ultimele scanări confirmate</div>
+  <div style="display:flex;gap:8px">
+    <button id="btn-view-feed" onclick="setView('feed')" style="background:var(--blue);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:0.78rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">📋 Scanări</button>
+    <button id="btn-view-prod" onclick="setView('products')" style="background:var(--card);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:6px 14px;font-size:0.78rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">📦 Produse</button>
+  </div>
+</div>
 
-<div class="feed">
+<div class="feed" id="panel-feed">
   <div class="feed-header">Flux live — scanări confirmate (împachetate)</div>
   <ul class="feed-list" id="feed"></ul>
+</div>
+
+<div class="feed" id="panel-products" style="display:none">
+  <div class="feed-header">Produse împachetate azi — grupate după titlu</div>
+  <div id="prod-list" style="overflow-y:auto;max-height:420px"></div>
 </div>
 
 <div id="status">Se conectează…</div>
@@ -242,7 +296,7 @@
   function courierOf(awb) {
     if (/BOK|B0K/i.test(awb))    return 'bok';
     if (/^1ONB/i.test(awb))      return 'sameday';
-    if (/^\d{11}$/.test(awb))    return 'dpd';
+    if (/^\d{10,14}$/.test(awb)) return 'dpd';
     return 'other';
   }
 
@@ -295,6 +349,7 @@
       allPacked = (data.rows || []).filter(r => r.packed && !r.cancelled);
       updateCounters();
       renderFeed();
+      if (currentView === 'products') renderProducts();
     } catch (e) {
       console.error('loadDay error', e);
     }
@@ -329,6 +384,90 @@
     document.getElementById('val-dpd').textContent = dpd.length ? sum(dpd).toFixed(2) + ' RON' : '';
     document.getElementById('cnt-smd').textContent = smd.length;
     document.getElementById('val-smd').textContent = smd.length ? sum(smd).toFixed(2) + ' RON' : '';
+  }
+
+  // ── View toggle ───────────────────────────────────────────────────────────
+  let currentView = 'feed';
+
+  function setView(v) {
+    currentView = v;
+    const isFeed = v === 'feed';
+    document.getElementById('panel-feed').style.display     = isFeed ? '' : 'none';
+    document.getElementById('panel-products').style.display = isFeed ? 'none' : '';
+    document.getElementById('btn-view-feed').style.background = isFeed ? 'var(--blue)' : 'var(--card)';
+    document.getElementById('btn-view-feed').style.color      = isFeed ? '#fff' : 'var(--muted)';
+    document.getElementById('btn-view-feed').style.border     = isFeed ? 'none' : '1px solid var(--border)';
+    document.getElementById('btn-view-prod').style.background = isFeed ? 'var(--card)' : 'var(--orange)';
+    document.getElementById('btn-view-prod').style.color      = isFeed ? 'var(--muted)' : '#000';
+    document.getElementById('btn-view-prod').style.border     = isFeed ? '1px solid var(--border)' : 'none';
+    document.getElementById('section-label').textContent = isFeed
+      ? 'Ultimele scanări confirmate'
+      : 'Produse împachetate — grupate după titlu';
+    if (v === 'products') renderProducts();
+  }
+
+  // ── Products view ─────────────────────────────────────────────────────────
+  function parseItems(row) {
+    try {
+      const raw = row.items;
+      if (!raw) return [];
+      if (Array.isArray(raw)) return raw;
+      return JSON.parse(raw);
+    } catch { return []; }
+  }
+
+  function renderProducts() {
+    // Build map: product key → { title, variant, orders: [{name, qty, awb}] }
+    const map = new Map();
+
+    for (const row of allPacked) {
+      const items = parseItems(row);
+      if (!items.length) {
+        // Fallback: no items stored — just show order name
+        const key = '(produs necunoscut)';
+        if (!map.has(key)) map.set(key, { title: key, variant: '', orders: [] });
+        map.get(key).orders.push({ name: row.order_name || row.awb, qty: 1, awb: row.awb });
+        continue;
+      }
+      for (const it of items) {
+        const title   = it.title || '?';
+        const variant = it.variant && it.variant !== 'Default Title' ? it.variant : '';
+        const key     = title + (variant ? ' · ' + variant : '');
+        if (!map.has(key)) map.set(key, { title, variant, orders: [] });
+        map.get(key).orders.push({
+          name: row.order_name || row.awb,
+          qty:  it.qty || 1,
+          awb:  row.awb
+        });
+      }
+    }
+
+    // Sort: most duplicated first, then alphabetical
+    const sorted = [...map.entries()].sort((a, b) => {
+      const diff = b[1].orders.length - a[1].orders.length;
+      return diff !== 0 ? diff : a[0].localeCompare(b[0], 'ro');
+    });
+
+    const container = document.getElementById('prod-list');
+    if (!sorted.length) {
+      container.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">Nicio scanare</div>';
+      return;
+    }
+
+    container.innerHTML = sorted.map(([key, { title, variant, orders }]) => {
+      const totalQty = orders.reduce((s, o) => s + o.qty, 0);
+      const isDup    = orders.length > 1;
+      // Chips for each order (show order name + qty if qty>1)
+      const chips = orders.map(o =>
+        `<span class="ord-chip">${o.name}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
+      ).join('');
+      const variantLine = variant ? `<span style="color:var(--muted);font-size:0.78rem"> — ${variant}</span>` : '';
+      return `<div class="prod-row${isDup ? ' dup' : ''}">
+        <div class="prod-title">${title}${variantLine}</div>
+        <div class="prod-badge">${totalQty}</div>
+        <div class="prod-orders">${chips}</div>
+      </div>`;
+    }).join('');
   }
 
   function renderFeed() {
@@ -387,6 +526,7 @@
             else allPacked.push(row);
             updateCounters();
             renderFeed();
+            if (currentView === 'products') renderProducts();
             // Flash new row
             const items = document.querySelectorAll('#feed li');
             if (items[0]) {
