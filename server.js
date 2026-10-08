@@ -1107,6 +1107,14 @@ app.post('/api/stock-missing/clear', (req, res) => {
   res.json({ found: true, row });
 });
 
+app.post('/api/stock-missing/reset-all', (req, res) => {
+  // Șterge flagul stock_missing de pe TOATE comenzile blocate
+  const candidates = db.listStockMissing();
+  const updated = candidates.map((r) => db.clearStockMissing(r.awb)).filter(Boolean);
+  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+  res.json({ ok: true, count: updated.length });
+});
+
 // --- Returns --------------------------------------------------------------
 // AWBs Sameday currently shows as "in return" (courier bringing it back)
 // that nobody has confirmed as physically received yet — not scoped to
@@ -1229,9 +1237,9 @@ app.get('/reset-necesar', (req, res) => {
 </head>
 <body>
   <div class="card">
-    <h1>🗑️ Reset Necesar Produse</h1>
-    <p>Șterge toate bifele și cantitățile din „Produse lipsă".<br>Acțiunea nu poate fi anulată.</p>
-    <button id="btn-reset" onclick="doReset()">Resetează necesarul</button>
+    <h1>🚫 Reset Produse Lipsă</h1>
+    <p>Elimină flagul „lipsă din stoc" de pe toate comenzile blocate.<br>Comenzile redevin vizibile normal în scanare.</p>
+    <button id="btn-reset" onclick="doReset()">Resetează produsele lipsă</button>
     <div id="msg"></div>
   </div>
   <script>
@@ -1242,20 +1250,20 @@ app.get('/reset-necesar', (req, res) => {
       btn.textContent = 'Se resetează…';
       msg.textContent = '';
       try {
-        const r = await fetch('/api/stock-purchases/reset', { method: 'POST' });
+        const r = await fetch('/api/stock-missing/reset-all', { method: 'POST' });
+        const data = await r.json().catch(() => ({}));
         if (r.ok) {
-          msg.innerHTML = '<span class="ok">✅ Resetat cu succes! Toate bifele au fost șterse.</span>';
+          msg.innerHTML = '<span class="ok">✅ Resetat! ' + (data.count || 0) + ' comenzi deblocate.</span>';
           btn.textContent = 'Resetat ✓';
         } else {
-          const e = await r.json().catch(() => ({}));
-          msg.innerHTML = '<span class="err">Eroare: ' + (e.error || r.status) + '</span>';
+          msg.innerHTML = '<span class="err">Eroare: ' + (data.error || r.status) + '</span>';
           btn.disabled = false;
-          btn.textContent = 'Resetează necesarul';
+          btn.textContent = 'Resetează produsele lipsă';
         }
       } catch(e) {
         msg.innerHTML = '<span class="err">Eroare rețea: ' + e.message + '</span>';
         btn.disabled = false;
-        btn.textContent = 'Resetează necesarul';
+        btn.textContent = 'Resetează produsele lipsă';
       }
     }
   </script>
