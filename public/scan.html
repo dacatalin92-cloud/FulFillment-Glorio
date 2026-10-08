@@ -222,6 +222,84 @@
   .registry-stats .pill.pending{ background:var(--amber-soft); color:var(--amber); border-color:transparent; }
   .registry-filter-btn{ font-size:0.72rem; padding:0.3rem 0.6rem; }
   .registry-scroll{ overflow-y:auto; flex:1 1 auto; }
+
+  /* ── Mobile / iPhone ─────────────────────────────────────────────────── */
+  @media (max-width: 639px) {
+    /* Safe area pentru notch/home indicator iPhone */
+    body { padding-bottom: env(safe-area-inset-bottom); }
+
+    /* Topbar compact */
+    .topbar { padding: 0.6rem 1rem; }
+    .brand .mark { font-size: 1rem; }
+    .brand .eyebrow { display: none; }
+    .count-pill { font-size: 0.7rem; padding: 0.2rem 0.6rem; }
+
+    /* Layout: stivă verticală în loc de side-by-side
+       Panoul de scanare (right-panel) vine PRIMUL pe mobil */
+    .layout { flex-direction: column-reverse; height: auto; overflow: visible; }
+    .left-panel {
+      border-right: none;
+      border-top: 2px solid var(--border);
+      flex: 0 0 auto;
+      min-height: auto;
+    }
+    .right-panel { flex: 1 1 auto; min-height: 0; }
+
+    /* Butoane picklist pe 2 rânduri mai compacte */
+    .picklist-head { padding: 0.5rem 0.8rem; gap: 0.4rem; }
+    .picklist-head h3 { font-size: 0.82rem; width: 100%; }
+    .needs-btn { font-size: 0.72rem; padding: 0.35rem 0.6rem; }
+
+    /* Scan input mai mic dar tot lizibil */
+    .scan-input-wrap { padding: 0.7rem 0.8rem; }
+    #scanInput { font-size: 1.15rem; padding: 0.7rem 0.85rem; }
+
+    /* Butoanele de mod sub input — pe rând */
+    .scan-mode-row { flex-wrap: wrap; gap: 0.4rem; }
+    .mode-toggle { font-size: 0.72rem; padding: 0.45rem 0.65rem; flex: 1 1 auto; text-align: center; }
+
+    /* Panoul rezultat scanare */
+    main { padding: 0.8rem 0.8rem 0.5rem; }
+    .idle { margin-top: 1.2rem; }
+    .idle .glyph { font-size: 2rem; }
+    .idle h2 { font-size: 1.1rem; }
+
+    /* Card produs: imagine mai mică */
+    .item-card { padding: 0.75rem; gap: 0.7rem; border-radius: 10px; }
+    .item-card img { width: 72px; height: 72px; border-radius: 8px; }
+    .item-info .title { font-size: 0.92rem; }
+    .qty-badge { padding: 0.45rem 0.7rem; min-width: 50px; }
+    .qty-badge .n { font-size: 1.4rem; }
+
+    /* Statusuri */
+    .status-banner { font-size: 0.84rem; padding: 0.55rem 0.75rem; }
+    .result-head .order-tag { font-size: 1.35rem; }
+
+    /* Barele de alerte (retururi, stoc lipsă) */
+    .returns-bar-head,
+    .unknown-returns-bar-head,
+    .stock-missing-bar-head { padding: 0.5rem 0.8rem; font-size: 0.82rem; }
+
+    /* Registry ascuns pe mobil (e inutil la stații pe telefon) */
+    .registry { display: none; }
+    .picklist.full-height { flex: 0 0 auto; }
+
+    /* Modals: full screen pe iOS cu safe area */
+    .needs-panel {
+      border-radius: 0 !important;
+      height: 100% !important;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .needs-header { padding: 0.85rem 1rem; }
+    .needs-header h3 { font-size: 0.92rem; }
+    .needs-list { padding: 0.4rem; -webkit-overflow-scrolling: touch; }
+    .needs-row { gap: 0.6rem; padding: 0.6rem; border-radius: 10px; }
+    .needs-row img,
+    .needs-row .img-placeholder { width: 48px; height: 48px; border-radius: 7px; }
+    .needs-row .needs-title { font-size: 0.84rem; }
+    .needs-row .needs-qty .n { font-size: 1.1rem; }
+    .needs-purchase label { font-size: 0.68rem; }
+  }
 </style>
 </head>
 <body>
@@ -661,7 +739,7 @@
   }
   function computeProductNeeds(){
     const list = Object.values(rows).filter(isPickable);
-    const agg = new Map(); // key -> { title, specs, img, qty, blockedOrders }
+    const agg = new Map(); // key -> { title, specs, img, qty, orders, blockedOrders }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
@@ -671,9 +749,14 @@
         if (existing) {
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
+          existing.orders.push({ name: row.order_name, qty: it.qty });
           if (row.stock_missing && !existing.blockedOrders.includes(row.order_name)) existing.blockedOrders.push(row.order_name);
         } else {
-          agg.set(key, { title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty, blockedOrders: row.stock_missing ? [row.order_name] : [] });
+          agg.set(key, {
+            title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty,
+            orders: [{ name: row.order_name, qty: it.qty }],
+            blockedOrders: row.stock_missing ? [row.order_name] : []
+          });
         }
       });
     });
@@ -686,15 +769,21 @@
       needsList.innerHTML = '<div class="empty-row">Nimic de pregătit — toate comenzile sunt împachetate sau ridicate. 🎉</div>';
       return;
     }
-    needsList.innerHTML = items.map(it => `
+    needsList.innerHTML = items.map(it => {
+      const orderChips = it.orders.map(o =>
+        `<span style="display:inline-block;background:rgba(0,0,0,0.07);border-radius:6px;padding:1px 7px;margin:2px 3px 2px 0;font-size:0.72rem;font-weight:600;white-space:nowrap;">${escapeHtml(o.name)}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
+      ).join('');
+      return `
       <div class="needs-row">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
+        <div class="needs-title">
+          ${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
+          <div style="margin-top:5px;line-height:1.8">${orderChips}</div>
           ${it.blockedOrders.length ? `<div class="needs-blocked">⚠️ Stoc lipsă — blocat pentru: ${it.blockedOrders.map(escapeHtml).join(', ')}</div>` : ''}
         </div>
         <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   }
   document.getElementById('needsBtn').addEventListener('click', () => {
     renderNeeds();
@@ -729,7 +818,7 @@
   }
   function computeStockMissingNeeds(){
     const list = Object.values(rows).filter(r => r.stock_missing);
-    const agg = new Map(); // key -> { key, title, specs, img, qty }
+    const agg = new Map(); // key -> { key, title, specs, img, qty, waitingOrders }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
       items.forEach(it => {
@@ -739,8 +828,13 @@
         if (existing) {
           existing.qty += it.qty;
           if (!existing.img && it.img) existing.img = it.img;
+          // fiecare comandă apare separat (chiar dacă aceeași comandă are 2 produse lipsă diferite)
+          existing.waitingOrders.push({ name: row.order_name, qty: it.qty, awb: row.awb });
         } else {
-          agg.set(key, { key, title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty });
+          agg.set(key, {
+            key, title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty,
+            waitingOrders: [{ name: row.order_name, qty: it.qty, awb: row.awb }]
+          });
         }
       });
     });
@@ -768,10 +862,16 @@
       const purchase = stockPurchases[it.key] || {};
       const checked = !!purchase.checked;
       const qtyVal = purchase.qty_purchased === null || purchase.qty_purchased === undefined ? '' : purchase.qty_purchased;
+      const orderChips = it.waitingOrders.map(o =>
+        `<span style="display:inline-block;background:var(--amber-soft);color:var(--amber);border-radius:6px;padding:2px 8px;margin:2px 3px 2px 0;font-size:0.72rem;font-weight:600;white-space:nowrap;">${escapeHtml(o.name)}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
+      ).join('');
       return `
       <div class="needs-row${checked ? ' purchased' : ''}" data-key="${escapeAttr(it.key)}">
         ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
-        <div class="needs-title">${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}</div>
+        <div class="needs-title">
+          ${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
+          <div style="margin-top:5px;line-height:1.9">${orderChips}</div>
+        </div>
         <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">necesar</span></div>
         <div class="needs-purchase">
           <label><input type="checkbox" class="purchase-check" data-key="${escapeAttr(it.key)}" ${checked ? 'checked' : ''}> Achiziționat</label>
