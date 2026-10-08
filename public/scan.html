@@ -579,7 +579,8 @@
   // târziu doar redenumind acea regulă CSS, dacă va fi nevoie.
   function renderPicklist(){
     const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
-    document.getElementById('picklistCount').textContent = list.length + (list.length === 1 ? ' comandă' : ' comenzi');
+    const cnt = list.length;
+    document.getElementById('picklistCount').textContent = cnt + (cnt === 1 ? ' comandă' : ' comenzi');
     if (!list.length){
       picklistBody.innerHTML = '<tr><td colspan="6" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
       return;
@@ -1049,6 +1050,55 @@
     if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
   }
 
+  // Actualizare rapidă după un scan — nu rebuild total, doar ce s-a schimbat
+  function renderAfterScan(row){
+    // 1. Contorul din header (picklist count) — recalcul rapid, fără rebuild DOM
+    const unpacked = Object.values(rows).filter(isPickable);
+    const cnt = unpacked.length;
+    document.getElementById('picklistCount').textContent = cnt + (cnt === 1 ? ' comandă' : ' comenzi');
+    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
+    // 2. Bara stock-missing (ușoară)
+    renderStockMissingBar();
+    // 3. Modals deschise (ușoare)
+    if (needsModal.classList.contains('open')) renderNeeds();
+    if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+    // 4. Registru — update chirurgical pe un singur <tr>
+    upsertRegistryRow(row);
+  }
+
+  function rowToRegistryHtml(row){
+    return `
+      <td class="awb-cell">${escapeHtml(row.awb)}</td>
+      <td>${escapeHtml(row.order_name)}</td>
+      <td>${fmtTime(row.first_scan_at)}</td>
+      <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
+      <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+      <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+    `;
+  }
+
+  function upsertRegistryRow(row){
+    if (!row.first_scan_at) return; // nu e în registru
+    const existing = registryBody.querySelector(`tr[data-awb="${CSS.escape(row.awb)}"]`);
+    // Verifică dacă rândul e vizibil în filtrul curent
+    const visible = (registryFilter === 'packed') ? row.packed
+                  : (registryFilter === 'pending') ? !row.packed
+                  : true;
+    if (!visible){
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing){
+      existing.innerHTML = rowToRegistryHtml(row);
+    } else {
+      // Inserează la începutul tbody (cele mai recente primele)
+      const tr = document.createElement('tr');
+      tr.dataset.awb = row.awb;
+      tr.innerHTML = rowToRegistryHtml(row);
+      registryBody.insertAdjacentElement('afterbegin', tr);
+    }
+  }
+
   // Every ~30s Sameday poll cycle broadcasts one awb:update message PER AWB
   // (190+ of them, arriving almost simultaneously) — calling renderAll()
   // straight from each message rebuilds the entire picking list + registry
@@ -1291,7 +1341,7 @@
       const data = await res.json();
       rows[data.row.awb] = data.row;
       lastScannedAwb = data.row.awb;
-      renderAll();
+      renderAfterScan(data.row);
       const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
       if (data.kind === 'first'){
         renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
