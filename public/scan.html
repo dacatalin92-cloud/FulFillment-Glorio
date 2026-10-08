@@ -416,6 +416,7 @@
   <div class="needs-panel">
     <div class="needs-header">
       <h3>🚫 Produse lipsă — <span id="stockMissingNeedsSubcount">0</span> comenzi blocate</h3>
+      <button type="button" class="needs-btn" id="resetNecesarBtn" style="margin-right:0.4rem;border-color:var(--red);background:var(--red-soft);color:var(--red);" title="Resetează necesarul de produse">🗑️ Reset necesar</button>
       <button type="button" class="needs-close" id="stockMissingNeedsCloseBtn" aria-label="Închide">✕</button>
     </div>
     <div class="needs-list" id="stockMissingNeedsList"></div>
@@ -916,6 +917,15 @@
   });
   stockMissingNeedsModal.addEventListener('click', e => { if (e.target === stockMissingNeedsModal) stockMissingNeedsModal.classList.remove('open'); });
 
+  document.getElementById('resetNecesarBtn').addEventListener('click', async () => {
+    if (!confirm('Resetezi necesarul de produse? Toate bifele și cantitățile vor fi șterse.')) return;
+    try {
+      await fetch('/api/stock-purchases/reset', { method: 'POST' });
+      stockPurchases = {};
+      renderStockMissingNeeds();
+    } catch (err) { alert('Eroare la resetare: ' + err.message); }
+  });
+
   // ---- Registry --------------------------------------------------------
   // Only useful while the warehouse is actually staffed — outside 08:00-18:00
   // (Bucharest time) we hide it and let the picking list use the full column,
@@ -1372,6 +1382,9 @@
         renderUnknownReturnsBar();
       } else if (msg.type === 'stock-purchase:update'){
         if (msg.row) stockPurchases[msg.row.agg_key] = msg.row;
+        if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+      } else if (msg.type === 'stock-purchases:reset'){
+        stockPurchases = {};
         if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
       } else if (msg.type === 'refresh'){
         loadUnpacked();
