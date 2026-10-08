@@ -1194,6 +1194,18 @@ app.post('/api/stock-purchases', (req, res) => {
   broadcast({ type: 'stock-purchase:update', row });
   res.json({ row });
 });
+app.post('/api/stock-purchases/reset', (req, res) => {
+  // Șterge toate înregistrările din tabelul stock_purchases (resetare necesar)
+  try {
+    db.db.prepare('DELETE FROM stock_purchases').run();
+  } catch (e) {
+    // Fallback: dacă db.db nu e expus, încearcă prin metoda publică dacă există
+    if (typeof db.clearAllStockPurchases === 'function') db.clearAllStockPurchases();
+    else return res.status(500).json({ error: 'Nu pot reseta — db.db inaccesibil' });
+  }
+  broadcast({ type: 'stock-purchases:reset' });
+  res.json({ ok: true });
+});
 
 // --- Sameday polling (courier status for open AWBs) ----------------------
 // Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
