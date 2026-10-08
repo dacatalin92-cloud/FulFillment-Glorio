@@ -25,9 +25,11 @@ const shopify = require('./shopify');
 // simplu nu se declanșează pentru ele, comportamentul rămâne neschimbat.
 function extractDpdAwbFromScan(code) {
   const c = String(code || '').trim();
-  if (/^1000\d{24}$/.test(c)) {
-    return c.slice(4, 15);
-  }
+  // Format confirmat: "1000" (4 cifre fixe) + AWB real (10-14 cifre) + sufix variabil
+  // Totalul e 28 de cifre pentru AWB-urile de 11 cifre confirmate, dar acceptăm
+  // și variații unde AWB-ul are 10-14 cifre (total cod 24-32 cifre).
+  const m = c.match(/^1000(\d{10,14})\d+$/);
+  if (m) return m[1];
   return null;
 }
 
