@@ -1008,69 +1008,59 @@ app.get('/api/lookup/:code', (req, res) => {
   res.json({ found: true, row });
 });
 
-app.post('/api/scan', async (req, res) => {
+app.post('/api/scan', (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: 'missing code' });
   const row = findByCodeFlexible(code);
   if (!row) return res.status(404).json({ found: false });
-  let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
-  // First scan at the station → note+tag on the Shopify order. We AWAIT the
-  // Shopify round-trip here (rather than fire-and-forget) so we can capture
-  // the ORIGINAL note (the client's own instructions, if any — shown under
-  // the SKU on the packing screen, separate from our own confirmation line)
-  // and the full merged text actually saved to Shopify. If the Shopify call
-  // fails for any reason, we fall back to saving just our own line so the
-  // scan itself never breaks.
+  const result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
+
+  // Răspundem IMEDIAT — scanerul nu mai așteaptă Shopify.
+  // Nota + tag-ul se scriu în fundal și se broadcast-ează când sunt gata.
+  if (result.kind && result.kind !== 'already' && result.kind !== 'blocked') {
+    broadcast({ type: 'awb:update', awb: result.row });
+  }
+  res.json({ found: true, kind: result.kind, row: result.row });
+
+  // --- Shopify note + client_note (fire-and-forget, în fundal) --------------
   if (result.kind === 'first' && result.row.order_id) {
     const stamp = new Date().toLocaleString('ro-RO', {
       timeZone: 'Europe/Bucharest',
       day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
     });
     const line = `Scanat la depozit: ${stamp}`;
-    try {
-      const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
-      result.row = db.setScanNote(result.row.awb, fullNote);
-      if (originalNote) result.row = db.setClientNoteIfEmpty(result.row.awb, originalNote);
-    } catch (err) {
-      // Can fail for reasons that have nothing to do with the note content —
-      // e.g. an order placed through a marketplace/POS-quick-sale channel
-      // needs a write scope (write_marketplace_orders / write_quick_sale)
-      // this app's token doesn't have, so the WRITE (our confirmation line +
-      // tag) is rejected even though nothing is actually wrong. When that
-      // happens we still don't want to lose the client's own note, so fall
-      // back to a plain READ (which doesn't need that extra scope) to at
-      // least capture it for display, even though our own line can't be
-      // written to Shopify for this order.
-      console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
-      result.row = db.setScanNote(result.row.awb, line);
+    (async () => {
+      try {
+        const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
+        let updated = db.setScanNote(result.row.awb, fullNote);
+        if (originalNote) updated = db.setClientNoteIfEmpty(result.row.awb, originalNote);
+        broadcast({ type: 'awb:update', awb: updated });
+      } catch (err) {
+        console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
+        let updated = db.setScanNote(result.row.awb, line);
+        try {
+          const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+          if (note) updated = db.setClientNoteIfEmpty(result.row.awb, note);
+        } catch (readErr) {
+          console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
+        }
+        broadcast({ type: 'awb:update', awb: updated });
+      }
+    })();
+  } else if (result.row.order_id && !result.row.client_note) {
+    // Scane ulterioare: citim nota clientului dacă n-o avem încă (read-only, fundal)
+    (async () => {
       try {
         const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
-        if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
-      } catch (readErr) {
-        console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
+        if (note) {
+          const updated = db.setClientNoteIfEmpty(result.row.awb, note);
+          broadcast({ type: 'awb:update', awb: updated });
+        }
+      } catch (err) {
+        console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
       }
-    }
-  } else if (result.row.order_id && !result.row.client_note) {
-    // Not the first scan (or already had order_id-less row) — the client
-    // note can still be missing simply because it was typed into Shopify
-    // a few seconds AFTER the very first scan (appendOrderScanNote only
-    // ever reads once). Re-check on every subsequent scan, as long as we
-    // still don't have one saved, so timing no longer matters. Read-only,
-    // best-effort — never breaks the scan if it fails.
-    try {
-      const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
-      if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
-    } catch (err) {
-      console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
-    }
+    })();
   }
-  // 'already' and 'blocked' both mean nothing about the row actually
-  // changed on this scan — no need to broadcast a state nobody's state
-  // just changed to.
-  if (result.kind && result.kind !== 'already' && result.kind !== 'blocked') {
-    broadcast({ type: 'awb:update', awb: result.row });
-  }
-  res.json({ found: true, kind: result.kind, row: result.row });
 });
 
 app.post('/api/note', (req, res) => {
