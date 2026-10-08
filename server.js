@@ -1,558 +1,1364 @@
-<!doctype html>
-<html lang="ro">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Monitor Depozit — Glorio</title>
-<style>
-  :root {
-    --bg: #0f1117;
-    --card: #1a1d27;
-    --border: #2a2d3a;
-    --text: #e8eaf0;
-    --muted: #7a7f96;
-    --green: #22c55e;
-    --blue: #3b82f6;
-    --orange: #f59e0b;
-    --red: #ef4444;
-    --purple: #a855f7;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    padding: 24px;
-    gap: 20px;
-  }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-  header h1 {
-    font-size: 1.3rem;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-  #clock {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--text);
-    font-variant-numeric: tabular-nums;
-  }
-  #date-label {
-    font-size: 0.9rem;
-    color: var(--muted);
-    text-align: right;
-  }
-  .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px;
-  }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 24px 28px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .card .label {
-    font-size: 0.78rem;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: var(--muted);
-    font-weight: 600;
-  }
-  .card .count {
-    font-size: 4rem;
-    font-weight: 800;
-    line-height: 1;
-    font-variant-numeric: tabular-nums;
-  }
-  .card .value {
-    font-size: 1.35rem;
-    font-weight: 700;
-    color: var(--text);
-    margin-top: 6px;
-    font-variant-numeric: tabular-nums;
-  }
-  .card.total .count { color: var(--green); }
-  .card.bok    .count { color: var(--blue); }
-  .card.dpd    .count { color: var(--orange); }
-  .card.sameday .count { color: var(--purple); }
-  .card.unscan .count { color: var(--red); }
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const fetch = require('node-fetch');
+const { WebSocketServer } = require('ws');
 
-  .section-title {
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    font-weight: 600;
-    margin-bottom: -4px;
-  }
+const db = require('./db');
+const sameday = require('./sameday');
+const shopify = require('./shopify');
 
-  .feed {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    overflow: hidden;
-    flex: 1;
-  }
-  .feed-header {
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.78rem;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: var(--muted);
-    font-weight: 600;
-  }
-  .feed-list {
-    list-style: none;
-    max-height: 320px;
-    overflow-y: auto;
-  }
-  .feed-list li {
-    display: grid;
-    grid-template-columns: 60px 110px 1fr auto auto;
-    gap: 12px;
-    align-items: center;
-    padding: 11px 20px;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.88rem;
-    transition: background 0.3s;
-  }
-  .feed-list li.new {
-    background: rgba(34, 197, 94, 0.08);
-  }
-  .feed-list li .nr { color: var(--muted); font-size: 0.78rem; }
-  .feed-list li .time { color: var(--muted); font-variant-numeric: tabular-nums; }
-  .feed-list li .order { font-weight: 700; }
-  .feed-list li .awb {
-    font-family: 'Courier New', monospace;
-    font-size: 0.8rem;
-    color: var(--muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .badge {
-    font-size: 0.7rem;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 20px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    white-space: nowrap;
-  }
-  .badge-bok     { background: rgba(59,130,246,0.18); color: #60a5fa; }
-  .badge-dpd     { background: rgba(245,158,11,0.18); color: #fbbf24; }
-  .badge-sameday { background: rgba(168,85,247,0.18); color: #c084fc; }
-  .badge-other   { background: rgba(122,127,150,0.18); color: #a0a5b8; }
+// 2026-10-07: scanerul citește de pe eticheta DPD un cod de bare de 28 de
+// cifre care NU e AWB-ul real — e un cod compus: "1000" (prefix fix) +
+// AWB-ul real, de 11 cifre (acelasi număr ținut de xConnector/Shopify ca
+// tracking number) + încă 13 cifre (verificare/date suplimentare de pe
+// etichetă). Confirmat pe două comenzi reale via /admin/debug-awb:
+//   "1000" + "81382257056" + "9260003870813"  (28 cifre)
+//   "1000" + "81382265004" + "9370000610818"  (28 cifre)
+// Prima variantă a acestui fix (doar "scoate zerourile din față") era
+// greșită — codul scanat efectiv începe cu "1", nu cu "0", deci acel fix nu
+// se activa niciodată pentru scanări reale. Acum extragem exact cifrele
+// 5-15 (poziția AWB-ului real) când codul se potrivește cu formatul de mai
+// sus. Sigur pentru celelalte AWB-uri (Sameday, Bookurier) — niciunul nu are
+// 28 de cifre numerice cu "1000" la început, deci a doua încercare pur și
+// simplu nu se declanșează pentru ele, comportamentul rămâne neschimbat.
+function extractDpdAwbFromScan(code) {
+  const c = String(code || '').trim();
+  // Format confirmat: "1000" (4 cifre fixe) + AWB real (10-14 cifre) + sufix variabil
+  // Totalul e 28 de cifre pentru AWB-urile de 11 cifre confirmate, dar acceptăm
+  // și variații unde AWB-ul are 10-14 cifre (total cod 24-32 cifre).
+  const m = c.match(/^1000(\d{10,14})\d+$/);
+  if (m) return m[1];
+  return null;
+}
 
-  #status {
-    font-size: 0.75rem;
-    color: var(--muted);
-    text-align: center;
+function findByCodeFlexible(code) {
+  const row = db.findByCode(code);
+  if (row) return row;
+  const dpdAwb = extractDpdAwbFromScan(code);
+  if (dpdAwb) {
+    const dpdRow = db.findByCode(dpdAwb);
+    if (dpdRow) return dpdRow;
   }
-  #status.ok { color: var(--green); }
-  #status.err { color: var(--red); }
+  const trimmed = String(code || '').replace(/^0+(?=\d)/, '');
+  if (trimmed && trimmed !== code) return db.findByCode(trimmed);
+  return null;
+}
 
-  /* ── Products view ───────────────────────────────────────────────────── */
-  .prod-row {
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--border);
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 8px 16px;
-    align-items: start;
-  }
-  .prod-row .prod-title {
-    font-weight: 700;
-    font-size: 0.92rem;
-    grid-column: 1;
-  }
-  .prod-row .prod-badge {
-    grid-column: 2;
-    grid-row: 1 / span 2;
-    align-self: center;
-    font-size: 1.6rem;
-    font-weight: 800;
-    color: var(--green);
-    font-variant-numeric: tabular-nums;
-    text-align: right;
-    white-space: nowrap;
-  }
-  .prod-row .prod-orders {
-    grid-column: 1;
-    font-size: 0.78rem;
-    color: var(--muted);
-    line-height: 1.6;
-  }
-  .prod-row .prod-orders .ord-chip {
-    display: inline-block;
-    background: rgba(59,130,246,0.12);
-    color: #60a5fa;
-    border-radius: 6px;
-    padding: 1px 7px;
-    margin: 2px 3px 2px 0;
-    font-size: 0.75rem;
-    font-weight: 600;
-  }
-  .prod-row.dup .prod-title { color: var(--orange); }
+const PORT = process.env.PORT || 3000;
+// 2026-08-26: era 30000 (30 secunde) — prea scurt pentru fluxul real de
+// împachetare (scanezi AWB-ul, pui efectiv produsul în cutie, lipești
+// eticheta, scanezi din nou). Cu 30s, a doua scanare venea aproape mereu
+// prea târziu și era tratată ca RESET (o nouă "primă scanare"), nu ca
+// CONFIRMARE — comanda rămânea blocată la "Scanat 1×" deși fusese scanată
+// de 2 ori. 10 minute lasă timp de împachetare real, păstrând totuși
+// protecția inițială (nu confirmă un scan izolat, la întâmplare, ore mai
+// târziu).
+const PACK_WINDOW_MS = 10 * 60 * 1000;
+// 5 seconds caused the server to crash-loop in production (a native SQLite
+// assertion, from creating/destroying prepared statements at very high
+// frequency — fixed separately in db.js by caching statements, but running
+// the poll near-continuously is still much heavier load than needed). 30
+// seconds is a safe middle ground: still 4x faster than the original 2
+// minutes, without hammering Sameday's API or the DB nonstop.
+const SAMEDAY_POLL_MS = 30 * 1000;
+const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
+// Payload of the fixed "stoc lipsă" QR code, printed once and taped to the
+// packing table (see scan.html) — not a real AWB, just a marker staff scan
+// right after an AWB whose product isn't in stock, to flag it. Checked
+// client-side in scan.html; the server side only needs to know the AWB.
 
-  @media (max-width: 600px) {
-    body { padding: 12px; gap: 12px; }
-    .card .count { font-size: 3rem; }
-    .feed-list li { grid-template-columns: 50px 1fr auto; }
-    .feed-list li .awb, .feed-list li .time { display: none; }
-  }
-</style>
-</head>
-<body>
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
 
-<header>
-  <h1>📦 Monitor Depozit</h1>
-  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end">
-    <div style="display:flex;align-items:center;gap:6px">
-      <button id="btn-prev" onclick="changeDay(-1)" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;font-size:1.1rem;cursor:pointer;">‹</button>
-      <input type="date" id="day-picker" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;font-size:0.9rem;cursor:pointer;" onchange="loadDay(this.value)">
-      <button id="btn-next" onclick="changeDay(1)" style="background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;font-size:1.1rem;cursor:pointer;">›</button>
-      <button onclick="goToday()" id="btn-today" style="background:var(--green);border:none;color:#000;border-radius:8px;padding:6px 12px;font-size:0.8rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">AZI</button>
-    </div>
-    <div style="text-align:right">
-      <div id="clock">--:--:--</div>
-      <div id="date-label">--</div>
-    </div>
-  </div>
-</header>
+function broadcast(msg) {
+  const payload = JSON.stringify(msg);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) client.send(payload);
+  });
+}
 
-<div class="cards">
-  <div class="card total">
-    <div class="label">✅ Total confirmate azi</div>
-    <div class="count" id="cnt-total">—</div>
-    <div class="value" id="val-total"></div>
-  </div>
-  <div class="card bok">
-    <div class="label">🔵 Bookurier</div>
-    <div class="count" id="cnt-bok">—</div>
-    <div class="value" id="val-bok"></div>
-  </div>
-  <div class="card dpd">
-    <div class="label">🟡 DPD</div>
-    <div class="count" id="cnt-dpd">—</div>
-    <div class="value" id="val-dpd"></div>
-  </div>
-  <div class="card sameday">
-    <div class="label">🟣 Sameday</div>
-    <div class="count" id="cnt-smd">—</div>
-    <div class="value" id="val-smd"></div>
-  </div>
-</div>
+// Curieri ale căror AWB-uri sunt urmărite de acest sistem. Orice
+// fulfillment Shopify al cărui nume de curier NU conține una din aceste
+// bucăți de text e ignorat complet (nu ajunge în baza de date) — exact
+// mecanismul care ținea sistemul strict pe Sameday până acum. Adăugat
+// "bookurier" 2026-09-30, apoi "dpd" 2026-10-07, la cererea clientului,
+// care a început să livreze și prin aceste curiere — dar DOAR pentru
+// recunoașterea/scanarea AWB-urilor lor; NU se cere și status live de la
+// Bookurier/DPD (asta ar necesita propriul client API per curier, ca
+// sameday.js), deci coloana sameday_status rămâne goală pentru AWB-urile
+// lor — inofensiv, codul care citește acel câmp (isPickable,
+// samedayIndicatesPickedUp etc.) tratează un status gol ca "nimic
+// special", nu ca eroare.
+const SUPPORTED_COURIERS = ['sameday', 'bookurier', 'dpd'];
+function isSupportedCourierName(company) {
+  const c = (company || '').toLowerCase();
+  return SUPPORTED_COURIERS.some((name) => c.includes(name));
+}
 
-<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
-  <div class="section-title" id="section-label">Ultimele scanări confirmate</div>
-  <div style="display:flex;gap:8px">
-    <button id="btn-view-feed" onclick="setView('feed')" style="background:var(--blue);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:0.78rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">📋 Scanări</button>
-    <button id="btn-view-prod" onclick="setView('products')" style="background:var(--card);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:6px 14px;font-size:0.78rem;font-weight:700;cursor:pointer;letter-spacing:0.04em;">📦 Produse</button>
-  </div>
-</div>
+// "packed" is primarily a warehouse-floor fact confirmed by a scan at the
+// station — but not every order goes through this app's station. Some are
+// fulfilled through the older/other process, and for those Sameday's own
+// tracking is the only signal that they ever left the warehouse ("cele care
+// au ajuns sa aibe scan de la ei, au fost sigur impachetate"). So Sameday
+// status DOES get to mark something packed — just never instantly. Only two
+// real "still sitting with us" statuses exist; anything past that means a
+// courier scan happened.
+const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
+function samedayIndicatesPickedUp(status) {
+  const t = (status || '').toLowerCase();
+  if (!t) return false;
+  if (t.includes('anulat')) return false;
+  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
+}
 
-<div class="feed" id="panel-feed">
-  <div class="feed-header">Flux live — scanări confirmate (împachetate)</div>
-  <ul class="feed-list" id="feed"></ul>
-</div>
+// The original incident: this same "picked up" check ran INSTANTLY, right
+// when the AWB was printed, and Sameday's status text for a brand-new label
+// didn't match the two known "still pending" phrases — so it read as
+// "already picked up" within seconds of printing. A courier physically
+// cannot pick something up seconds after the label exists, so nothing gets
+// auto-packed from Sameday status until it's had time to become real. This
+// is also what makes the live poller (every 30s, see startPoller below) a
+// standing reconciliation pass — old-process orders self-heal to packed as
+// soon as they age past this window and Sameday shows real movement.
+const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
 
-<div class="feed" id="panel-products" style="display:none">
-  <div class="feed-header">Produse împachetate azi — grupate după titlu</div>
-  <div id="prod-list" style="overflow-y:auto;max-height:420px"></div>
-</div>
+// 2026-08-26: dezactivat auto-pack-ul din reconciliere pe cerința expresă a
+// clientului — lista de "De pregătit pentru curier" trebuie să reflecte
+// STRICT scanările reale de la stație (db.recordScan), niciodată textul de
+// status Sameday. Investigația "65 vs 53" a arătat că reconcilierea automată
+// bazată pe status (orice text în afara celor 2 fraze "încă e la noi" conta
+// ca "ridicat") e prea riscantă — un text de status neprevăzut poate scoate
+// din listă un colet încă fizic neîmpachetat. markPackedFromReconciliation
+// și reconcileWithSameday rămân disponibile ca unelte manuale de admin
+// (/admin/reconcile-sameday), pentru curățare punctuală de backlog vechi,
+// dar NU mai rulează automat din poller-ul de 30s.
+function applySamedayUpdate(awb, result) {
+  const row = db.updateSameday(awb, result);
+  broadcast({ type: 'awb:update', awb: row });
+  return row;
+}
 
-<div id="status">Se conectează…</div>
+// On-demand version of the same reconciliation the live poller does
+// gradually — sweeps every currently-unpacked AWB against its last-known
+// Sameday status right now, for catching up a backlog immediately (e.g.
+// right after the false-packed cleanup) instead of waiting on the 30s
+// poller to cycle through all of them. Uses the cached sameday_status
+// already in the DB rather than hitting Sameday's API again — that column
+// is kept fresh by the poller regardless.
+function reconcileWithSameday(minAgeMinutes) {
+  const minAgeMs = minAgeMinutes * 60 * 1000;
+  const now = Date.now();
+  return db.listUnpackedNotCancelled().filter((row) => {
+    if (!samedayIndicatesPickedUp(row.sameday_status)) return false;
+    return now - new Date(row.awb_created_at).getTime() >= minAgeMs;
+  });
+}
 
-<script>
-  // ── Helpers ──────────────────────────────────────────────────────────────
-  const tz = 'Europe/Bucharest';
-
-  function todayStr() {
-    return new Date().toLocaleDateString('en-CA', { timeZone: tz });
-  }
-
-  function fmtTime(iso) {
-    return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }
-
-  function courierOf(awb) {
-    if (/BOK|B0K/i.test(awb))    return 'bok';
-    if (/^1ONB/i.test(awb))      return 'sameday';
-    if (/^\d{10,14}$/.test(awb)) return 'dpd';
-    return 'other';
-  }
-
-  function badgeHtml(courier) {
-    const map = { bok: 'Bookurier', dpd: 'DPD', sameday: 'Sameday', other: '?' };
-    return `<span class="badge badge-${courier}">${map[courier] || courier}</span>`;
-  }
-
-  // ── Clock ─────────────────────────────────────────────────────────────────
-  function tickClock() {
-    const now = new Date();
-    document.getElementById('clock').textContent =
-      now.toLocaleTimeString('ro-RO', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    document.getElementById('date-label').textContent =
-      now.toLocaleDateString('ro-RO', { timeZone: tz, day: '2-digit', month: 'long', year: 'numeric' });
-  }
-  setInterval(tickClock, 1000);
-  tickClock();
-
-  // ── State ─────────────────────────────────────────────────────────────────
-  let allPacked = [];   // all confirmed rows for current viewed day
-  let viewedDay = todayStr();  // which day we're looking at
-
-  // ── Day navigation ────────────────────────────────────────────────────────
-  function initPicker() {
-    const picker = document.getElementById('day-picker');
-    picker.value = viewedDay;
-    picker.max = todayStr();
-    updateTodayBtn();
-  }
-
-  function updateTodayBtn() {
-    const isToday = viewedDay === todayStr();
-    const btn = document.getElementById('btn-today');
-    btn.style.opacity = isToday ? '0.4' : '1';
-    btn.style.cursor  = isToday ? 'default' : 'pointer';
-  }
-
-  async function loadDay(dateStr) {
-    viewedDay = dateStr;
-    document.getElementById('day-picker').value = dateStr;
-    document.getElementById('day-picker').max = todayStr();
-    updateTodayBtn();
-    // Clear while loading
-    document.getElementById('cnt-total').textContent = '…';
-    document.getElementById('feed').innerHTML = '';
+// --- Shopify webhook: fulfillments/create -----------------------------
+// Needs the raw body for HMAC verification, so this route uses its own
+// raw-body parser instead of the app-wide express.json().
+app.post(
+  '/webhooks/fulfillments-create',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
     try {
-      const res = await fetch(`/api/packed-day/${dateStr}`);
-      const data = await res.json();
-      allPacked = (data.rows || []).filter(r => r.packed && !r.cancelled);
-      updateCounters();
-      renderFeed();
-      if (currentView === 'products') renderProducts();
-    } catch (e) {
-      console.error('loadDay error', e);
+      const hmac = req.get('X-Shopify-Hmac-Sha256');
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
+      if (!ok) return res.status(401).send('invalid signature');
+      res.status(200).send('ok'); // ack immediately, Shopify retries on timeout/non-2xx
+
+      const payload = JSON.parse(req.body.toString('utf8'));
+      await handleFulfillmentPayload(payload);
+    } catch (err) {
+      console.error('[webhook] processing error', err);
+      if (!res.headersSent) res.status(500).send('error');
     }
   }
+);
 
-  function changeDay(delta) {
-    const d = new Date(viewedDay + 'T12:00:00');
-    d.setDate(d.getDate() + delta);
-    const next = d.toLocaleDateString('en-CA', { timeZone: tz });
-    if (next > todayStr()) return;   // can't go into the future
-    loadDay(next);
-  }
+async function handleFulfillmentPayload(payload) {
+  if ((payload.status || '').toLowerCase() !== 'success') return;
+  if (!isSupportedCourierName(payload.tracking_company)) return;
+  const isSameday = (payload.tracking_company || '').toLowerCase().includes('sameday');
+  const awb = payload.tracking_number;
+  if (!awb) return;
 
-  function goToday() {
-    if (viewedDay === todayStr()) return;
-    loadDay(todayStr());
-  }
+  const orderGid = `gid://shopify/Order/${payload.order_id}`;
+  const order = await shopify.fetchOrderDetails(orderGid);
+  if (!order) return;
 
-  function updateCounters() {
-    const rows = allPacked;
-    const bok = rows.filter(r => courierOf(r.awb) === 'bok');
-    const dpd = rows.filter(r => courierOf(r.awb) === 'dpd');
-    const smd = rows.filter(r => courierOf(r.awb) === 'sameday');
+  const row = db.upsertAwb({
+    awb,
+    order_name: order.name,
+    order_created_at: order.createdAt,
+    phone: order.phone,
+    awb_created_at: payload.created_at,
+    total: order.total,
+    currency: order.currency,
+    items: order.items,
+    order_id: payload.order_id,
+    client_note: order.note,
+  });
+  broadcast({ type: 'awb:new', awb: row });
+  console.log(`[webhook] new AWB ${awb} for ${order.name}`);
 
-    const sum = arr => arr.reduce((s, r) => s + (r.cod ?? r.total ?? 0), 0);
-
-    document.getElementById('cnt-total').textContent = rows.length;
-    document.getElementById('val-total').textContent = sum(rows).toFixed(2) + ' RON';
-    document.getElementById('cnt-bok').textContent = bok.length;
-    document.getElementById('val-bok').textContent = bok.length ? sum(bok).toFixed(2) + ' RON' : '';
-    document.getElementById('cnt-dpd').textContent = dpd.length;
-    document.getElementById('val-dpd').textContent = dpd.length ? sum(dpd).toFixed(2) + ' RON' : '';
-    document.getElementById('cnt-smd').textContent = smd.length;
-    document.getElementById('val-smd').textContent = smd.length ? sum(smd).toFixed(2) + ' RON' : '';
-  }
-
-  // ── View toggle ───────────────────────────────────────────────────────────
-  let currentView = 'feed';
-
-  function setView(v) {
-    currentView = v;
-    const isFeed = v === 'feed';
-    document.getElementById('panel-feed').style.display     = isFeed ? '' : 'none';
-    document.getElementById('panel-products').style.display = isFeed ? 'none' : '';
-    document.getElementById('btn-view-feed').style.background = isFeed ? 'var(--blue)' : 'var(--card)';
-    document.getElementById('btn-view-feed').style.color      = isFeed ? '#fff' : 'var(--muted)';
-    document.getElementById('btn-view-feed').style.border     = isFeed ? 'none' : '1px solid var(--border)';
-    document.getElementById('btn-view-prod').style.background = isFeed ? 'var(--card)' : 'var(--orange)';
-    document.getElementById('btn-view-prod').style.color      = isFeed ? 'var(--muted)' : '#000';
-    document.getElementById('btn-view-prod').style.border     = isFeed ? '1px solid var(--border)' : 'none';
-    document.getElementById('section-label').textContent = isFeed
-      ? 'Ultimele scanări confirmate'
-      : 'Produse împachetate — grupate după titlu';
-    if (v === 'products') renderProducts();
-  }
-
-  // ── Products view ─────────────────────────────────────────────────────────
-  function parseItems(row) {
+  // Get a first real status right away instead of waiting for the next poll tick
+  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), or this
+  // AWB isn't a Sameday one at all (Bookurier has no status-lookup client
+  // built yet — see isSupportedCourierName above), in which case skip this
+  // too rather than calling Sameday's API for an AWB that isn't theirs.
+  if (isSameday && process.env.SAMEDAY_POLL_ENABLED !== 'false') {
     try {
-      const raw = row.items;
-      if (!raw) return [];
-      if (Array.isArray(raw)) return raw;
-      return JSON.parse(raw);
-    } catch { return []; }
-  }
-
-  function renderProducts() {
-    // Build map: product key → { title, variant, orders: [{name, qty, awb}] }
-    const map = new Map();
-
-    for (const row of allPacked) {
-      const items = parseItems(row);
-      if (!items.length) {
-        // Fallback: no items stored — just show order name
-        const key = '(produs necunoscut)';
-        if (!map.has(key)) map.set(key, { title: key, variant: '', orders: [] });
-        map.get(key).orders.push({ name: row.order_name || row.awb, qty: 1, awb: row.awb });
-        continue;
-      }
-      for (const it of items) {
-        const title   = it.title || '?';
-        const variant = it.variant && it.variant !== 'Default Title' ? it.variant : '';
-        const key     = title + (variant ? ' · ' + variant : '');
-        if (!map.has(key)) map.set(key, { title, variant, orders: [] });
-        map.get(key).orders.push({
-          name: row.order_name || row.awb,
-          qty:  it.qty || 1,
-          awb:  row.awb
-        });
-      }
+      const status = await sameday.getStatus(awb);
+      applySamedayUpdate(awb, status);
+    } catch (err) {
+      console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
     }
+  }
+}
 
-    // Sort: most duplicated first, then alphabetical
-    const sorted = [...map.entries()].sort((a, b) => {
-      const diff = b[1].orders.length - a[1].orders.length;
-      return diff !== 0 ? diff : a[0].localeCompare(b[0], 'ro');
-    });
+// --- Shopify webhook: orders/cancelled -----------------------------------
+// Sameday does NOT auto-cancel the AWB when the Shopify order is cancelled,
+// so this is our own signal to pull a cancelled order out of the packing
+// flow. A cancelled order can (rarely) have more than one AWB — markOrderCancelled
+// handles all of them and we broadcast an update for each.
+app.post(
+  '/webhooks/orders-cancelled',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    try {
+      const hmac = req.get('X-Shopify-Hmac-Sha256');
+      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
+      if (!ok) return res.status(401).send('invalid signature');
+      res.status(200).send('ok');
 
-    const container = document.getElementById('prod-list');
-    if (!sorted.length) {
-      container.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">Nicio scanare</div>';
-      return;
+      const payload = JSON.parse(req.body.toString('utf8'));
+      const orderId = String(payload.id);
+      const updatedRows = db.markOrderCancelled(orderId);
+      updatedRows.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+      if (updatedRows.length) {
+        console.log(`[webhook] order ${orderId} cancelled — ${updatedRows.length} AWB(s) taken out of the packing flow`);
+      }
+    } catch (err) {
+      console.error('[webhook] orders-cancelled processing error', err);
+      if (!res.headersSent) res.status(500).send('error');
     }
-
-    container.innerHTML = sorted.map(([key, { title, variant, orders }]) => {
-      const totalQty = orders.reduce((s, o) => s + o.qty, 0);
-      const isDup    = orders.length > 1;
-      // Chips for each order (show order name + qty if qty>1)
-      const chips = orders.map(o =>
-        `<span class="ord-chip">${o.name}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
-      ).join('');
-      const variantLine = variant ? `<span style="color:var(--muted);font-size:0.78rem"> — ${variant}</span>` : '';
-      return `<div class="prod-row${isDup ? ' dup' : ''}">
-        <div class="prod-title">${title}${variantLine}</div>
-        <div class="prod-badge">${totalQty}</div>
-        <div class="prod-orders">${chips}</div>
-      </div>`;
-    }).join('');
   }
+);
 
-  function renderFeed() {
-    const sorted = [...allPacked].sort((a, b) =>
-      (b.packed_at || '').localeCompare(a.packed_at || ''));
-    const recent = sorted.slice(0, 30);
-    const feed = document.getElementById('feed');
-    feed.innerHTML = recent.map((r, i) => {
-      const c = courierOf(r.awb);
-      return `<li>
-        <span class="nr">${allPacked.length - i}</span>
-        <span class="time">${r.packed_at ? fmtTime(r.packed_at) : '—'}</span>
-        <span class="order">${r.order_name || ''}</span>
-        <span class="awb">${r.awb}</span>
-        ${badgeHtml(c)}
-      </li>`;
-    }).join('');
+// --- One-time setup: register Shopify webhooks ---------------------------
+// Registers this server's own webhook URLs with Shopify, authenticated as
+// THIS app (via the same client_credentials exchange used for the Admin
+// API), so webhooks end up signed with SHOPIFY_CLIENT_SECRET — the secret
+// this server actually verifies against. Guarded by that same secret as a
+// query param so it can be triggered once from a browser. Safe to call again
+// later (e.g. after adding a new webhook here) — Shopify just reports a
+// userError for any topic/URI combo that's already registered.
+const WEBHOOKS_TO_REGISTER = [
+  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/fulfillments-create' },
+  { topic: 'ORDERS_CANCELLED', path: '/webhooks/orders-cancelled' },
+];
+app.get('/admin/setup-webhook', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
   }
-
-  // ── Load data ─────────────────────────────────────────────────────────────
-  function loadToday() { loadDay(todayStr()); }
-
-  initPicker();
-  loadDay(viewedDay);
-  // Refresh every 2 minutes — only reloads data for the currently viewed day
-  setInterval(() => loadDay(viewedDay), 120_000);
-
-  // ── WebSocket — real-time updates ─────────────────────────────────────────
-  let ws, wsRetries = 0;
-
-  function connectWs() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-    ws.onopen = () => {
-      wsRetries = 0;
-      document.getElementById('status').textContent = '🟢 Live — actualizare în timp real';
-      document.getElementById('status').className = 'ok';
-    };
-
-    ws.onmessage = (evt) => {
-      // Live updates only matter when watching today
-      if (viewedDay !== todayStr()) return;
-      try {
-        const msg = JSON.parse(evt.data);
-        // A confirmed pack scan
-        if (msg.result && msg.result.kind === 'packed' && msg.result.row) {
-          const row = msg.result.row;
-          const packedDay = row.packed_at
-            ? new Date(row.packed_at).toLocaleDateString('en-CA', { timeZone: tz })
-            : null;
-          if (packedDay === todayStr()) {
-            // Add or update in allPacked
-            const idx = allPacked.findIndex(r => r.awb === row.awb);
-            if (idx >= 0) allPacked[idx] = row;
-            else allPacked.push(row);
-            updateCounters();
-            renderFeed();
-            if (currentView === 'products') renderProducts();
-            // Flash new row
-            const items = document.querySelectorAll('#feed li');
-            if (items[0]) {
-              items[0].classList.add('new');
-              setTimeout(() => items[0].classList.remove('new'), 3000);
-            }
+  try {
+    const results = [];
+    for (const w of WEBHOOKS_TO_REGISTER) {
+      const uri = `https://${req.get('host')}${w.path}`;
+      const data = await shopify.shopifyGraphql(
+        `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+            webhookSubscription { id topic uri }
+            userErrors { field message }
           }
-        }
-        // Reload on any scan to catch edge cases
-        if (msg.result && (msg.result.kind === 'packed' || msg.result.kind === 'already')) {
-          loadDay(todayStr());
-        }
-      } catch {}
-    };
-
-    ws.onclose = () => {
-      const delay = Math.min(1000 * 2 ** wsRetries++, 30000);
-      document.getElementById('status').textContent = `🔴 Deconectat — reconectare în ${Math.round(delay/1000)}s…`;
-      document.getElementById('status').className = 'err';
-      setTimeout(connectWs, delay);
-    };
-
-    ws.onerror = () => ws.close();
+        }`,
+        { topic: w.topic, sub: { uri, format: 'JSON' } }
+      );
+      results.push({ topic: w.topic, ...data.webhookSubscriptionCreate });
+    }
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
   }
+});
 
-  connectWs();
-</script>
-</body>
-</html>
+// Diagnostic: reports the public IP this server's outbound requests use —
+// useful to hand Sameday support an exact address to check/whitelist.
+app.get('/admin/whoami', async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const body = await r.json();
+    res.json({ outboundIp: body.ip });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// TEMPORARY diagnostic: shows a masked preview + length of the secret this
+// server actually has configured, so it can be visually compared against
+// what's pasted into a URL — without ever printing the full value. Remove
+// this route once the /admin/backfill-old 403 mismatch is resolved.
+function maskedPreview(s) {
+  return s.length > 8 ? `${s.slice(0, 4)}...${s.slice(-4)}` : '(too short to preview safely)';
+}
+
+app.get('/admin/secret-debug', (req, res) => {
+  const s = process.env.SHOPIFY_CLIENT_SECRET || '';
+  if (!s) return res.json({ configured: false });
+  const result = {
+    configured: true,
+    length: s.length,
+    preview: maskedPreview(s),
+  };
+  // Pass ?got=<value you're about to use in the URL> to compare it directly
+  // against the real configured secret, without ever showing either in full.
+  if (typeof req.query.got === 'string') {
+    const g = req.query.got;
+    result.got = { length: g.length, preview: maskedPreview(g), match: g === s };
+  }
+  res.json(result);
+});
+
+// TEMPORARY diagnostic: pinpoints exactly why a given code does/doesn't
+// match a row — used to debug /api/lookup returning found:false for AWBs
+// that /api/scan clearly does find. Shows the raw char codes of the queried
+// string (catches invisible whitespace / lookalike characters that a
+// screenshot can't show), the exact-match result, the same findByCode()
+// logic /api/scan and /api/lookup both use, and any row whose awb merely
+// CONTAINS the tail of the queried code (catches base-vs-suffix mismatches).
+app.get('/admin/debug-awb', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const code = String(req.query.code || '');
+  if (!code) return res.status(400).json({ error: 'missing code query param' });
+  const exactMatch = db.getAwb(code);
+  const findByCodeResult = db.findByCode(code);
+  const tail = code.slice(-8);
+  const similarRows = db.db
+    .prepare('SELECT awb, order_name, scan_note, order_id, packed, cancelled FROM awbs WHERE awb LIKE ?')
+    .all(`%${tail}%`);
+  res.json({
+    queried: code,
+    queriedLength: code.length,
+    queriedCharCodes: Array.from(code).map((c) => c.charCodeAt(0)),
+    exactMatch,
+    findByCodeResult,
+    similarRows,
+  });
+});
+
+// One-time (or occasional) manual pull of older AWBs — the automatic
+// backfillToday() only ever looks at today. This brings AWBs from the last
+// N days into the new system, e.g. so anything still unpacked from before
+// the webhook went live shows up here too. Guarded the same way as the
+// other /admin routes. Usage: /admin/backfill-old?secret=...&days=7
+app.get('/admin/backfill-old', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const days = Math.max(1, Math.min(60, parseInt(req.query.days, 10) || 7));
+  const debug = req.query.debug === '1';
+  try {
+    const result = await backfillRange(days, debug);
+    const added = debug ? result.added : result;
+    if (added) broadcast({ type: 'refresh' });
+    res.json(debug ? { ...result, days } : { added, days });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// One-off cleanup for the now-removed auto-pack-from-courier bug: some AWBs
+// got marked packed within moments of their label being printed, without
+// anyone actually scanning them (see db.js findFalsePackedCandidates for the
+// exact detection rule). Dry-run by default — lists what would be reset;
+// pass &apply=1 to actually reset them back to unpacked so they return to
+// the normal picking list. Usage: /admin/fix-false-packed?secret=...
+// (add &apply=1 once the dry-run list looks right; &maxAgeMin=N to widen/
+// narrow the "packed within N minutes of creation" window, default 15).
+app.get('/admin/fix-false-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const maxAgeMin = Math.max(1, Math.min(180, parseInt(req.query.maxAgeMin, 10) || 15));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = db.findFalsePackedCandidates(maxAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        maxAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to reset these to unpacked.',
+      });
+    }
+    const updated = db.resetFalsePacked(candidates.map((r) => r.awb));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, maxAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Reset în masă al flagului "stoc lipsă" — șterge marcajul de pe TOATE
+// AWB-urile curent flagate (nu le împachetează, doar le scoate din
+// panoul "🚫 Produse lipsă" / bara galbenă din scan.html). Dry-run by
+// default — arată ce ar șterge; adaugă &apply=1 ca să chiar aplice.
+// Usage: /admin/clear-stock-missing?secret=...  (apoi &apply=1)
+app.get('/admin/clear-stock-missing', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = db.listStockMissing();
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, stock_missing_at: r.stock_missing_at })),
+        hint: 'Arată bine? Rulează același link cu &apply=1 ca să chiar șteargă flagurile.',
+      });
+    }
+    const updated = candidates.map((r) => db.clearStockMissing(r.awb));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Diagnostic ONE-OFF (nu modifică nimic): primește lista reală de AWB-uri
+// "în așteptare de ridicare" direct din exportul Sameday (69 AWB / 67
+// comenzi, dat de utilizator pe 26.08.2026) și verifică, unul câte unul, ce
+// știe baza noastră de date despre fiecare — găsit/negăsit, împachetat sau
+// nu, anulat sau nu, ar apărea sau nu în tabelul din scan.html. Așa vedem
+// exact unde diverge realitatea fizică (exportul Sameday) de ce arată
+// aplicația. Usage: /admin/check-sameday-export?secret=...
+const SAMEDAY_EXPORT_AWBS_260826 = ['1ONB24528264540', '1ONBCS528264074', '1ONB24528264073', '1ONBCS528263826', '1ONB24528257796', '1ONB24528252751', '1ONB24528246046', '1ONB24528246023', '1ONB24528225110', '1ONB24528223355', '1ONB24528223243', '1ONB24528223201', '1ONB24528223152', '1ONB24528181253', '1ONB24528181237', '1ONB24528181215', '1ONB24528181076', '1ONB24528114507', '1ONB24528111569', '1ONB24528111455', '1ONB24528092675', '1ONB24528092662', '1ONB24528087234', '1ONB24528083761', '1ONB24528083687', '1ONB24528083634', '1ONB24528083607', '1ONB24527906874', '1ONB24527890249', '1ONB24527883152', '1ONB24527875435', '1ONB24527874098', '1ONB24527866812', '1ONB24527861220', '1ONB24527860447', '1ONB24527860201', '1ONB24527840087', '1ONBLN527838962', '1ONBRS527837980', '1ONB24527799935', '1ONB24527799861', '1ONB24527699680', '1ONB24527556205', '1ONB24527556147', '1ONB24527554182', '1ONB24527554092', '1ONB24527553473', '1ONB24527553455', '1ONB24527553443', '1ONB24527553436', '1ONB24527553360', '1ONB24527200573', '1ONB24527195552', '1ONB24527189831', '1ONB24527181127', '1ONB24527179315', '1ONB24527148331', '1ONB24527036861', '1ONB24526881809', '1ONB24526879573', '1ONB24526878187', '1ONB24526840036', '1ONB24526829642', '1ONB24526829529', '1ONB24526776835', '1ONB24526776816', '1ONB24526145919', '1ONB24525798837', '1ONB24517558158'];
+app.get('/admin/check-sameday-export', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    function samedayToneCrit(status) {
+      const t = (status || '').toLowerCase();
+      return t.includes('anulat');
+    }
+    const results = SAMEDAY_EXPORT_AWBS_260826.map((awb) => {
+      const row = db.getAwb(awb);
+      if (!row) return { awb, found: false };
+      const wouldShowInPicklist = !row.cancelled && !row.packed && !samedayToneCrit(row.sameday_status);
+      return {
+        awb,
+        found: true,
+        order_name: row.order_name,
+        packed: !!row.packed,
+        cancelled: !!row.cancelled,
+        sameday_status: row.sameday_status,
+        first_scan_at: row.first_scan_at,
+        wouldShowInPicklist,
+      };
+    });
+    const notFound = results.filter((r) => !r.found);
+    const packedNotScanned = results.filter((r) => r.found && r.packed && !r.first_scan_at);
+    const hiddenAsAnulat = results.filter((r) => r.found && !r.packed && !r.cancelled && samedayToneCrit(r.sameday_status));
+    const shouldShowButMissing = results.filter((r) => r.found && !r.wouldShowInPicklist && !r.packed);
+    res.json({
+      totalChecked: results.length,
+      notFoundCount: notFound.length,
+      notFound,
+      packedNotScannedCount: packedNotScanned.length,
+      packedNotScanned,
+      hiddenAsAnulatCount: hiddenAsAnulat.length,
+      hiddenAsAnulat,
+      all: results,
+      hint: 'notFound = AWB-uri din exportul Sameday care lipsesc complet din baza noastră (niciodată sincronizate din Shopify). packedNotScanned = marcate greșit "împachetat" fără scanare reală, deși Sameday încă le arată ca așteptând ridicare.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Diagnostic (nu modifică nimic): AWB-uri încă NEÎMPACHETATE (packed=0,
+// cancelled=0 în baza de date — deci FAC parte din /api/unpacked) al căror
+// text de status Sameday conține "anulat". scan.html le ascunde din tabelul
+// "De pregătit pentru curier" (vezi isPickable()) considerându-le "cursă
+// anulată de curier", DAR asta e diferit de order.cancelled (care vine doar
+// din webhook-ul orders/cancelled din Shopify) — dacă Sameday zice "anulat"
+// dintr-un motiv care nu înseamnă că marfa nu mai trebuie ambalată (ex. un
+// AWB anulat și refăcut, sau un text ambiguu), comanda dispare vizual din
+// listă deși contează încă drept "neîmpachetată" — exact tiparul "65 vs 53".
+// Usage: /admin/diagnose-hidden-unpacked?secret=...
+app.get('/admin/diagnose-hidden-unpacked', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const unpacked = db.listUnpackedNotCancelled();
+    const hidden = unpacked.filter((r) => (r.sameday_status || '').toLowerCase().includes('anulat'));
+    res.json({
+      totalUnpackedNotCancelled: unpacked.length,
+      hiddenByAnulatFilter: hidden.length,
+      hidden: hidden.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status, sameday_checked_at: r.sameday_checked_at })),
+      hint: 'Astea sunt "neîmpachetate" în baza de date, dar NU apar în tabelul de pe scan.html din cauza cuvântului "anulat" în statusul Sameday. Verifică manual dacă chiar sunt anulate.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Reconciliation: some orders are fulfilled through the older/other process
+// and never get a manual scan at this app's station — for those, Sameday's
+// own tracking is the only proof they actually shipped. The live poller
+// already does this gradually every 30s (see applySamedayUpdate above); this
+// sweeps everything currently unpacked right now, for an immediate catch-up
+// instead of waiting on the poll cycle. Same dry-run-first pattern as
+// /admin/fix-false-packed. Usage: /admin/reconcile-sameday?secret=...
+// (add &apply=1 once the list looks right; &minAgeMin=N to change the "must
+// be at least this old" safety window, default 30 — matches
+// MIN_AWB_AGE_FOR_AUTO_PACK_MS).
+app.get('/admin/reconcile-sameday', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const minAgeMin = Math.max(1, Math.min(1440, parseInt(req.query.minAgeMin, 10) || 30));
+  const apply = req.query.apply === '1';
+  try {
+    const candidates = reconcileWithSameday(minAgeMin);
+    if (!apply) {
+      return res.json({
+        dryRun: true,
+        minAgeMin,
+        count: candidates.length,
+        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status })),
+        hint: 'Looks right? Re-run the same URL with &apply=1 to mark these packed.',
+      });
+    }
+    const whenIso = new Date().toISOString();
+    const updated = candidates.map((r) => db.markPackedFromReconciliation(r.awb, r.sameday_checked_at || whenIso));
+    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+    res.json({ applied: true, minAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Diagnostic (nu modifică nimic): găsește AWB-urile marcate "împachetat" DAR
+// niciodată scanate fizic la stație (first_scan_at gol) — adică au fost
+// "împachetate" automat de reconcilierea cu Sameday (applySamedayUpdate ->
+// markPackedFromReconciliation), pe baza textului de status. Unele sunt
+// corecte (comenzi onorate prin celălalt proces, mai vechi). Altele pot fi
+// FALSE POZITIVE: coletul stă încă fizic neîmpachetat, dar Sameday are un
+// text de status care nu se potrivește cu PENDING_PICKUP_PHRASES, deci a
+// fost interpretat greșit ca "ridicat de curier". Grupat pe text de status
+// exact, ca să se vadă rapid ce formulare lipsește din listă.
+// Usage: /admin/diagnose-false-packed?secret=...
+app.get('/admin/diagnose-false-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const allPacked = db.listAllPacked ? db.listAllPacked() : db.db.prepare('SELECT * FROM awbs WHERE packed = 1 AND cancelled = 0').all();
+    const neverScanned = allPacked.filter((r) => r.packed && !r.cancelled && !r.first_scan_at);
+    const byStatus = new Map();
+    for (const r of neverScanned) {
+      const key = r.sameday_status || '(fără status)';
+      if (!byStatus.has(key)) byStatus.set(key, []);
+      byStatus.get(key).push({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at });
+    }
+    const groups = [...byStatus.entries()]
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([status, rows]) => ({ sameday_status: status, count: rows.length, sample: rows.slice(0, 15) }));
+    res.json({
+      totalPackedNotCancelled: allPacked.filter((r) => !r.cancelled).length,
+      neverScannedCount: neverScanned.length,
+      groups,
+      hint: 'Verifică manual dacă comenzile din grupurile de mai jos chiar au plecat. Dacă nu, adaugă formularea lor de status în PENDING_PICKUP_PHRASES din server.js.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// The live poller (see startPoller below) only checks Sameday status for
+// AWBs created today/yesterday — on purpose, so it doesn't hammer Sameday's
+// API with thousands of requests every 30s for orders that settled long ago.
+// The tradeoff: for AWBs older than that, sameday_status in the DB can be
+// stale or (for very old backlog) never fetched at all, so the cache-based
+// /admin/reconcile-sameday above has nothing to work with for them. This
+// does the same reconciliation but fetches a FRESH live status per AWB first
+// — same 200ms throttle as the poller — then feeds it through the same
+// applySamedayUpdate() used everywhere else, so the normal 30-min-age +
+// status rules still apply. Meant for the historical backlog, not routine
+// use. Runs in the background (the HTTP response returns immediately) since
+// a few thousand AWBs at ~200ms each can take several minutes — watch the
+// Deploy Logs for "[backfill-status]" progress lines. Usage:
+// /admin/backfill-sameday-status?secret=...&limit=3000
+let backfillStatusRunning = false;
+async function backfillSamedayStatusLive(rows) {
+  let ok = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      const status = await sameday.getStatus(row.awb);
+      applySamedayUpdate(row.awb, status);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.error(`[backfill-status] ${row.awb} failed`, err.message || err);
+    }
+    if ((ok + failed) % 100 === 0) {
+      console.log(`[backfill-status] progress ${ok + failed}/${rows.length} (${ok} ok, ${failed} failed)`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  console.log(`[backfill-status] done — ${ok} ok, ${failed} failed out of ${rows.length}`);
+}
+
+app.get('/admin/backfill-sameday-status', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillStatusRunning) {
+    return res.status(409).json({ error: 'a backfill is already running — check Deploy Logs for [backfill-status] progress' });
+  }
+  const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  backfillStatusRunning = true;
+  backfillSamedayStatusLive(rows).finally(() => {
+    backfillStatusRunning = false;
+  });
+  res.json({
+    started: true,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.2) / 60),
+    hint: 'Running in background — watch Deploy Logs for [backfill-status] lines, or just refresh the dashboard in a few minutes.',
+  });
+});
+
+// Backfill order_id on old AWB rows that predate order_id tracking. The
+// normal Shopify crawl (backfillToday/backfillRange) only sets order_id on
+// AWBs it's inserting for the FIRST time — it skips (`if (existing) continue`)
+// any AWB already present in the DB, so old rows stay with order_id = NULL
+// forever. That in turn makes /admin/reconcile-with-shopify skip them (no ID
+// to query Shopify with). This looks each one up by order_name instead
+// (which every row does have) and fills in order_id directly. Dry-run first,
+// same pattern as the other /admin/* routes. Usage:
+// /admin/backfill-order-ids?secret=...  (add &apply=1 once it looks right)
+async function backfillOrderIds(rows) {
+  const results = [];
+  for (const row of rows) {
+    try {
+      const orderId = await shopify.findOrderIdByName(row.order_name);
+      results.push({ awb: row.awb, order_name: row.order_name, orderId, action: orderId ? 'set' : 'not-found' });
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let backfillOrderIdsRunning = false;
+app.get('/admin/backfill-order-ids', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillOrderIdsRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-order-ids] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().filter((r) => !r.order_id).slice(0, limit);
+  backfillOrderIdsRunning = true;
+  (async () => {
+    try {
+      const results = await backfillOrderIds(rows);
+      const toSet = results.filter((r) => r.action === 'set');
+      const notFound = results.filter((r) => r.action === 'not-found');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[backfill-order-ids] scanned ${results.length} — ${toSet.length} found, ${notFound.length} not found, ${errors.length} errors`);
+      if (apply) {
+        toSet.forEach((r) => db.setOrderId(r.awb, r.orderId));
+        console.log(`[backfill-order-ids] applied — set order_id on ${toSet.length} AWB(s)`);
+      }
+      global.__lastBackfillOrderIdsResult = { apply, count: results.length, toSet, notFound, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[backfill-order-ids] failed', err);
+      global.__lastBackfillOrderIdsResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      backfillOrderIdsRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/backfill-order-ids-result?secret=... for the outcome, or watch Deploy Logs for [backfill-order-ids].',
+  });
+});
+
+app.get('/admin/backfill-order-ids-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
+});
+
+// /admin/backfill-phones?secret=...  (add &apply=1 once it looks right)
+// The `phone` column was added 2026-08-27 — every AWB row created before
+// that has it blank. This fills it in for old rows that already have an
+// order_id (so we can fetch the order straight by GID, no name lookup
+// needed) but no phone yet. Same background-job + dry-run pattern as
+// backfill-order-ids above.
+async function backfillPhones(rows) {
+  const results = [];
+  for (const row of rows) {
+    try {
+      const order = await shopify.fetchOrderDetails(`gid://shopify/Order/${row.order_id}`);
+      const phone = order && order.phone ? order.phone : '';
+      results.push({ awb: row.awb, order_name: row.order_name, phone, action: phone ? 'set' : 'no-phone' });
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let backfillPhonesRunning = false;
+app.get('/admin/backfill-phones', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (backfillPhonesRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-phones] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listMissingPhone(limit);
+  backfillPhonesRunning = true;
+  (async () => {
+    try {
+      const results = await backfillPhones(rows);
+      const toSet = results.filter((r) => r.action === 'set');
+      const noPhone = results.filter((r) => r.action === 'no-phone');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[backfill-phones] scanned ${results.length} — ${toSet.length} found, ${noPhone.length} fara telefon in Shopify, ${errors.length} erori`);
+      if (apply) {
+        toSet.forEach((r) => db.setPhone(r.awb, r.phone));
+        console.log(`[backfill-phones] applied — set phone on ${toSet.length} AWB(s)`);
+        broadcast({ type: 'refresh' }); // paginile deschise re-fetch ca să vadă telefoanele noi
+      }
+      global.__lastBackfillPhonesResult = { apply, count: results.length, toSet, noPhone, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[backfill-phones] failed', err);
+      global.__lastBackfillPhonesResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      backfillPhonesRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/backfill-phones-result?secret=... for the outcome, or watch Deploy Logs for [backfill-phones].',
+  });
+});
+
+app.get('/admin/backfill-phones-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastBackfillPhonesResult || { hint: 'no run recorded yet in this process' });
+});
+
+// Safety-net revert: undoes an incorrect "packed" mark for a specific list
+// of AWBs, given as a comma-separated query param. Built for the incident
+// where an earlier version of /admin/reconcile-with-shopify wrongly marked
+// recently-created (still awaiting courier pickup) AWBs as packed, based on
+// Shopify's displayFulfillmentStatus alone — see the correctness note above
+// reconcileWithShopify. Reuses db.resetPacked (packed=0, packed_at=NULL,
+// first_scan_at=NULL) — harmless for these rows since first_scan_at was
+// already NULL (they were reconciled, never manually scanned). Usage:
+// /admin/revert-packed?secret=...&awbs=AWB1,AWB2,...
+app.get('/admin/revert-packed', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const awbs = String(req.query.awbs || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!awbs.length) return res.status(400).json({ error: 'missing awbs (comma-separated query param)' });
+  const before = awbs.map((awb) => db.getAwb(awb)).filter(Boolean);
+  const stillPacked = before.filter((r) => r.packed);
+  const updated = db.resetFalsePacked(stillPacked.map((r) => r.awb));
+  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+  res.json({ requested: awbs.length, found: before.length, reverted: updated.length, awbs: updated.map((r) => r.awb) });
+});
+
+// Reconciliation against SHOPIFY itself (not Sameday) — for the specific
+// case of old backlog AWBs where Sameday's own status lookup comes back
+// empty/erroring (so /admin/reconcile-sameday and the status backfill have
+// nothing to work with), but Shopify's order record already tells the truth:
+// either the order was cancelled (and our own `cancelled` flag never got set
+// because it predates the orders/cancelled webhook), or the order shows
+// FULFILLED — meaning a courier scan already happened somewhere, just not
+// through this app's own Sameday-status pipeline (e.g. shipped manually by
+// an operator under a different/legacy process). Same dry-run-first pattern
+// as the other /admin/reconcile-* routes. Usage:
+// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
+// CORRECTNESS NOTE (learned the hard way): Shopify's displayFulfillmentStatus
+// turns "FULFILLED" the instant a fulfillment record with tracking exists —
+// i.e. the moment an AWB label is created, same trigger as our own
+// awb_created_at. It does NOT mean the courier physically picked it up. An
+// earlier version of this function used bare displayFulfillmentStatus to
+// decide "pack", which wrongly marked recently-created (still awaiting
+// pickup) AWBs as packed — the exact same false-positive shape as the
+// original incident this whole app was built to avoid. The only safe "pack"
+// signal from Shopify is a genuinely SEPARATE completed fulfillment: one
+// whose tracking number does NOT match the AWB we already have on file for
+// this row (proof a real, different shipment already went out, e.g. through
+// a manual/legacy process). A fulfillment carrying the SAME awb we're
+// already tracking tells us nothing new — Sameday's own live status is the
+// only trustworthy source for whether THAT specific AWB was picked up.
+async function reconcileWithShopify(rows) {
+  const results = [];
+  for (const row of rows) {
+    if (!row.order_id) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'no order_id on this row' });
+      continue;
+    }
+    try {
+      const data = await shopify.shopifyGraphql(
+        `query($id: ID!) { order(id: $id) { cancelledAt fulfillments(first: 10) { status trackingInfo(first: 1) { number } } } }`,
+        { id: `gid://shopify/Order/${row.order_id}` }
+      );
+      const o = data.order;
+      if (!o) {
+        results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'order not found in Shopify' });
+      } else if (o.cancelledAt) {
+        results.push({ awb: row.awb, order_name: row.order_name, order_id: row.order_id, action: 'cancel', cancelledAt: o.cancelledAt });
+      } else {
+        const otherShipment = (o.fulfillments || []).find((f) => {
+          if (f.status !== 'SUCCESS') return false;
+          const num = f.trackingInfo && f.trackingInfo[0] && f.trackingInfo[0].number;
+          return num && num !== row.awb;
+        });
+        if (otherShipment) {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', otherTrackingNumber: otherShipment.trackingInfo[0].number });
+        } else {
+          results.push({ awb: row.awb, order_name: row.order_name, action: 'none' });
+        }
+      }
+    } catch (err) {
+      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return results;
+}
+
+let reconcileShopifyRunning = false;
+app.get('/admin/reconcile-with-shopify', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (reconcileShopifyRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [reconcile-shopify] progress' });
+  }
+  const apply = req.query.apply === '1';
+  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
+  const rows = db.listUnpackedNotCancelled().slice(0, limit);
+  reconcileShopifyRunning = true;
+  (async () => {
+    try {
+      const results = await reconcileWithShopify(rows);
+      const toCancel = results.filter((r) => r.action === 'cancel');
+      const toPack = results.filter((r) => r.action === 'pack');
+      const errors = results.filter((r) => r.action === 'error');
+      console.log(`[reconcile-shopify] scanned ${results.length} — ${toCancel.length} to cancel, ${toPack.length} to pack, ${errors.length} errors`);
+      if (apply) {
+        const cancelledOrderIds = new Set();
+        for (const r of toCancel) {
+          if (cancelledOrderIds.has(r.order_id)) continue;
+          cancelledOrderIds.add(r.order_id);
+          db.markOrderCancelled(r.order_id).forEach((row) => broadcast({ type: 'awb:update', awb: row }));
+        }
+        for (const r of toPack) {
+          const row = db.markPackedFromReconciliation(r.awb, new Date().toISOString());
+          if (row) broadcast({ type: 'awb:update', awb: row });
+        }
+        console.log(`[reconcile-shopify] applied — cancelled ${cancelledOrderIds.size} order(s), packed ${toPack.length} AWB(s)`);
+      }
+      global.__lastReconcileShopifyResult = { apply, count: results.length, toCancel, toPack, errors, finishedAt: new Date().toISOString() };
+    } catch (err) {
+      console.error('[reconcile-shopify] failed', err);
+      global.__lastReconcileShopifyResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
+    } finally {
+      reconcileShopifyRunning = false;
+    }
+  })();
+  res.json({
+    started: true,
+    apply,
+    total: rows.length,
+    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
+    hint: 'Running in background — poll /admin/reconcile-with-shopify-result?secret=... for the outcome, or watch Deploy Logs for [reconcile-shopify].',
+  });
+});
+
+app.get('/admin/reconcile-with-shopify-result', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
+});
+
+// --- REST API -----------------------------------------------------------
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/days', (req, res) => {
+  res.json({ days: db.listDays() });
+});
+
+app.get('/api/today', (req, res) => {
+  const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
+  res.json({ day, rows: db.listForDay(day) });
+});
+
+app.get('/api/day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listForDay(req.params.day) });
+});
+
+// --- Dashboard "packed/shipped" view (grouped by pack date, not AWB
+// creation date — see db.js listPackedDays/listPackedForDay) -------------
+app.get('/api/packed-days', (req, res) => {
+  res.json({ days: db.listPackedDays() });
+});
+
+app.get('/api/packed-day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listPackedForDay(req.params.day) });
+});
+
+// Per-day summary — how many parcels got packed each day and their total
+// value, pre-aggregated server-side (see db.listPackedSummary). Powers the
+// "sumar pe zile" list on the dashboard, newest day first.
+app.get('/api/packed-summary', (req, res) => {
+  res.json({ days: db.listPackedSummary() });
+});
+
+app.get('/api/unpacked-count', (req, res) => {
+  res.json({ count: db.countUnpacked() });
+});
+
+// --- Reconciliation: courier pickup vs warehouse scan --------------------
+// Two distinct mismatch shapes, both surfaced for the dashboard's
+// "Reconciliere" panel:
+//   - pickedUpNotScanned: Sameday's own status shows the courier already
+//     has it, but this row was never scanned at the station (packed here
+//     only via the background Sameday reconciliation pass — first_scan_at
+//     is NULL). It left the warehouse without our own confirmation.
+//   - scannedNotPickedUp: a REAL station scan confirmed it packed (first_
+//     scan_at is set) a while ago (minAgeHours, default 3h — long enough
+//     that this isn't just normal courier-status lag), but Sameday still
+//     doesn't show a pickup.
+// Reuses samedayIndicatesPickedUp(), the same status-text rule the live
+// poller and /admin/reconcile-sameday already use, so "picked up" means the
+// same thing everywhere in this app. Not day-scoped — an anomaly from a
+// couple of days ago is still worth a human's attention, not just today's.
+app.get('/api/reconciliation', (req, res) => {
+  const minAgeHours = Math.max(0, Math.min(72, parseFloat(req.query.minAgeHours) || 3));
+  const minAgeMs = minAgeHours * 3600 * 1000;
+  const now = Date.now();
+  const packed = db.listPackedNotCancelled();
+
+  const pickedUpNotScanned = packed
+    .filter((r) => !r.first_scan_at && samedayIndicatesPickedUp(r.sameday_status))
+    .sort((a, b) => (b.packed_at || '').localeCompare(a.packed_at || ''));
+
+  const scannedNotPickedUp = packed
+    .filter((r) => r.first_scan_at && r.packed_at && !samedayIndicatesPickedUp(r.sameday_status) && now - new Date(r.packed_at).getTime() >= minAgeMs)
+    .sort((a, b) => (a.packed_at || '').localeCompare(b.packed_at || ''));
+
+  res.json({ minAgeHours, pickedUpNotScanned, scannedNotPickedUp });
+});
+
+// Full list of every AWB that exists (has a printed label) but is neither
+// packed nor cancelled — across ALL days, not just today. This is the real
+// "still owed to a courier" backlog: unlike /api/today (which is scoped to
+// today's creation date, for the scan-station picking list), this covers
+// everything regardless of when the AWB was created.
+app.get('/api/unpacked', (req, res) => {
+  const rows = db.listUnpackedNotCancelled().sort((a, b) => new Date(a.awb_created_at) - new Date(b.awb_created_at));
+  res.json({ count: rows.length, rows });
+});
+
+app.get('/api/lookup/:code', (req, res) => {
+  const row = findByCodeFlexible(req.params.code);
+  if (!row) return res.status(404).json({ found: false });
+  res.json({ found: true, row });
+});
+
+app.post('/api/scan', async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'missing code' });
+  const row = findByCodeFlexible(code);
+  if (!row) return res.status(404).json({ found: false });
+  let result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
+  // First scan at the station → note+tag on the Shopify order. We AWAIT the
+  // Shopify round-trip here (rather than fire-and-forget) so we can capture
+  // the ORIGINAL note (the client's own instructions, if any — shown under
+  // the SKU on the packing screen, separate from our own confirmation line)
+  // and the full merged text actually saved to Shopify. If the Shopify call
+  // fails for any reason, we fall back to saving just our own line so the
+  // scan itself never breaks.
+  if (result.kind === 'first' && result.row.order_id) {
+    const stamp = new Date().toLocaleString('ro-RO', {
+      timeZone: 'Europe/Bucharest',
+      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+    const line = `Scanat la depozit: ${stamp}`;
+    try {
+      const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
+      result.row = db.setScanNote(result.row.awb, fullNote);
+      if (originalNote) result.row = db.setClientNoteIfEmpty(result.row.awb, originalNote);
+    } catch (err) {
+      // Can fail for reasons that have nothing to do with the note content —
+      // e.g. an order placed through a marketplace/POS-quick-sale channel
+      // needs a write scope (write_marketplace_orders / write_quick_sale)
+      // this app's token doesn't have, so the WRITE (our confirmation line +
+      // tag) is rejected even though nothing is actually wrong. When that
+      // happens we still don't want to lose the client's own note, so fall
+      // back to a plain READ (which doesn't need that extra scope) to at
+      // least capture it for display, even though our own line can't be
+      // written to Shopify for this order.
+      console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
+      result.row = db.setScanNote(result.row.awb, line);
+      try {
+        const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+        if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+      } catch (readErr) {
+        console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
+      }
+    }
+  } else if (result.row.order_id && !result.row.client_note) {
+    // Not the first scan (or already had order_id-less row) — the client
+    // note can still be missing simply because it was typed into Shopify
+    // a few seconds AFTER the very first scan (appendOrderScanNote only
+    // ever reads once). Re-check on every subsequent scan, as long as we
+    // still don't have one saved, so timing no longer matters. Read-only,
+    // best-effort — never breaks the scan if it fails.
+    try {
+      const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
+      if (note) result.row = db.setClientNoteIfEmpty(result.row.awb, note);
+    } catch (err) {
+      console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
+    }
+  }
+  // 'already' and 'blocked' both mean nothing about the row actually
+  // changed on this scan — no need to broadcast a state nobody's state
+  // just changed to.
+  if (result.kind && result.kind !== 'already' && result.kind !== 'blocked') {
+    broadcast({ type: 'awb:update', awb: result.row });
+  }
+  res.json({ found: true, kind: result.kind, row: result.row });
+});
+
+app.post('/api/note', (req, res) => {
+  const { awb, note } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.setNote(awb, note || '');
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ row });
+});
+
+// --- Stock-missing flag -----------------------------------------------------
+// Staff scan the AWB first (sees the product), then scan the fixed "stoc
+// lipsă" QR code taped to the packing table — scan.html recognizes that
+// marker code client-side and calls this with the AWB it was just showing.
+// The AWB stays in the normal picking list; this only flags it for
+// visibility and feeds the "Necesar produse" panel with which orders are
+// waiting on which product. Cleared automatically when the AWB is actually
+// packed (see db.js setPacked), or manually via /clear below.
+app.post('/api/stock-missing/flag', (req, res) => {
+  const { awb } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.flagStockMissing(awb, new Date().toISOString());
+  if (!row) return res.status(404).json({ found: false });
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ found: true, row });
+});
+
+app.post('/api/stock-missing/clear', (req, res) => {
+  const { awb } = req.body || {};
+  if (!awb) return res.status(400).json({ error: 'missing awb' });
+  const row = db.clearStockMissing(awb);
+  if (!row) return res.status(404).json({ found: false });
+  broadcast({ type: 'awb:update', awb: row });
+  res.json({ found: true, row });
+});
+
+// --- Returns --------------------------------------------------------------
+// AWBs Sameday currently shows as "in return" (courier bringing it back)
+// that nobody has confirmed as physically received yet — not scoped to
+// today, since a return can land days after the original order.
+app.get('/api/returns', (req, res) => {
+  res.json({ rows: db.listPendingReturns() });
+});
+
+// History: returns already confirmed as physically received (most recent
+// first, capped at 200) — separate from /api/returns above, which only
+// lists the ones still waiting for confirmation.
+app.get('/api/returns/history', (req, res) => {
+  res.json({ rows: db.listReturnHistory() });
+});
+
+// Retururi grupate pe zi (ziua în care au fost scanate ca primite fizic în
+// depozit) — vezi db.listReturnDays/listReturnsForDay. Zilele sunt string
+// "YYYY-MM-DD" (fus București), la fel ca /api/packed-days.
+app.get('/api/return-days', (req, res) => {
+  res.json({ days: db.listReturnDays() });
+});
+app.get('/api/return-day/:day', (req, res) => {
+  res.json({ day: req.params.day, rows: db.listReturnsForDay(req.params.day) });
+});
+
+// Manual confirmation scan: the box physically arrived back at the
+// warehouse. Deliberately separate from /api/scan's pack-confirmation flow
+// — scanning a returned AWB here never touches `packed`, only `return_received`.
+// If the code matches no known AWB at all (a return from another channel,
+// an older order, a typo, a damaged label), it's logged as an "unknown
+// return" instead of a plain 404 — those need a human to go find out what
+// they actually are, not silently vanish as a failed scan.
+app.post('/api/scan-return', (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'missing code' });
+  const row = findByCodeFlexible(code);
+  if (!row) {
+    const entry = db.logUnknownReturn(code, new Date().toISOString());
+    broadcast({ type: 'unknown-return:new', entry });
+    return res.json({ found: false, logged: true, entry });
+  }
+  const updated = db.markReturnReceived(row.awb, new Date().toISOString());
+  broadcast({ type: 'awb:update', awb: updated });
+  res.json({ found: true, row: updated });
+});
+
+// Unknown-return entries: listing, adding a note, and marking one resolved
+// once someone has figured out / handled what it actually was.
+app.get('/api/unknown-returns', (req, res) => {
+  res.json({ rows: db.listUnknownReturns() });
+});
+
+app.post('/api/unknown-returns/:id/note', (req, res) => {
+  const { note } = req.body || {};
+  const entry = db.setUnknownReturnNote(Number(req.params.id), note || '');
+  broadcast({ type: 'unknown-return:update', entry });
+  res.json({ entry });
+});
+
+app.post('/api/unknown-returns/:id/resolve', (req, res) => {
+  const entry = db.resolveUnknownReturn(Number(req.params.id), new Date().toISOString());
+  broadcast({ type: 'unknown-return:resolved', entry });
+  res.json({ entry });
+});
+
+// History: unknown-return entries already resolved (most recent first,
+// capped at 200).
+app.get('/api/unknown-returns/history', (req, res) => {
+  res.json({ rows: db.listResolvedUnknownReturns() });
+});
+
+// --- Checklist de achiziție pentru "🚫 Produse lipsă" ----------------------
+// Cheia (agg_key) e cheia de agregare calculată în scan.html (SKU sau
+// titlu+variantă + specsKey) — un produs lipsă e comun mai multor comenzi,
+// deci bifa "achiziționat" + cantitatea cumpărată se țin per produs, nu per
+// AWB. Broadcast pe websocket, ca toate stațiile deschise să rămână
+// sincronizate când cineva bifează de pe alt calculator/telefon.
+app.get('/api/stock-purchases', (req, res) => {
+  res.json({ rows: db.listStockPurchases() });
+});
+app.post('/api/stock-purchases', (req, res) => {
+  const { key, checked, qty } = req.body || {};
+  if (!key) return res.status(400).json({ error: 'lipsește "key"' });
+  const row = db.setStockPurchase(key, !!checked, qty, new Date().toISOString());
+  broadcast({ type: 'stock-purchase:update', row });
+  res.json({ row });
+});
+
+// --- Sameday polling (courier status for open AWBs) ----------------------
+// Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
+// entirely (e.g. while investigating a block/lockout on the Sameday side)
+// without touching anything else — AWB tracking via the Shopify webhook
+// keeps working either way, this only feeds the courier-status column.
+if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
+  console.warn('[sameday] polling disabled via SAMEDAY_POLL_ENABLED=false');
+} else {
+  sameday.startPoller(
+    db,
+    (awb, result) => applySamedayUpdate(awb, result),
+    SAMEDAY_POLL_MS
+  );
+}
+
+// --- Shopify backfill safety net -----------------------------------------
+// Webhooks are the primary path (seconds of latency); this just guards
+// against a missed delivery (server restart, transient network blip).
+async function backfillToday() {
+  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
+  const startIso = new Date(`${todayKey}T00:00:00+03:00`).toISOString(); // Bucharest is UTC+2/+3; adjust below if needed
+  let cursor = null;
+  let added = 0;
+  for (let page = 0; page < 20; page++) {
+    const data = await shopify.shopifyGraphql(
+      `query($cursor: String) {
+        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+          edges { node {
+            id name createdAt updatedAt note phone
+            shippingAddress { phone }
+            totalPriceSet { shopMoney { amount currencyCode } }
+            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor }
+    );
+    const edges = data.orders.edges;
+    if (!edges.length) break;
+    let sawOld = false;
+    for (const { node: o } of edges) {
+      if (new Date(o.updatedAt) < new Date(startIso)) { sawOld = true; continue; }
+      for (const f of o.fulfillments) {
+        if (f.status !== 'SUCCESS') continue;
+        const tracking = f.trackingInfo[0];
+        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
+        if (new Date(f.createdAt).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' }) !== todayKey) continue;
+        const existing = db.getAwb(tracking.number);
+        if (existing) continue;
+        db.upsertAwb({
+          awb: tracking.number,
+          order_name: o.name,
+          order_created_at: o.createdAt,
+          awb_created_at: f.createdAt,
+          total: parseFloat(o.totalPriceSet.shopMoney.amount),
+          currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
+          items: o.lineItems.edges.map((e) => ({
+            title: e.node.title,
+            qty: e.node.quantity,
+            sku: e.node.sku,
+            variant: e.node.variantTitle || '',
+            props: shopify.extractProperties(e.node.customAttributes),
+            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+          })),
+        });
+        added++;
+      }
+    }
+    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
+    cursor = data.orders.pageInfo.endCursor;
+  }
+  if (added) {
+    console.log(`[backfill] added ${added} AWB(s) missed by webhooks`);
+    broadcast({ type: 'refresh' }); // simplest: tell clients to re-fetch today
+  }
+  return added;
+}
+
+// Same crawl as backfillToday(), but over the last `daysBack` days instead of
+// just today, and without the "must be Sameday-created today" restriction —
+// used for the one-time manual catch-up via /admin/backfill-old.
+async function backfillRange(daysBack, debug) {
+  const cutoffMs = Date.now() - daysBack * 24 * 3600 * 1000;
+  let cursor = null;
+  let added = 0;
+  const stats = { ordersScanned: 0, fulfillmentsSuccess: 0, samedayMatches: 0, alreadyInDb: 0, pages: 0 };
+  for (let page = 0; page < 60; page++) {
+    stats.pages++;
+    const data = await shopify.shopifyGraphql(
+      `query($cursor: String) {
+        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+          edges { node {
+            id name createdAt updatedAt note phone
+            shippingAddress { phone }
+            totalPriceSet { shopMoney { amount currencyCode } }
+            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
+            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor }
+    );
+    const edges = data.orders.edges;
+    if (!edges.length) break;
+    let sawOld = false;
+    for (const { node: o } of edges) {
+      stats.ordersScanned++;
+      if (new Date(o.updatedAt).getTime() < cutoffMs) { sawOld = true; continue; }
+      for (const f of o.fulfillments) {
+        if (f.status !== 'SUCCESS') continue;
+        if (new Date(f.createdAt).getTime() < cutoffMs) continue;
+        stats.fulfillmentsSuccess++;
+        const tracking = f.trackingInfo[0];
+        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
+        stats.samedayMatches++;
+        const existing = db.getAwb(tracking.number);
+        if (existing) { stats.alreadyInDb++; continue; }
+        db.upsertAwb({
+          awb: tracking.number,
+          order_name: o.name,
+          order_created_at: o.createdAt,
+          awb_created_at: f.createdAt,
+          total: parseFloat(o.totalPriceSet.shopMoney.amount),
+          currency: o.totalPriceSet.shopMoney.currencyCode,
+          order_id: o.id ? o.id.split('/').pop() : null,
+          client_note: o.note || '',
+          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
+          items: o.lineItems.edges.map((e) => ({
+            title: e.node.title,
+            qty: e.node.quantity,
+            sku: e.node.sku,
+            variant: e.node.variantTitle || '',
+            props: shopify.extractProperties(e.node.customAttributes),
+            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
+          })),
+        });
+        added++;
+      }
+    }
+    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
+    cursor = data.orders.pageInfo.endCursor;
+  }
+  if (added) console.log(`[backfill-old] added ${added} AWB(s) from the last ${daysBack} day(s)`);
+  return debug ? { added, stats } : added;
+}
+
+if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
+  backfillToday().catch((err) => console.error('[backfill] startup run failed', err));
+  setInterval(() => backfillToday().catch((err) => console.error('[backfill] error', err)), BACKFILL_INTERVAL_MS);
+} else {
+  console.warn('[backfill] SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set — skipping Shopify backfill (webhook-only mode)');
+}
+
+server.listen(PORT, () => {
+  console.log(`AWB Glorio server listening on :${PORT}`);
+});
+
+// Last-resort safety net: log and keep running instead of crashing the
+// whole process on an unexpected error (e.g. from a background poll tick).
+process.on('uncaughtException', (err) => console.error('[fatal] uncaughtException', err));
+process.on('unhandledRejection', (err) => console.error('[fatal] unhandledRejection', err));
