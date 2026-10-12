@@ -924,11 +924,11 @@
   stockMissingNeedsModal.addEventListener('click', e => { if (e.target === stockMissingNeedsModal) stockMissingNeedsModal.classList.remove('open'); });
 
   document.getElementById('resetNecesarBtn').addEventListener('click', async () => {
-    if (!confirm('Resetezi necesarul de produse? Toate bifele și cantitățile vor fi șterse.')) return;
+    if (!confirm('Resetezi lista de produse lipsă? Toate comenzile blocate vor fi deblocate.')) return;
     try {
-      await fetch('/api/stock-purchases/reset', { method: 'POST' });
-      stockPurchases = {};
-      renderStockMissingNeeds();
+      const res = await fetch('/api/stock-missing/reset-all', { method: 'POST' });
+      const data = await res.json();
+      alert(`✅ ${data.count || 0} comenzi deblocate.`);
     } catch (err) { alert('Eroare la resetare: ' + err.message); }
   });
 
