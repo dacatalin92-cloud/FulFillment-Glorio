@@ -1279,6 +1279,43 @@
     `;
   }
 
+  // ---- Sunete scanare (Web Audio API, fără fișiere externe) ---------------
+  let _audioCtx = null;
+  function getAudioCtx(){ return _audioCtx || (_audioCtx = new (window.AudioContext || window.webkitAudioContext)()); }
+  function playTone(freq, duration, type = 'sine', vol = 0.4){
+    try {
+      const ctx = getAudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = type; osc.frequency.value = freq;
+      gain.gain.setValueAtTime(vol, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime + duration);
+    } catch(e) { /* audio blocat de browser */ }
+  }
+  function soundOk()      { playTone(880, 0.12); setTimeout(() => playTone(1320, 0.15), 100); }
+  function soundPacked()  { playTone(660, 0.1);  setTimeout(() => playTone(880, 0.1), 90); setTimeout(() => playTone(1100, 0.2), 180); }
+  function soundError()   { playTone(220, 0.3, 'sawtooth', 0.35); }
+  function soundWarning() { playTone(440, 0.2, 'square', 0.2); setTimeout(() => playTone(330, 0.2, 'square', 0.2), 220); }
+
+  // ---- Notificări browser pentru comenzi noi --------------------------------
+  let _notifGranted = false;
+  (async function initNotif(){
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') { _notifGranted = true; return; }
+    if (Notification.permission !== 'denied') {
+      const p = await Notification.requestPermission();
+      _notifGranted = p === 'granted';
+    }
+  })();
+  function notifyNewOrder(row){
+    if (!_notifGranted) return;
+    const title = `📦 Comandă nouă — ${row.order_name || row.awb}`;
+    const body = row.items_json ? (() => { try { return JSON.parse(row.items_json).map(i => `${i.qty}× ${i.title}`).join(', '); } catch(e){ return ''; } })() : '';
+    try { new Notification(title, { body, icon: '/favicon.ico', tag: row.awb }); } catch(e){}
+  }
+
   async function handleScan(raw){
     const code = raw.trim();
     if (!code) return;
@@ -1337,26 +1374,32 @@
     }
     try {
       const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-      if (res.status === 404){ lastScannedAwb = null; renderNotFound(code); return; }
+      if (res.status === 404){ lastScannedAwb = null; soundError(); renderNotFound(code); return; }
       const data = await res.json();
       rows[data.row.awb] = data.row;
       lastScannedAwb = data.row.awb;
       renderAfterScan(data.row);
       const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
       if (data.kind === 'first'){
+        soundOk();
         renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'packed'){
+        soundPacked();
         renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
       } else if (data.kind === 'already'){
+        soundWarning();
         renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
       } else if (data.kind === 'reset'){
+        soundWarning();
         renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 10 minute de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
       } else if (data.kind === 'cancelled'){
+        soundError();
         renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
       } else if (data.kind === 'restocked'){
         // 2026-08-27: scanarea unui AWB marcat "stoc lipsă" șterge flagul și
         // repornește ciclul normal (ca o primă scanare) — mai e nevoie de
         // ÎNCĂ o scanare, în fereastra normală, ca să confirme împachetat.
+        soundOk();
         renderFound(data.row, renderStatusBanner('first', '📦 Stocul a revenit — flag șters. Scanare 2/3, mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
       } else if (data.kind === 'blocked'){
         // 2026-08-26: db.recordScan nu mai întoarce 'blocked' pentru un AWB
@@ -1415,6 +1458,7 @@
       const msg = JSON.parse(ev.data);
       if (msg.type === 'awb:new' || msg.type === 'awb:update'){
         rows[msg.awb.awb] = msg.awb;
+        if (msg.type === 'awb:new') notifyNewOrder(msg.awb);
         scheduleRenderAll();
         // Keep the returns bar in sync without a full re-fetch: add/remove
         // this one row locally based on its current status.
