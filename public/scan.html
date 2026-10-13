@@ -322,21 +322,17 @@
       <button type="button" class="theme-dot" data-color-theme="padure" style="--dot-bg:#386641;" title="Pădure"></button>
       <button type="button" class="theme-dot" data-color-theme="noapte" style="--dot-bg:#0D0F14;" title="Noapte"></button>
     </div>
+    <button type="button" id="returnsBarHead" class="hidden" style="display:none;align-items:center;gap:0.3rem;font-size:0.78rem;font-weight:600;padding:0.3rem 0.65rem;border-radius:8px;border:1.5px solid var(--accent);background:var(--accent-soft);color:var(--accent);cursor:pointer;white-space:nowrap;">🔄 <span id="returnsCount">0</span></button>
+    <button type="button" id="unknownReturnsBarHead" class="hidden" style="display:none;align-items:center;gap:0.3rem;font-size:0.78rem;font-weight:600;padding:0.3rem 0.65rem;border-radius:8px;border:1.5px solid var(--red);background:var(--red-soft);color:var(--red);cursor:pointer;white-space:nowrap;">⚠️ <span id="unknownReturnsCount">0</span></button>
     <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
   </div>
 </div>
 
-<div class="returns-bar hidden" id="returnsBar">
-  <div class="returns-bar-head" id="returnsBarHead">
-    <span>🔄 <span id="returnsCount">0</span> retur(uri) de gestionat — click pentru listă</span>
-  </div>
+<div class="returns-bar hidden" id="returnsBar" style="display:none;">
   <div class="returns-list" id="returnsList" style="display:none;"></div>
 </div>
 
-<div class="unknown-returns-bar hidden" id="unknownReturnsBar">
-  <div class="unknown-returns-bar-head" id="unknownReturnsBarHead">
-    <span>⚠️ <span id="unknownReturnsCount">0</span> retur(uri) neidentificate (nu sunt în sistem) — click pentru listă</span>
-  </div>
+<div class="unknown-returns-bar hidden" id="unknownReturnsBar" style="display:none;">
   <div class="unknown-returns-hint">De verificat manual — poate fi de la Fan Curier, Cargus, Sameday, Bookurier sau DPD (curieri pe care sistemul nu îi caută automat aici).</div>
   <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
 </div>
@@ -632,7 +628,8 @@
   function renderReturnsBar(){
     const list = Object.values(returnRows);
     document.getElementById('returnsCount').textContent = list.length;
-    returnsBar.classList.toggle('hidden', list.length === 0);
+    const btn = document.getElementById('returnsBarHead');
+    btn.style.display = list.length === 0 ? 'none' : 'flex';
     returnsList.innerHTML = list.map(row => `
       <div class="returns-row">
         <span class="awb-cell">${escapeHtml(row.awb)}</span>
@@ -643,7 +640,8 @@
     `).join('');
   }
   document.getElementById('returnsBarHead').addEventListener('click', () => {
-    returnsList.style.display = returnsList.style.display === 'none' ? 'flex' : 'none';
+    returnsBar.classList.toggle('hidden');
+    returnsList.style.display = returnsBar.classList.contains('hidden') ? 'none' : 'flex';
   });
   document.addEventListener('click', async (e) => {
     if (e.target.classList.contains('mark-received-btn')){
@@ -676,7 +674,8 @@
   function renderUnknownReturnsBar(){
     const list = Object.values(unknownReturns).sort((a,b) => b.scanned_at.localeCompare(a.scanned_at));
     document.getElementById('unknownReturnsCount').textContent = list.length;
-    unknownReturnsBar.classList.toggle('hidden', list.length === 0);
+    const btn = document.getElementById('unknownReturnsBarHead');
+    btn.style.display = list.length === 0 ? 'none' : 'flex';
     unknownReturnsList.innerHTML = list.map(entry => `
       <div class="unknown-returns-row" data-id="${entry.id}">
         <span class="awb-cell">${escapeHtml(entry.code)}</span>
@@ -687,7 +686,8 @@
     `).join('');
   }
   document.getElementById('unknownReturnsBarHead').addEventListener('click', () => {
-    unknownReturnsList.style.display = unknownReturnsList.style.display === 'none' ? 'flex' : 'none';
+    unknownReturnsBar.classList.toggle('hidden');
+    unknownReturnsList.style.display = unknownReturnsBar.classList.contains('hidden') ? 'none' : 'flex';
   });
   document.addEventListener('change', async e => {
     if (e.target.dataset.unknownId){
