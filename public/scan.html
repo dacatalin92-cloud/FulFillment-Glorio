@@ -61,7 +61,7 @@
   .theme-switcher{ display:flex; align-items:center; gap:0.35rem; }
   .theme-dot{ width:1.35rem; height:1.35rem; border-radius:50%; border:2px solid var(--border); cursor:pointer; padding:0; background:var(--dot-bg); }
   .theme-dot.active{ border-color:var(--text); box-shadow:0 0 0 2px var(--surface), 0 0 0 3px var(--text); }
-  *{box-sizing:border-box;} html,body{height:100%;}
+  *{box-sizing:border-box;} html,body{height:100%;overflow:hidden;}
   body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; display:flex; flex-direction:column; }
   .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex:0 0 auto; }
   .brand{ display:flex; align-items:baseline; gap:0.6rem; }
@@ -109,7 +109,7 @@
   #scanInput{ width:100%; font-family:"IBM Plex Mono", monospace; font-size:1.4rem; padding:0.85rem 1.1rem; border-radius:10px; border:2px solid var(--accent); background:var(--surface-2); color:var(--text); outline:none; }
   #scanInput::placeholder{ color:var(--text-dim); font-size:1.05rem; }
 
-  main{ flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding:2rem 1.5rem 1rem; overflow-y:auto; }
+  main{ flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding:2rem 1.5rem 1rem; overflow-y:auto; -webkit-overflow-scrolling:touch; }
   .idle{ margin-top:3rem; text-align:center; color:var(--text-dim); max-width:32ch; }
   .idle .glyph{ font-size:2.6rem; margin-bottom:0.75rem; opacity:0.6; }
   .idle h2{ font-family:"Fraunces", serif; font-weight:600; font-size:1.3rem; color:var(--text); margin:0 0 0.4rem; }
@@ -231,7 +231,8 @@
   /* ── Mobile / iPhone ─────────────────────────────────────────────────── */
   @media (max-width: 639px) {
     /* Safe area pentru notch/home indicator iPhone */
-    body { padding-bottom: env(safe-area-inset-bottom); }
+    body { padding-bottom: env(safe-area-inset-bottom); overflow: auto; }
+    html { overflow: auto; }
 
     /* Topbar compact */
     .topbar { padding: 0.6rem 1rem; }
