@@ -73,11 +73,40 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-function broadcast(msg) {
-  const payload = JSON.stringify(msg);
+function broadcastRaw(payload) {
   wss.clients.forEach((client) => {
     if (client.readyState === 1) client.send(payload);
   });
+}
+
+// Mesajele de tip awb:update venite în rafale (din poller-ul Sameday care
+// procesează 150+ AWB-uri la fiecare 30s) sunt comasate: se acumulează
+// timp de 600ms, apoi se trimite un singur mesaj "refresh" către clienți
+// în loc de 150 mesaje individuale. Scanările reale (singure, nu în rafală)
+// tot ajung imediat, pentru că timer-ul nu e activ în acel moment.
+let _bcastQueue = [];
+let _bcastTimer = null;
+function broadcast(msg) {
+  if (msg.type === 'awb:update') {
+    _bcastQueue.push(msg);
+    if (!_bcastTimer) {
+      _bcastTimer = setTimeout(() => {
+        _bcastTimer = null;
+        const q = _bcastQueue.splice(0);
+        if (q.length >= 5) {
+          // Rafală din poller → un singur "refresh" (clienții re-fetch /api/unpacked)
+          broadcastRaw(JSON.stringify({ type: 'refresh' }));
+        } else {
+          // Scanare reală sau update singular → trimite individual, imediat
+          q.forEach(m => broadcastRaw(JSON.stringify(m)));
+        }
+        _bcastTimer = null;
+      }, 600);
+    }
+  } else {
+    // stock-purchase:update, awb:new, refresh etc. → merg întotdeauna imediat
+    broadcastRaw(JSON.stringify(msg));
+  }
 }
 
 // Curieri ale căror AWB-uri sunt urmărite de acest sistem. Orice
@@ -136,6 +165,15 @@ const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
 // (/admin/reconcile-sameday), pentru curățare punctuală de backlog vechi,
 // dar NU mai rulează automat din poller-ul de 30s.
 function applySamedayUpdate(awb, result) {
+  // Dacă statusul nu s-a schimbat față de ce avem în DB, nu scriem și nu
+  // broadcast-uim — economisim event loop la fiecare ciclu de poll (150+ AWB-uri).
+  // db.updateSameday returnează rândul actualizat și scrie NUMAI dacă ceva
+  // s-a schimbat — semnalăm asta prin câmpul _unchanged pe care îl setăm noi.
+  const existing = db.getAwb ? db.getAwb(awb) : null;
+  const resultStatus = result && (result.status || result.sameday_status || null);
+  if (existing && resultStatus && existing.sameday_status === resultStatus) {
+    return existing; // nimic schimbat, skip DB write + broadcast
+  }
   const row = db.updateSameday(awb, result);
   broadcast({ type: 'awb:update', awb: row });
   return row;
@@ -925,6 +963,12 @@ app.get('/admin/reconcile-with-shopify-result', (req, res) => {
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// PWA Icons — servite direct din cod, fără fișiere binare externe
+const _icon192 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAACiklEQVR4nO3SUW7TUBRF0cyAGTIEpp6fKN8IFRUITmJ7u312s6Q1gHN19+l6OW/l24/vHMKGTz9phTefFNDwO/lQHxjQ8Nv4NBsHNPwehtggoOE3MNz6gIZPZyfWBDR8NLuyLKDhc9mhuQENH8puPQ9o+ER2TkAkjwIaPo5DEBDJdEDDZ3EgAiK5DWj4IA5HQCR/Aho+hYMSEImASAREIiASAZEIiORXQMNHcGgCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgktP1ch4+goO6Xs4CYj0BkQiIREAkAiIREMnvgDTECm/lCIiV/glIQyzyno2AWGMiIA0x09/NCIjF7gakIZ66CUZALPMkIA3xwP+1TASkISZNpjIdkIa4ca+TuwFpiHcPInkUkIZ4XM/zgGT0yua0MSsgGb2a+VUsCEhGr2BpD4sDktFXta6ElQGp6tA2fPpPhakygRMOf1wAAAAASUVORK5CYII=', 'base64');
+const _icon512 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAIw0lEQVR4nO3V220lVRRFUWdAhoRA6v6x/I0QqAG3276PqtpVZw5pBHAe0pov72+va/jtj98BDjA+d1t5GT+BfQcWMz6Ylw/A+BcCbGJ8Tq8RgPF/AtjV+MyeLgDjXwJwsPHhnQ/A+B8CDCoGYPzRAU4lEYDxVwY4rWUDMP6yAJewWgDGHxTgQhYJwPg7AlzUhQMw/nYAC7heAMafDGAZVwrA+GMBLOYCARh/I4CFnTcA408DsLwzBmD8UQAizhWA8ecASDlLAMYfAiBoOADj9weImwnA+LUBeKYBAgBwbUcHYPzCAPxwXADGrwrAB0cEYPySAHxq3wCMXw+AL+wVgPGLAfAtAQCI2j4A41cC4EZbBmD8MgDcZZsAjF8DgAcIAEDUswEYvwAADxMAgKjHAzB+dACe9EgAxg8NwCYEACDqvgCMHxeADQkAQNStARg/KACbEwCAKAEAiPo+AONHBGAnAgAQ9VUAxg8HwK4EACBKAACiPg/A+LEAOIAAAEQJAECUAABECQBAlAAARAkAQJQAAEQJAECUAABECQBAlAAARP0TAA0ASPl7+QUAIEcAAKIEACBKAACi/hcADQCI+DH7AgDQIgAAUQIAEPVJADQAYHn/3XwBAAgRAICoXwZAAwAW9mHwBQCg4psAaADAkn5eewEASBAAgKibAqABAIv5dOoFAGB9dwRAAwCW8audFwCAxd0dAA0AWMAXI/9VADQA4NK+XngBAFjWUwHQAICL+nbeBQBgTRsEQAMALueWbb8pABoAcCE3DvutAdAAgEu4fdUFAGApuwRAAwBO7q5Jvy8AGgBwWvfu+d0B0ACAE3pgzB8JgAYAnMpjS/5gADQA4CQennEBALi2gQBoAMC4Zzb8qQDIAMCU59d7gwBoAMDBNpnubQKgAQCH2Wq3NwuABgAcYMPR3jIAGgCwq20Xe+MAyADAHvbY6l0CoAEAG9ppqPcKgAYAbGK/ld4xADIA8Iy993n3AMgAwL2OWeaDAqABADc6bJaPC4AMAHzt4EE+OgAyAPCzkSmeCYASAEzt/lkCIANA0/jwniUASgBEjM/seQMgBsB6xuf0egHQA+CixgdztQAoBHAS43O3lT8BbBwFRedDN1EAAAAASUVORK5CYII=', 'base64');
+app.get('/icon-192.png', (_req, res) => { res.set('Content-Type','image/png').send(_icon192); });
+app.get('/icon-512.png', (_req, res) => { res.set('Content-Type','image/png').send(_icon512); });
 
 app.get('/api/days', (req, res) => {
   res.json({ days: db.listDays() });
