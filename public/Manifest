@@ -4,20 +4,20 @@
   "description": "Stație de scanare AWB pentru depozit Glorio",
   "start_url": "/scan.html",
   "display": "standalone",
-  "orientation": "portrait",
+  "orientation": "landscape",
   "background_color": "#F6F4EF",
   "theme_color": "#0F6E5E",
   "icons": [
     {
-      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='24' fill='%230F6E5E'/%3E%3Ctext x='96' y='130' font-size='100' text-anchor='middle' fill='white'%3E📦%3C/text%3E%3C/svg%3E",
+      "src": "/icon-192.png",
       "sizes": "192x192",
-      "type": "image/svg+xml",
+      "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='64' fill='%230F6E5E'/%3E%3Ctext x='256' y='346' font-size='260' text-anchor='middle' fill='white'%3E📦%3C/text%3E%3C/svg%3E",
+      "src": "/icon-512.png",
       "sizes": "512x512",
-      "type": "image/svg+xml",
+      "type": "image/png",
       "purpose": "any maskable"
     }
   ]
