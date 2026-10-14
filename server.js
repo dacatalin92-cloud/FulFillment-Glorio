@@ -1118,9 +1118,12 @@ app.post('/api/scan', (req, res) => {
   if (!row) return res.status(404).json({ found: false });
 
   // AWB anulat — nu înregistrăm scanarea, afișăm banner de eroare direct.
-  // Se ajunge aici fie prin webhook orders/cancelled din Shopify, fie prin
-  // anularea manuală a AWB-ului din Sameday (care setează cancelled = 1 în DB).
-  if (row.cancelled) {
+  // Două căi prin care un AWB poate fi anulat:
+  //   1. cancelled = 1: setat de webhook-ul orders/cancelled din Shopify
+  //   2. sameday_status conține "anulat": AWB-ul a fost anulat direct în
+  //      Sameday/xConnector (statusul vine prin polling, nu prin webhook Shopify)
+  const samedayAnulat = (row.sameday_status || '').toLowerCase().includes('anulat');
+  if (row.cancelled || samedayAnulat) {
     return res.json({ found: true, kind: 'cancelled', row });
   }
 
