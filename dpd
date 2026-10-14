@@ -1,0 +1,84 @@
+// DPD Romania tracking API client
+// Similar cu sameday.js — polling status AWB-uri DPD.
+// Credențiale: DPD_USERNAME + DPD_PASSWORD (Railway env vars)
+//
+// API DPD Romania — autentificare Basic Auth (user:password base64).
+// Dacă endpoint-ul de mai jos returnează eroare neașteptată, verifică
+// Deploy Logs pentru "[dpd]" — va fi afișat statusul HTTP și răspunsul raw.
+const fetch = require('node-fetch');
+
+const DPD_API_BASE = process.env.DPD_API_BASE || 'https://api.dpd.ro/v1';
+
+function authHeader() {
+  const u = process.env.DPD_USERNAME;
+  const p = process.env.DPD_PASSWORD;
+  if (!u || !p) return null;
+  return 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
+}
+
+// Returnează statusul curent al unui AWB DPD ca string simplu,
+// sau null dacă nu se poate determina.
+async function getStatus(awb) {
+  const auth = authHeader();
+  if (!auth) {
+    throw new Error('DPD_USERNAME / DPD_PASSWORD lipsesc din env');
+  }
+
+  const url = `${DPD_API_BASE}/parcels/${encodeURIComponent(awb)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        'Authorization': auth,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    });
+  } catch (err) {
+    throw new Error(`DPD fetch failed: ${err.message}`);
+  }
+
+  if (res.status === 404) return null; // AWB negăsit — normal pentru AWBuri noi
+  if (!res.ok) {
+    const raw = await res.text().catch(() => '');
+    console.error(`[dpd] HTTP ${res.status} pentru ${awb}:`, raw.slice(0, 300));
+    throw new Error(`DPD API HTTP ${res.status}`);
+  }
+
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    const raw = await res.text().catch(() => '');
+    console.error(`[dpd] răspuns non-JSON pentru ${awb}:`, raw.slice(0, 300));
+    return null;
+  }
+
+  // Extrage statusul din răspuns — structura exactă depinde de API-ul DPD.
+  // Logăm întregul răspuns prima dată ca să vedem structura reală.
+  if (process.env.DPD_DEBUG === '1') {
+    console.log(`[dpd] răspuns brut pentru ${awb}:`, JSON.stringify(body).slice(0, 500));
+  }
+
+  // Încercăm câmpuri comune — ajustează după ce vezi structura reală în logs
+  const status =
+    body.statusText ||
+    body.status ||
+    body.state ||
+    body.statusDescription ||
+    (body.events && body.events[0] && body.events[0].description) ||
+    (body.tracking && body.tracking.status) ||
+    null;
+
+  return status ? String(status) : null;
+}
+
+// Verifică dacă un status DPD indică un AWB anulat
+function isAnulat(status) {
+  if (!status) return false;
+  const s = status.toLowerCase();
+  return s.includes('anulat') || s.includes('cancel') || s.includes('annul');
+}
+
+module.exports = { getStatus, isAnulat };
