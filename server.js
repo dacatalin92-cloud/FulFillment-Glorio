@@ -1116,6 +1116,14 @@ app.post('/api/scan', (req, res) => {
   if (!code) return res.status(400).json({ error: 'missing code' });
   const row = findByCodeFlexible(code);
   if (!row) return res.status(404).json({ found: false });
+
+  // AWB anulat — nu înregistrăm scanarea, afișăm banner de eroare direct.
+  // Se ajunge aici fie prin webhook orders/cancelled din Shopify, fie prin
+  // anularea manuală a AWB-ului din Sameday (care setează cancelled = 1 în DB).
+  if (row.cancelled) {
+    return res.json({ found: true, kind: 'cancelled', row });
+  }
+
   const result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
 
   // Răspundem IMEDIAT — scanerul nu mai așteaptă Shopify.
