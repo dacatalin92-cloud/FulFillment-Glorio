@@ -1,1559 +1,1553 @@
-require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const path = require('path');
-const fetch = require('node-fetch');
-const { WebSocketServer } = require('ws');
-
-const db = require('./db');
-const sameday = require('./sameday');
-const shopify = require('./shopify');
-
-// 2026-10-07: scanerul citește de pe eticheta DPD un cod de bare de 28 de
-// cifre care NU e AWB-ul real — e un cod compus: "1000" (prefix fix) +
-// AWB-ul real, de 11 cifre (acelasi număr ținut de xConnector/Shopify ca
-// tracking number) + încă 13 cifre (verificare/date suplimentare de pe
-// etichetă). Confirmat pe două comenzi reale via /admin/debug-awb:
-//   "1000" + "81382257056" + "9260003870813"  (28 cifre)
-//   "1000" + "81382265004" + "9370000610818"  (28 cifre)
-// Prima variantă a acestui fix (doar "scoate zerourile din față") era
-// greșită — codul scanat efectiv începe cu "1", nu cu "0", deci acel fix nu
-// se activa niciodată pentru scanări reale. Acum extragem exact cifrele
-// 5-15 (poziția AWB-ului real) când codul se potrivește cu formatul de mai
-// sus. Sigur pentru celelalte AWB-uri (Sameday, Bookurier) — niciunul nu are
-// 28 de cifre numerice cu "1000" la început, deci a doua încercare pur și
-// simplu nu se declanșează pentru ele, comportamentul rămâne neschimbat.
-function extractDpdAwbFromScan(code) {
-  const c = String(code || '').trim();
-  // Format confirmat: "1000" (4 cifre fixe) + AWB real (10-14 cifre) + sufix variabil
-  // Totalul e 28 de cifre pentru AWB-urile de 11 cifre confirmate, dar acceptăm
-  // și variații unde AWB-ul are 10-14 cifre (total cod 24-32 cifre).
-  const m = c.match(/^1000(\d{10,14})\d+$/);
-  if (m) return m[1];
-  return null;
-}
-
-function findByCodeFlexible(code) {
-  const row = db.findByCode(code);
-  if (row) return row;
-  const dpdAwb = extractDpdAwbFromScan(code);
-  if (dpdAwb) {
-    const dpdRow = db.findByCode(dpdAwb);
-    if (dpdRow) return dpdRow;
-  }
-  const trimmed = String(code || '').replace(/^0+(?=\d)/, '');
-  if (trimmed && trimmed !== code) return db.findByCode(trimmed);
-  return null;
-}
-
-const PORT = process.env.PORT || 3000;
-// 2026-08-26: era 30000 (30 secunde) — prea scurt pentru fluxul real de
-// împachetare (scanezi AWB-ul, pui efectiv produsul în cutie, lipești
-// eticheta, scanezi din nou). Cu 30s, a doua scanare venea aproape mereu
-// prea târziu și era tratată ca RESET (o nouă "primă scanare"), nu ca
-// CONFIRMARE — comanda rămânea blocată la "Scanat 1×" deși fusese scanată
-// de 2 ori. 10 minute lasă timp de împachetare real, păstrând totuși
-// protecția inițială (nu confirmă un scan izolat, la întâmplare, ore mai
-// târziu).
-const PACK_WINDOW_MS = 10 * 60 * 1000;
-// 5 seconds caused the server to crash-loop in production (a native SQLite
-// assertion, from creating/destroying prepared statements at very high
-// frequency — fixed separately in db.js by caching statements, but running
-// the poll near-continuously is still much heavier load than needed). 30
-// seconds is a safe middle ground: still 4x faster than the original 2
-// minutes, without hammering Sameday's API or the DB nonstop.
-const SAMEDAY_POLL_MS = 30 * 1000;
-const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
-// Payload of the fixed "stoc lipsă" QR code, printed once and taped to the
-// packing table (see scan.html) — not a real AWB, just a marker staff scan
-// right after an AWB whose product isn't in stock, to flag it. Checked
-// client-side in scan.html; the server side only needs to know the AWB.
-
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
-
-function broadcastRaw(payload) {
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1) client.send(payload);
-  });
-}
-
-// Mesajele de tip awb:update venite în rafale (din poller-ul Sameday care
-// procesează 150+ AWB-uri la fiecare 30s) sunt comasate: se acumulează
-// timp de 600ms, apoi se trimite un singur mesaj "refresh" către clienți
-// în loc de 150 mesaje individuale. Scanările reale (singure, nu în rafală)
-// tot ajung imediat, pentru că timer-ul nu e activ în acel moment.
-let _bcastQueue = [];
-let _bcastTimer = null;
-function broadcast(msg) {
-  if (msg.type === 'awb:update') {
-    _bcastQueue.push(msg);
-    if (!_bcastTimer) {
-      _bcastTimer = setTimeout(() => {
-        _bcastTimer = null;
-        const q = _bcastQueue.splice(0);
-        if (q.length >= 5) {
-          // Rafală din poller → un singur "refresh" (clienții re-fetch /api/unpacked)
-          broadcastRaw(JSON.stringify({ type: 'refresh' }));
-        } else {
-          // Scanare reală sau update singular → trimite individual, imediat
-          q.forEach(m => broadcastRaw(JSON.stringify(m)));
-        }
-        _bcastTimer = null;
-      }, 600);
-    }
-  } else {
-    // stock-purchase:update, awb:new, refresh etc. → merg întotdeauna imediat
-    broadcastRaw(JSON.stringify(msg));
-  }
-}
-
-// Curieri ale căror AWB-uri sunt urmărite de acest sistem. Orice
-// fulfillment Shopify al cărui nume de curier NU conține una din aceste
-// bucăți de text e ignorat complet (nu ajunge în baza de date) — exact
-// mecanismul care ținea sistemul strict pe Sameday până acum. Adăugat
-// "bookurier" 2026-09-30, apoi "dpd" 2026-10-07, la cererea clientului,
-// care a început să livreze și prin aceste curiere — dar DOAR pentru
-// recunoașterea/scanarea AWB-urilor lor; NU se cere și status live de la
-// Bookurier/DPD (asta ar necesita propriul client API per curier, ca
-// sameday.js), deci coloana sameday_status rămâne goală pentru AWB-urile
-// lor — inofensiv, codul care citește acel câmp (isPickable,
-// samedayIndicatesPickedUp etc.) tratează un status gol ca "nimic
-// special", nu ca eroare.
-const SUPPORTED_COURIERS = ['sameday', 'bookurier', 'dpd'];
-function isSupportedCourierName(company) {
-  const c = (company || '').toLowerCase();
-  return SUPPORTED_COURIERS.some((name) => c.includes(name));
-}
-
-// "packed" is primarily a warehouse-floor fact confirmed by a scan at the
-// station — but not every order goes through this app's station. Some are
-// fulfilled through the older/other process, and for those Sameday's own
-// tracking is the only signal that they ever left the warehouse ("cele care
-// au ajuns sa aibe scan de la ei, au fost sigur impachetate"). So Sameday
-// status DOES get to mark something packed — just never instantly. Only two
-// real "still sitting with us" statuses exist; anything past that means a
-// courier scan happened.
-const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
-function samedayIndicatesPickedUp(status) {
-  const t = (status || '').toLowerCase();
-  if (!t) return false;
-  if (t.includes('anulat')) return false;
-  return !PENDING_PICKUP_PHRASES.some((p) => t.includes(p));
-}
-
-// The original incident: this same "picked up" check ran INSTANTLY, right
-// when the AWB was printed, and Sameday's status text for a brand-new label
-// didn't match the two known "still pending" phrases — so it read as
-// "already picked up" within seconds of printing. A courier physically
-// cannot pick something up seconds after the label exists, so nothing gets
-// auto-packed from Sameday status until it's had time to become real. This
-// is also what makes the live poller (every 30s, see startPoller below) a
-// standing reconciliation pass — old-process orders self-heal to packed as
-// soon as they age past this window and Sameday shows real movement.
-const MIN_AWB_AGE_FOR_AUTO_PACK_MS = 30 * 60 * 1000; // 30 minutes
-
-// 2026-08-26: dezactivat auto-pack-ul din reconciliere pe cerința expresă a
-// clientului — lista de "De pregătit pentru curier" trebuie să reflecte
-// STRICT scanările reale de la stație (db.recordScan), niciodată textul de
-// status Sameday. Investigația "65 vs 53" a arătat că reconcilierea automată
-// bazată pe status (orice text în afara celor 2 fraze "încă e la noi" conta
-// ca "ridicat") e prea riscantă — un text de status neprevăzut poate scoate
-// din listă un colet încă fizic neîmpachetat. markPackedFromReconciliation
-// și reconcileWithSameday rămân disponibile ca unelte manuale de admin
-// (/admin/reconcile-sameday), pentru curățare punctuală de backlog vechi,
-// dar NU mai rulează automat din poller-ul de 30s.
-function applySamedayUpdate(awb, result) {
-  // Dacă statusul nu s-a schimbat față de ce avem în DB, nu scriem și nu
-  // broadcast-uim — economisim event loop la fiecare ciclu de poll (150+ AWB-uri).
-  // db.updateSameday returnează rândul actualizat și scrie NUMAI dacă ceva
-  // s-a schimbat — semnalăm asta prin câmpul _unchanged pe care îl setăm noi.
-  const existing = db.getAwb ? db.getAwb(awb) : null;
-  const resultStatus = result && (result.status || result.sameday_status || null);
-  if (existing && resultStatus && existing.sameday_status === resultStatus) {
-    return existing; // nimic schimbat, skip DB write + broadcast
-  }
-  const row = db.updateSameday(awb, result);
-  broadcast({ type: 'awb:update', awb: row });
-  return row;
-}
-
-// On-demand version of the same reconciliation the live poller does
-// gradually — sweeps every currently-unpacked AWB against its last-known
-// Sameday status right now, for catching up a backlog immediately (e.g.
-// right after the false-packed cleanup) instead of waiting on the 30s
-// poller to cycle through all of them. Uses the cached sameday_status
-// already in the DB rather than hitting Sameday's API again — that column
-// is kept fresh by the poller regardless.
-function reconcileWithSameday(minAgeMinutes) {
-  const minAgeMs = minAgeMinutes * 60 * 1000;
-  const now = Date.now();
-  return db.listUnpackedNotCancelled().filter((row) => {
-    if (!samedayIndicatesPickedUp(row.sameday_status)) return false;
-    return now - new Date(row.awb_created_at).getTime() >= minAgeMs;
-  });
-}
-
-// --- Shopify webhook: fulfillments/create -----------------------------
-// Needs the raw body for HMAC verification, so this route uses its own
-// raw-body parser instead of the app-wide express.json().
-app.post(
-  '/webhooks/fulfillments-create',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    try {
-      const hmac = req.get('X-Shopify-Hmac-Sha256');
-      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
-      if (!ok) return res.status(401).send('invalid signature');
-      res.status(200).send('ok'); // ack immediately, Shopify retries on timeout/non-2xx
-
-      const payload = JSON.parse(req.body.toString('utf8'));
-      await handleFulfillmentPayload(payload);
-    } catch (err) {
-      console.error('[webhook] processing error', err);
-      if (!res.headersSent) res.status(500).send('error');
-    }
-  }
-);
-
-async function handleFulfillmentPayload(payload) {
-  if ((payload.status || '').toLowerCase() !== 'success') return;
-  if (!isSupportedCourierName(payload.tracking_company)) return;
-  const isSameday = (payload.tracking_company || '').toLowerCase().includes('sameday');
-  const awb = payload.tracking_number;
-  if (!awb) return;
-
-  const orderGid = `gid://shopify/Order/${payload.order_id}`;
-  // fetchFulfillmentDetails filtrează produsele după fulfillment-ul cu tracking = awb
-  // — fix pentru comenzile cu mai multe colete (fulfillment-uri parțiale).
-  const order = await shopify.fetchFulfillmentDetails(orderGid, awb);
-  if (!order) return;
-
-  const row = db.upsertAwb({
-    awb,
-    order_name: order.name,
-    order_created_at: order.createdAt,
-    phone: order.phone,
-    awb_created_at: payload.created_at,
-    total: order.total,
-    currency: order.currency,
-    items: order.items,
-    order_id: payload.order_id,
-    client_note: order.note,
-  });
-  broadcast({ type: 'awb:new', awb: row });
-  console.log(`[webhook] new AWB ${awb} for ${order.name}`);
-
-  // Get a first real status right away instead of waiting for the next poll tick
-  // — unless Sameday polling is paused (SAMEDAY_POLL_ENABLED=false), or this
-  // AWB isn't a Sameday one at all (Bookurier has no status-lookup client
-  // built yet — see isSupportedCourierName above), in which case skip this
-  // too rather than calling Sameday's API for an AWB that isn't theirs.
-  if (isSameday && process.env.SAMEDAY_POLL_ENABLED !== 'false') {
-    try {
-      const status = await sameday.getStatus(awb);
-      applySamedayUpdate(awb, status);
-    } catch (err) {
-      console.error(`[webhook] sameday status fetch failed for ${awb}`, err);
-    }
-  }
-}
-
-// --- Shopify webhook: orders/cancelled -----------------------------------
-// Sameday does NOT auto-cancel the AWB when the Shopify order is cancelled,
-// so this is our own signal to pull a cancelled order out of the packing
-// flow. A cancelled order can (rarely) have more than one AWB — markOrderCancelled
-// handles all of them and we broadcast an update for each.
-app.post(
-  '/webhooks/orders-cancelled',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    try {
-      const hmac = req.get('X-Shopify-Hmac-Sha256');
-      const ok = shopify.verifyWebhookHmac(req.body, hmac, process.env.SHOPIFY_CLIENT_SECRET);
-      if (!ok) return res.status(401).send('invalid signature');
-      res.status(200).send('ok');
-
-      const payload = JSON.parse(req.body.toString('utf8'));
-      const orderId = String(payload.id);
-      const updatedRows = db.markOrderCancelled(orderId);
-      updatedRows.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-      if (updatedRows.length) {
-        console.log(`[webhook] order ${orderId} cancelled — ${updatedRows.length} AWB(s) taken out of the packing flow`);
-      }
-    } catch (err) {
-      console.error('[webhook] orders-cancelled processing error', err);
-      if (!res.headersSent) res.status(500).send('error');
-    }
-  }
-);
-
-// --- One-time setup: register Shopify webhooks ---------------------------
-// Registers this server's own webhook URLs with Shopify, authenticated as
-// THIS app (via the same client_credentials exchange used for the Admin
-// API), so webhooks end up signed with SHOPIFY_CLIENT_SECRET — the secret
-// this server actually verifies against. Guarded by that same secret as a
-// query param so it can be triggered once from a browser. Safe to call again
-// later (e.g. after adding a new webhook here) — Shopify just reports a
-// userError for any topic/URI combo that's already registered.
-const WEBHOOKS_TO_REGISTER = [
-  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/fulfillments-create' },
-  { topic: 'ORDERS_CANCELLED', path: '/webhooks/orders-cancelled' },
-];
-app.get('/admin/setup-webhook', async (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  try {
-    const results = [];
-    for (const w of WEBHOOKS_TO_REGISTER) {
-      const uri = `https://${req.get('host')}${w.path}`;
-      const data = await shopify.shopifyGraphql(
-        `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
-          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
-            webhookSubscription { id topic uri }
-            userErrors { field message }
-          }
-        }`,
-        { topic: w.topic, sub: { uri, format: 'JSON' } }
-      );
-      results.push({ topic: w.topic, ...data.webhookSubscriptionCreate });
-    }
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Diagnostic: reports the public IP this server's outbound requests use —
-// useful to hand Sameday support an exact address to check/whitelist.
-app.get('/admin/whoami', async (req, res) => {
-  try {
-    const r = await fetch('https://api.ipify.org?format=json');
-    const body = await r.json();
-    res.json({ outboundIp: body.ip });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// TEMPORARY diagnostic: shows a masked preview + length of the secret this
-// server actually has configured, so it can be visually compared against
-// what's pasted into a URL — without ever printing the full value. Remove
-// this route once the /admin/backfill-old 403 mismatch is resolved.
-function maskedPreview(s) {
-  return s.length > 8 ? `${s.slice(0, 4)}...${s.slice(-4)}` : '(too short to preview safely)';
-}
-
-app.get('/admin/secret-debug', (req, res) => {
-  const s = process.env.SHOPIFY_CLIENT_SECRET || '';
-  if (!s) return res.json({ configured: false });
-  const result = {
-    configured: true,
-    length: s.length,
-    preview: maskedPreview(s),
-  };
-  // Pass ?got=<value you're about to use in the URL> to compare it directly
-  // against the real configured secret, without ever showing either in full.
-  if (typeof req.query.got === 'string') {
-    const g = req.query.got;
-    result.got = { length: g.length, preview: maskedPreview(g), match: g === s };
-  }
-  res.json(result);
-});
-
-// TEMPORARY diagnostic: pinpoints exactly why a given code does/doesn't
-// match a row — used to debug /api/lookup returning found:false for AWBs
-// that /api/scan clearly does find. Shows the raw char codes of the queried
-// string (catches invisible whitespace / lookalike characters that a
-// screenshot can't show), the exact-match result, the same findByCode()
-// logic /api/scan and /api/lookup both use, and any row whose awb merely
-// CONTAINS the tail of the queried code (catches base-vs-suffix mismatches).
-app.get('/admin/debug-awb', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const code = String(req.query.code || '');
-  if (!code) return res.status(400).json({ error: 'missing code query param' });
-  const exactMatch = db.getAwb(code);
-  const findByCodeResult = db.findByCode(code);
-  const tail = code.slice(-8);
-  const similarRows = db.db
-    .prepare('SELECT awb, order_name, scan_note, order_id, packed, cancelled FROM awbs WHERE awb LIKE ?')
-    .all(`%${tail}%`);
-  res.json({
-    queried: code,
-    queriedLength: code.length,
-    queriedCharCodes: Array.from(code).map((c) => c.charCodeAt(0)),
-    exactMatch,
-    findByCodeResult,
-    similarRows,
-  });
-});
-
-// One-time (or occasional) manual pull of older AWBs — the automatic
-// backfillToday() only ever looks at today. This brings AWBs from the last
-// N days into the new system, e.g. so anything still unpacked from before
-// the webhook went live shows up here too. Guarded the same way as the
-// other /admin routes. Usage: /admin/backfill-old?secret=...&days=7
-app.get('/admin/backfill-old', async (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const days = Math.max(1, Math.min(60, parseInt(req.query.days, 10) || 7));
-  const debug = req.query.debug === '1';
-  try {
-    const result = await backfillRange(days, debug);
-    const added = debug ? result.added : result;
-    if (added) broadcast({ type: 'refresh' });
-    res.json(debug ? { ...result, days } : { added, days });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// One-off cleanup for the now-removed auto-pack-from-courier bug: some AWBs
-// got marked packed within moments of their label being printed, without
-// anyone actually scanning them (see db.js findFalsePackedCandidates for the
-// exact detection rule). Dry-run by default — lists what would be reset;
-// pass &apply=1 to actually reset them back to unpacked so they return to
-// the normal picking list. Usage: /admin/fix-false-packed?secret=...
-// (add &apply=1 once the dry-run list looks right; &maxAgeMin=N to widen/
-// narrow the "packed within N minutes of creation" window, default 15).
-app.get('/admin/fix-false-packed', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const maxAgeMin = Math.max(1, Math.min(180, parseInt(req.query.maxAgeMin, 10) || 15));
-  const apply = req.query.apply === '1';
-  try {
-    const candidates = db.findFalsePackedCandidates(maxAgeMin);
-    if (!apply) {
-      return res.json({
-        dryRun: true,
-        maxAgeMin,
-        count: candidates.length,
-        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at })),
-        hint: 'Looks right? Re-run the same URL with &apply=1 to reset these to unpacked.',
-      });
-    }
-    const updated = db.resetFalsePacked(candidates.map((r) => r.awb));
-    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-    res.json({ applied: true, maxAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Reset în masă al flagului "stoc lipsă" — șterge marcajul de pe TOATE
-// AWB-urile curent flagate (nu le împachetează, doar le scoate din
-// panoul "🚫 Produse lipsă" / bara galbenă din scan.html). Dry-run by
-// default — arată ce ar șterge; adaugă &apply=1 ca să chiar aplice.
-// Usage: /admin/clear-stock-missing?secret=...  (apoi &apply=1)
-app.get('/admin/clear-stock-missing', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const apply = req.query.apply === '1';
-  try {
-    const candidates = db.listStockMissing();
-    if (!apply) {
-      return res.json({
-        dryRun: true,
-        count: candidates.length,
-        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, stock_missing_at: r.stock_missing_at })),
-        hint: 'Arată bine? Rulează același link cu &apply=1 ca să chiar șteargă flagurile.',
-      });
-    }
-    const updated = candidates.map((r) => db.clearStockMissing(r.awb));
-    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-    res.json({ applied: true, count: updated.length, awbs: updated.map((r) => r.awb) });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Diagnostic ONE-OFF (nu modifică nimic): primește lista reală de AWB-uri
-// "în așteptare de ridicare" direct din exportul Sameday (69 AWB / 67
-// comenzi, dat de utilizator pe 26.08.2026) și verifică, unul câte unul, ce
-// știe baza noastră de date despre fiecare — găsit/negăsit, împachetat sau
-// nu, anulat sau nu, ar apărea sau nu în tabelul din scan.html. Așa vedem
-// exact unde diverge realitatea fizică (exportul Sameday) de ce arată
-// aplicația. Usage: /admin/check-sameday-export?secret=...
-const SAMEDAY_EXPORT_AWBS_260826 = ['1ONB24528264540', '1ONBCS528264074', '1ONB24528264073', '1ONBCS528263826', '1ONB24528257796', '1ONB24528252751', '1ONB24528246046', '1ONB24528246023', '1ONB24528225110', '1ONB24528223355', '1ONB24528223243', '1ONB24528223201', '1ONB24528223152', '1ONB24528181253', '1ONB24528181237', '1ONB24528181215', '1ONB24528181076', '1ONB24528114507', '1ONB24528111569', '1ONB24528111455', '1ONB24528092675', '1ONB24528092662', '1ONB24528087234', '1ONB24528083761', '1ONB24528083687', '1ONB24528083634', '1ONB24528083607', '1ONB24527906874', '1ONB24527890249', '1ONB24527883152', '1ONB24527875435', '1ONB24527874098', '1ONB24527866812', '1ONB24527861220', '1ONB24527860447', '1ONB24527860201', '1ONB24527840087', '1ONBLN527838962', '1ONBRS527837980', '1ONB24527799935', '1ONB24527799861', '1ONB24527699680', '1ONB24527556205', '1ONB24527556147', '1ONB24527554182', '1ONB24527554092', '1ONB24527553473', '1ONB24527553455', '1ONB24527553443', '1ONB24527553436', '1ONB24527553360', '1ONB24527200573', '1ONB24527195552', '1ONB24527189831', '1ONB24527181127', '1ONB24527179315', '1ONB24527148331', '1ONB24527036861', '1ONB24526881809', '1ONB24526879573', '1ONB24526878187', '1ONB24526840036', '1ONB24526829642', '1ONB24526829529', '1ONB24526776835', '1ONB24526776816', '1ONB24526145919', '1ONB24525798837', '1ONB24517558158'];
-app.get('/admin/check-sameday-export', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  try {
-    function samedayToneCrit(status) {
-      const t = (status || '').toLowerCase();
-      return t.includes('anulat');
-    }
-    const results = SAMEDAY_EXPORT_AWBS_260826.map((awb) => {
-      const row = db.getAwb(awb);
-      if (!row) return { awb, found: false };
-      const wouldShowInPicklist = !row.cancelled && !row.packed && !samedayToneCrit(row.sameday_status);
-      return {
-        awb,
-        found: true,
-        order_name: row.order_name,
-        packed: !!row.packed,
-        cancelled: !!row.cancelled,
-        sameday_status: row.sameday_status,
-        first_scan_at: row.first_scan_at,
-        wouldShowInPicklist,
-      };
-    });
-    const notFound = results.filter((r) => !r.found);
-    const packedNotScanned = results.filter((r) => r.found && r.packed && !r.first_scan_at);
-    const hiddenAsAnulat = results.filter((r) => r.found && !r.packed && !r.cancelled && samedayToneCrit(r.sameday_status));
-    const shouldShowButMissing = results.filter((r) => r.found && !r.wouldShowInPicklist && !r.packed);
-    res.json({
-      totalChecked: results.length,
-      notFoundCount: notFound.length,
-      notFound,
-      packedNotScannedCount: packedNotScanned.length,
-      packedNotScanned,
-      hiddenAsAnulatCount: hiddenAsAnulat.length,
-      hiddenAsAnulat,
-      all: results,
-      hint: 'notFound = AWB-uri din exportul Sameday care lipsesc complet din baza noastră (niciodată sincronizate din Shopify). packedNotScanned = marcate greșit "împachetat" fără scanare reală, deși Sameday încă le arată ca așteptând ridicare.',
-    });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Diagnostic (nu modifică nimic): AWB-uri încă NEÎMPACHETATE (packed=0,
-// cancelled=0 în baza de date — deci FAC parte din /api/unpacked) al căror
-// text de status Sameday conține "anulat". scan.html le ascunde din tabelul
-// "De pregătit pentru curier" (vezi isPickable()) considerându-le "cursă
-// anulată de curier", DAR asta e diferit de order.cancelled (care vine doar
-// din webhook-ul orders/cancelled din Shopify) — dacă Sameday zice "anulat"
-// dintr-un motiv care nu înseamnă că marfa nu mai trebuie ambalată (ex. un
-// AWB anulat și refăcut, sau un text ambiguu), comanda dispare vizual din
-// listă deși contează încă drept "neîmpachetată" — exact tiparul "65 vs 53".
-// Usage: /admin/diagnose-hidden-unpacked?secret=...
-app.get('/admin/diagnose-hidden-unpacked', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  try {
-    const unpacked = db.listUnpackedNotCancelled();
-    const hidden = unpacked.filter((r) => (r.sameday_status || '').toLowerCase().includes('anulat'));
-    res.json({
-      totalUnpackedNotCancelled: unpacked.length,
-      hiddenByAnulatFilter: hidden.length,
-      hidden: hidden.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status, sameday_checked_at: r.sameday_checked_at })),
-      hint: 'Astea sunt "neîmpachetate" în baza de date, dar NU apar în tabelul de pe scan.html din cauza cuvântului "anulat" în statusul Sameday. Verifică manual dacă chiar sunt anulate.',
-    });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Reconciliation: some orders are fulfilled through the older/other process
-// and never get a manual scan at this app's station — for those, Sameday's
-// own tracking is the only proof they actually shipped. The live poller
-// already does this gradually every 30s (see applySamedayUpdate above); this
-// sweeps everything currently unpacked right now, for an immediate catch-up
-// instead of waiting on the poll cycle. Same dry-run-first pattern as
-// /admin/fix-false-packed. Usage: /admin/reconcile-sameday?secret=...
-// (add &apply=1 once the list looks right; &minAgeMin=N to change the "must
-// be at least this old" safety window, default 30 — matches
-// MIN_AWB_AGE_FOR_AUTO_PACK_MS).
-app.get('/admin/reconcile-sameday', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const minAgeMin = Math.max(1, Math.min(1440, parseInt(req.query.minAgeMin, 10) || 30));
-  const apply = req.query.apply === '1';
-  try {
-    const candidates = reconcileWithSameday(minAgeMin);
-    if (!apply) {
-      return res.json({
-        dryRun: true,
-        minAgeMin,
-        count: candidates.length,
-        awbs: candidates.map((r) => ({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, sameday_status: r.sameday_status })),
-        hint: 'Looks right? Re-run the same URL with &apply=1 to mark these packed.',
-      });
-    }
-    const whenIso = new Date().toISOString();
-    const updated = candidates.map((r) => db.markPackedFromReconciliation(r.awb, r.sameday_checked_at || whenIso));
-    updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-    res.json({ applied: true, minAgeMin, count: updated.length, awbs: updated.map((r) => r.awb) });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// Diagnostic (nu modifică nimic): găsește AWB-urile marcate "împachetat" DAR
-// niciodată scanate fizic la stație (first_scan_at gol) — adică au fost
-// "împachetate" automat de reconcilierea cu Sameday (applySamedayUpdate ->
-// markPackedFromReconciliation), pe baza textului de status. Unele sunt
-// corecte (comenzi onorate prin celălalt proces, mai vechi). Altele pot fi
-// FALSE POZITIVE: coletul stă încă fizic neîmpachetat, dar Sameday are un
-// text de status care nu se potrivește cu PENDING_PICKUP_PHRASES, deci a
-// fost interpretat greșit ca "ridicat de curier". Grupat pe text de status
-// exact, ca să se vadă rapid ce formulare lipsește din listă.
-// Usage: /admin/diagnose-false-packed?secret=...
-app.get('/admin/diagnose-false-packed', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  try {
-    const allPacked = db.listAllPacked ? db.listAllPacked() : db.db.prepare('SELECT * FROM awbs WHERE packed = 1 AND cancelled = 0').all();
-    const neverScanned = allPacked.filter((r) => r.packed && !r.cancelled && !r.first_scan_at);
-    const byStatus = new Map();
-    for (const r of neverScanned) {
-      const key = r.sameday_status || '(fără status)';
-      if (!byStatus.has(key)) byStatus.set(key, []);
-      byStatus.get(key).push({ awb: r.awb, order_name: r.order_name, awb_created_at: r.awb_created_at, packed_at: r.packed_at });
-    }
-    const groups = [...byStatus.entries()]
-      .sort((a, b) => b[1].length - a[1].length)
-      .map(([status, rows]) => ({ sameday_status: status, count: rows.length, sample: rows.slice(0, 15) }));
-    res.json({
-      totalPackedNotCancelled: allPacked.filter((r) => !r.cancelled).length,
-      neverScannedCount: neverScanned.length,
-      groups,
-      hint: 'Verifică manual dacă comenzile din grupurile de mai jos chiar au plecat. Dacă nu, adaugă formularea lor de status în PENDING_PICKUP_PHRASES din server.js.',
-    });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// The live poller (see startPoller below) only checks Sameday status for
-// AWBs created today/yesterday — on purpose, so it doesn't hammer Sameday's
-// API with thousands of requests every 30s for orders that settled long ago.
-// The tradeoff: for AWBs older than that, sameday_status in the DB can be
-// stale or (for very old backlog) never fetched at all, so the cache-based
-// /admin/reconcile-sameday above has nothing to work with for them. This
-// does the same reconciliation but fetches a FRESH live status per AWB first
-// — same 200ms throttle as the poller — then feeds it through the same
-// applySamedayUpdate() used everywhere else, so the normal 30-min-age +
-// status rules still apply. Meant for the historical backlog, not routine
-// use. Runs in the background (the HTTP response returns immediately) since
-// a few thousand AWBs at ~200ms each can take several minutes — watch the
-// Deploy Logs for "[backfill-status]" progress lines. Usage:
-// /admin/backfill-sameday-status?secret=...&limit=3000
-let backfillStatusRunning = false;
-async function backfillSamedayStatusLive(rows) {
-  let ok = 0;
-  let failed = 0;
-  for (const row of rows) {
-    try {
-      const status = await sameday.getStatus(row.awb);
-      applySamedayUpdate(row.awb, status);
-      ok++;
-    } catch (err) {
-      failed++;
-      console.error(`[backfill-status] ${row.awb} failed`, err.message || err);
-    }
-    if ((ok + failed) % 100 === 0) {
-      console.log(`[backfill-status] progress ${ok + failed}/${rows.length} (${ok} ok, ${failed} failed)`);
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  console.log(`[backfill-status] done — ${ok} ok, ${failed} failed out of ${rows.length}`);
-}
-
-app.get('/admin/backfill-sameday-status', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  if (backfillStatusRunning) {
-    return res.status(409).json({ error: 'a backfill is already running — check Deploy Logs for [backfill-status] progress' });
-  }
-  const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 3000));
-  const rows = db.listUnpackedNotCancelled().slice(0, limit);
-  backfillStatusRunning = true;
-  backfillSamedayStatusLive(rows).finally(() => {
-    backfillStatusRunning = false;
-  });
-  res.json({
-    started: true,
-    total: rows.length,
-    etaMinutes: Math.ceil((rows.length * 0.2) / 60),
-    hint: 'Running in background — watch Deploy Logs for [backfill-status] lines, or just refresh the dashboard in a few minutes.',
-  });
-});
-
-// Backfill order_id on old AWB rows that predate order_id tracking. The
-// normal Shopify crawl (backfillToday/backfillRange) only sets order_id on
-// AWBs it's inserting for the FIRST time — it skips (`if (existing) continue`)
-// any AWB already present in the DB, so old rows stay with order_id = NULL
-// forever. That in turn makes /admin/reconcile-with-shopify skip them (no ID
-// to query Shopify with). This looks each one up by order_name instead
-// (which every row does have) and fills in order_id directly. Dry-run first,
-// same pattern as the other /admin/* routes. Usage:
-// /admin/backfill-order-ids?secret=...  (add &apply=1 once it looks right)
-async function backfillOrderIds(rows) {
-  const results = [];
-  for (const row of rows) {
-    try {
-      const orderId = await shopify.findOrderIdByName(row.order_name);
-      results.push({ awb: row.awb, order_name: row.order_name, orderId, action: orderId ? 'set' : 'not-found' });
-    } catch (err) {
-      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return results;
-}
-
-let backfillOrderIdsRunning = false;
-app.get('/admin/backfill-order-ids', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  if (backfillOrderIdsRunning) {
-    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-order-ids] progress' });
-  }
-  const apply = req.query.apply === '1';
-  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
-  const rows = db.listUnpackedNotCancelled().filter((r) => !r.order_id).slice(0, limit);
-  backfillOrderIdsRunning = true;
-  (async () => {
-    try {
-      const results = await backfillOrderIds(rows);
-      const toSet = results.filter((r) => r.action === 'set');
-      const notFound = results.filter((r) => r.action === 'not-found');
-      const errors = results.filter((r) => r.action === 'error');
-      console.log(`[backfill-order-ids] scanned ${results.length} — ${toSet.length} found, ${notFound.length} not found, ${errors.length} errors`);
-      if (apply) {
-        toSet.forEach((r) => db.setOrderId(r.awb, r.orderId));
-        console.log(`[backfill-order-ids] applied — set order_id on ${toSet.length} AWB(s)`);
-      }
-      global.__lastBackfillOrderIdsResult = { apply, count: results.length, toSet, notFound, errors, finishedAt: new Date().toISOString() };
-    } catch (err) {
-      console.error('[backfill-order-ids] failed', err);
-      global.__lastBackfillOrderIdsResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
-    } finally {
-      backfillOrderIdsRunning = false;
-    }
-  })();
-  res.json({
-    started: true,
-    apply,
-    total: rows.length,
-    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
-    hint: 'Running in background — poll /admin/backfill-order-ids-result?secret=... for the outcome, or watch Deploy Logs for [backfill-order-ids].',
-  });
-});
-
-app.get('/admin/backfill-order-ids-result', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  res.json(global.__lastBackfillOrderIdsResult || { hint: 'no run recorded yet in this process' });
-});
-
-// /admin/backfill-phones?secret=...  (add &apply=1 once it looks right)
-// The `phone` column was added 2026-08-27 — every AWB row created before
-// that has it blank. This fills it in for old rows that already have an
-// order_id (so we can fetch the order straight by GID, no name lookup
-// needed) but no phone yet. Same background-job + dry-run pattern as
-// backfill-order-ids above.
-async function backfillPhones(rows) {
-  const results = [];
-  for (const row of rows) {
-    try {
-      const order = await shopify.fetchOrderDetails(`gid://shopify/Order/${row.order_id}`);
-      const phone = order && order.phone ? order.phone : '';
-      results.push({ awb: row.awb, order_name: row.order_name, phone, action: phone ? 'set' : 'no-phone' });
-    } catch (err) {
-      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return results;
-}
-
-let backfillPhonesRunning = false;
-app.get('/admin/backfill-phones', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  if (backfillPhonesRunning) {
-    return res.status(409).json({ error: 'already running — check Deploy Logs for [backfill-phones] progress' });
-  }
-  const apply = req.query.apply === '1';
-  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
-  const rows = db.listMissingPhone(limit);
-  backfillPhonesRunning = true;
-  (async () => {
-    try {
-      const results = await backfillPhones(rows);
-      const toSet = results.filter((r) => r.action === 'set');
-      const noPhone = results.filter((r) => r.action === 'no-phone');
-      const errors = results.filter((r) => r.action === 'error');
-      console.log(`[backfill-phones] scanned ${results.length} — ${toSet.length} found, ${noPhone.length} fara telefon in Shopify, ${errors.length} erori`);
-      if (apply) {
-        toSet.forEach((r) => db.setPhone(r.awb, r.phone));
-        console.log(`[backfill-phones] applied — set phone on ${toSet.length} AWB(s)`);
-        broadcast({ type: 'refresh' }); // paginile deschise re-fetch ca să vadă telefoanele noi
-      }
-      global.__lastBackfillPhonesResult = { apply, count: results.length, toSet, noPhone, errors, finishedAt: new Date().toISOString() };
-    } catch (err) {
-      console.error('[backfill-phones] failed', err);
-      global.__lastBackfillPhonesResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
-    } finally {
-      backfillPhonesRunning = false;
-    }
-  })();
-  res.json({
-    started: true,
-    apply,
-    total: rows.length,
-    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
-    hint: 'Running in background — poll /admin/backfill-phones-result?secret=... for the outcome, or watch Deploy Logs for [backfill-phones].',
-  });
-});
-
-app.get('/admin/backfill-phones-result', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  res.json(global.__lastBackfillPhonesResult || { hint: 'no run recorded yet in this process' });
-});
-
-// Safety-net revert: undoes an incorrect "packed" mark for a specific list
-// of AWBs, given as a comma-separated query param. Built for the incident
-// where an earlier version of /admin/reconcile-with-shopify wrongly marked
-// recently-created (still awaiting courier pickup) AWBs as packed, based on
-// Shopify's displayFulfillmentStatus alone — see the correctness note above
-// reconcileWithShopify. Reuses db.resetPacked (packed=0, packed_at=NULL,
-// first_scan_at=NULL) — harmless for these rows since first_scan_at was
-// already NULL (they were reconciled, never manually scanned). Usage:
-// /admin/revert-packed?secret=...&awbs=AWB1,AWB2,...
-app.get('/admin/revert-packed', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  const awbs = String(req.query.awbs || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (!awbs.length) return res.status(400).json({ error: 'missing awbs (comma-separated query param)' });
-  const before = awbs.map((awb) => db.getAwb(awb)).filter(Boolean);
-  const stillPacked = before.filter((r) => r.packed);
-  const updated = db.resetFalsePacked(stillPacked.map((r) => r.awb));
-  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-  res.json({ requested: awbs.length, found: before.length, reverted: updated.length, awbs: updated.map((r) => r.awb) });
-});
-
-// Reconciliation against SHOPIFY itself (not Sameday) — for the specific
-// case of old backlog AWBs where Sameday's own status lookup comes back
-// empty/erroring (so /admin/reconcile-sameday and the status backfill have
-// nothing to work with), but Shopify's order record already tells the truth:
-// either the order was cancelled (and our own `cancelled` flag never got set
-// because it predates the orders/cancelled webhook), or the order shows
-// FULFILLED — meaning a courier scan already happened somewhere, just not
-// through this app's own Sameday-status pipeline (e.g. shipped manually by
-// an operator under a different/legacy process). Same dry-run-first pattern
-// as the other /admin/reconcile-* routes. Usage:
-// /admin/reconcile-with-shopify?secret=...  (add &apply=1 once it looks right)
-// CORRECTNESS NOTE (learned the hard way): Shopify's displayFulfillmentStatus
-// turns "FULFILLED" the instant a fulfillment record with tracking exists —
-// i.e. the moment an AWB label is created, same trigger as our own
-// awb_created_at. It does NOT mean the courier physically picked it up. An
-// earlier version of this function used bare displayFulfillmentStatus to
-// decide "pack", which wrongly marked recently-created (still awaiting
-// pickup) AWBs as packed — the exact same false-positive shape as the
-// original incident this whole app was built to avoid. The only safe "pack"
-// signal from Shopify is a genuinely SEPARATE completed fulfillment: one
-// whose tracking number does NOT match the AWB we already have on file for
-// this row (proof a real, different shipment already went out, e.g. through
-// a manual/legacy process). A fulfillment carrying the SAME awb we're
-// already tracking tells us nothing new — Sameday's own live status is the
-// only trustworthy source for whether THAT specific AWB was picked up.
-async function reconcileWithShopify(rows) {
-  const results = [];
-  for (const row of rows) {
-    if (!row.order_id) {
-      results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'no order_id on this row' });
-      continue;
-    }
-    try {
-      const data = await shopify.shopifyGraphql(
-        `query($id: ID!) { order(id: $id) { cancelledAt fulfillments(first: 10) { status trackingInfo(first: 1) { number } } } }`,
-        { id: `gid://shopify/Order/${row.order_id}` }
-      );
-      const o = data.order;
-      if (!o) {
-        results.push({ awb: row.awb, order_name: row.order_name, action: 'skip', reason: 'order not found in Shopify' });
-      } else if (o.cancelledAt) {
-        results.push({ awb: row.awb, order_name: row.order_name, order_id: row.order_id, action: 'cancel', cancelledAt: o.cancelledAt });
-      } else {
-        const otherShipment = (o.fulfillments || []).find((f) => {
-          if (f.status !== 'SUCCESS') return false;
-          const num = f.trackingInfo && f.trackingInfo[0] && f.trackingInfo[0].number;
-          return num && num !== row.awb;
-        });
-        if (otherShipment) {
-          results.push({ awb: row.awb, order_name: row.order_name, action: 'pack', otherTrackingNumber: otherShipment.trackingInfo[0].number });
-        } else {
-          results.push({ awb: row.awb, order_name: row.order_name, action: 'none' });
-        }
-      }
-    } catch (err) {
-      results.push({ awb: row.awb, order_name: row.order_name, action: 'error', error: String(err.message || err) });
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return results;
-}
-
-let reconcileShopifyRunning = false;
-app.get('/admin/reconcile-with-shopify', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  if (reconcileShopifyRunning) {
-    return res.status(409).json({ error: 'already running — check Deploy Logs for [reconcile-shopify] progress' });
-  }
-  const apply = req.query.apply === '1';
-  const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 3000));
-  const rows = db.listUnpackedNotCancelled().slice(0, limit);
-  reconcileShopifyRunning = true;
-  (async () => {
-    try {
-      const results = await reconcileWithShopify(rows);
-      const toCancel = results.filter((r) => r.action === 'cancel');
-      const toPack = results.filter((r) => r.action === 'pack');
-      const errors = results.filter((r) => r.action === 'error');
-      console.log(`[reconcile-shopify] scanned ${results.length} — ${toCancel.length} to cancel, ${toPack.length} to pack, ${errors.length} errors`);
-      if (apply) {
-        const cancelledOrderIds = new Set();
-        for (const r of toCancel) {
-          if (cancelledOrderIds.has(r.order_id)) continue;
-          cancelledOrderIds.add(r.order_id);
-          db.markOrderCancelled(r.order_id).forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-        }
-        for (const r of toPack) {
-          const row = db.markPackedFromReconciliation(r.awb, new Date().toISOString());
-          if (row) broadcast({ type: 'awb:update', awb: row });
-        }
-        console.log(`[reconcile-shopify] applied — cancelled ${cancelledOrderIds.size} order(s), packed ${toPack.length} AWB(s)`);
-      }
-      global.__lastReconcileShopifyResult = { apply, count: results.length, toCancel, toPack, errors, finishedAt: new Date().toISOString() };
-    } catch (err) {
-      console.error('[reconcile-shopify] failed', err);
-      global.__lastReconcileShopifyResult = { apply, error: String(err.message || err), finishedAt: new Date().toISOString() };
-    } finally {
-      reconcileShopifyRunning = false;
-    }
-  })();
-  res.json({
-    started: true,
-    apply,
-    total: rows.length,
-    etaMinutes: Math.ceil((rows.length * 0.25) / 60),
-    hint: 'Running in background — poll /admin/reconcile-with-shopify-result?secret=... for the outcome, or watch Deploy Logs for [reconcile-shopify].',
-  });
-});
-
-app.get('/admin/reconcile-with-shopify-result', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
-});
-
-// --- Re-backfill items per fulfillment -----------------------------------
-// Endpoint nou (2026-10-14) care re-fetchuiește produsele pentru AWB-urile
-// deja în DB, folosind noua logică fetchFulfillmentDetails (filtrată după AWB,
-// nu după toată comanda). Necesar pentru AWB-urile create înainte de fix, care
-// au în items_json toate produsele comenzii în loc de cele din coletul lor.
-//
-// Opțional: ?awb=BOK123 — re-fetchuiește doar un AWB specific.
-// Fără parametru: re-fetchuiește TOATE AWB-urile active cu order_id.
-// Usage: /admin/rebackfill-fulfillment-items?secret=...&awb=BOK3732254
-//        /admin/rebackfill-fulfillment-items?secret=...   (toate)
-let rebackfillFulfillmentRunning = false;
-app.get('/admin/rebackfill-fulfillment-items', (req, res) => {
-  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
-    return res.status(403).send('forbidden');
-  }
-  if (rebackfillFulfillmentRunning) {
-    return res.status(409).json({ error: 'already running — check Deploy Logs for [rebackfill-fulfillment] progress' });
-  }
-  const targetAwb = req.query.awb || null;
-  res.json({ hint: 'Running in background — watch Deploy Logs for [rebackfill-fulfillment] progress.' });
-  rebackfillFulfillmentRunning = true;
-  (async () => {
-    try {
-      let rows;
-      if (targetAwb) {
-        const r = db.db.prepare('SELECT awb, order_id FROM awbs WHERE awb = ? AND order_id IS NOT NULL').get(targetAwb);
-        rows = r ? [r] : [];
-      } else {
-        rows = db.db.prepare("SELECT awb, order_id FROM awbs WHERE order_id IS NOT NULL AND packed_at IS NULL").all();
-      }
-      console.log(`[rebackfill-fulfillment] ${rows.length} AWB(s) to process`);
-      let ok = 0, fail = 0;
-      for (const row of rows) {
-        try {
-          const order = await shopify.fetchFulfillmentDetails(`gid://shopify/Order/${row.order_id}`, row.awb);
-          if (!order || !order.items || !order.items.length) { fail++; continue; }
-          db.db.prepare('UPDATE awbs SET items_json = ?, total = ?, currency = ? WHERE awb = ?')
-            .run(JSON.stringify(order.items), order.total, order.currency, row.awb);
-          const updated = db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(row.awb);
-          if (updated) broadcast({ type: 'awb:update', awb: updated });
-          ok++;
-          if (ok % 10 === 0) console.log(`[rebackfill-fulfillment] progress: ${ok} done, ${fail} failed`);
-          await new Promise(r => setTimeout(r, 200)); // throttle Shopify API
-        } catch (err) {
-          console.error(`[rebackfill-fulfillment] failed for ${row.awb}:`, err.message);
-          fail++;
-        }
-      }
-      console.log(`[rebackfill-fulfillment] done — ${ok} updated, ${fail} failed`);
-    } catch (err) {
-      console.error('[rebackfill-fulfillment] outer error:', err);
-    } finally {
-      rebackfillFulfillmentRunning = false;
-    }
-  })();
-});
-
-// --- REST API -----------------------------------------------------------
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// PWA Icons — servite direct din cod, fără fișiere binare externe
-const _icon192 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAACiklEQVR4nO3SUW7TUBRF0cyAGTIEpp6fKN8IFRUITmJ7u312s6Q1gHN19+l6OW/l24/vHMKGTz9phTefFNDwO/lQHxjQ8Nv4NBsHNPwehtggoOE3MNz6gIZPZyfWBDR8NLuyLKDhc9mhuQENH8puPQ9o+ER2TkAkjwIaPo5DEBDJdEDDZ3EgAiK5DWj4IA5HQCR/Aho+hYMSEImASAREIiASAZEIiORXQMNHcGgCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgktP1ch4+goO6Xs4CYj0BkQiIREAkAiIREMnvgDTECm/lCIiV/glIQyzyno2AWGMiIA0x09/NCIjF7gakIZ66CUZALPMkIA3xwP+1TASkISZNpjIdkIa4ca+TuwFpiHcPInkUkIZ4XM/zgGT0yua0MSsgGb2a+VUsCEhGr2BpD4sDktFXta6ElQGp6tA2fPpPhakygRMOf1wAAAAASUVORK5CYII=', 'base64');
-const _icon512 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAIw0lEQVR4nO3V220lVRRFUWdAhoRA6v6x/I0QqAG3276PqtpVZw5pBHAe0pov72+va/jtj98BDjA+d1t5GT+BfQcWMz6Ylw/A+BcCbGJ8Tq8RgPF/AtjV+MyeLgDjXwJwsPHhnQ/A+B8CDCoGYPzRAU4lEYDxVwY4rWUDMP6yAJewWgDGHxTgQhYJwPg7AlzUhQMw/nYAC7heAMafDGAZVwrA+GMBLOYCARh/I4CFnTcA408DsLwzBmD8UQAizhWA8ecASDlLAMYfAiBoOADj9weImwnA+LUBeKYBAgBwbUcHYPzCAPxwXADGrwrAB0cEYPySAHxq3wCMXw+AL+wVgPGLAfAtAQCI2j4A41cC4EZbBmD8MgDcZZsAjF8DgAcIAEDUswEYvwAADxMAgKjHAzB+dACe9EgAxg8NwCYEACDqvgCMHxeADQkAQNStARg/KACbEwCAKAEAiPo+AONHBGAnAgAQ9VUAxg8HwK4EACBKAACiPg/A+LEAOIAAAEQJAECUAABECQBAlAAARAkAQJQAAEQJAECUAABECQBAlAAARP0TAA0ASPl7+QUAIEcAAKIEACBKAACi/hcADQCI+DH7AgDQIgAAUQIAEPVJADQAYHn/3XwBAAgRAICoXwZAAwAW9mHwBQCg4psAaADAkn5eewEASBAAgKibAqABAIv5dOoFAGB9dwRAAwCW8audFwCAxd0dAA0AWMAXI/9VADQA4NK+XngBAFjWUwHQAICL+nbeBQBgTRsEQAMALueWbb8pABoAcCE3DvutAdAAgEu4fdUFAGApuwRAAwBO7q5Jvy8AGgBwWvfu+d0B0ACAE3pgzB8JgAYAnMpjS/5gADQA4CQennEBALi2gQBoAMC4Zzb8qQDIAMCU59d7gwBoAMDBNpnubQKgAQCH2Wq3NwuABgAcYMPR3jIAGgCwq20Xe+MAyADAHvbY6l0CoAEAG9ppqPcKgAYAbGK/ld4xADIA8Iy993n3AMgAwL2OWeaDAqABADc6bJaPC4AMAHzt4EE+OgAyAPCzkSmeCYASAEzt/lkCIANA0/jwniUASgBEjM/seQMgBsB6xuf0egHQA+CixgdztQAoBHAS43O3lT8BbBwFRedDN1EAAAAASUVORK5CYII=', 'base64');
-app.get('/icon-192.png', (_req, res) => { res.set('Content-Type','image/png').send(_icon192); });
-app.get('/icon-512.png', (_req, res) => { res.set('Content-Type','image/png').send(_icon512); });
-
-app.get('/api/days', (req, res) => {
-  res.json({ days: db.listDays() });
-});
-
-app.get('/api/today', (req, res) => {
-  const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
-  res.json({ day, rows: db.listForDay(day) });
-});
-
-app.get('/api/day/:day', (req, res) => {
-  res.json({ day: req.params.day, rows: db.listForDay(req.params.day) });
-});
-
-// --- Dashboard "packed/shipped" view (grouped by pack date, not AWB
-// creation date — see db.js listPackedDays/listPackedForDay) -------------
-app.get('/api/packed-days', (req, res) => {
-  res.json({ days: db.listPackedDays() });
-});
-
-app.get('/api/packed-day/:day', (req, res) => {
-  res.json({ day: req.params.day, rows: db.listPackedForDay(req.params.day) });
-});
-
-// Per-day summary — how many parcels got packed each day and their total
-// value, pre-aggregated server-side (see db.listPackedSummary). Powers the
-// "sumar pe zile" list on the dashboard, newest day first.
-app.get('/api/packed-summary', (req, res) => {
-  res.json({ days: db.listPackedSummary() });
-});
-
-app.get('/api/unpacked-count', (req, res) => {
-  res.json({ count: db.countUnpacked() });
-});
-
-// --- Reconciliation: courier pickup vs warehouse scan --------------------
-// Two distinct mismatch shapes, both surfaced for the dashboard's
-// "Reconciliere" panel:
-//   - pickedUpNotScanned: Sameday's own status shows the courier already
-//     has it, but this row was never scanned at the station (packed here
-//     only via the background Sameday reconciliation pass — first_scan_at
-//     is NULL). It left the warehouse without our own confirmation.
-//   - scannedNotPickedUp: a REAL station scan confirmed it packed (first_
-//     scan_at is set) a while ago (minAgeHours, default 3h — long enough
-//     that this isn't just normal courier-status lag), but Sameday still
-//     doesn't show a pickup.
-// Reuses samedayIndicatesPickedUp(), the same status-text rule the live
-// poller and /admin/reconcile-sameday already use, so "picked up" means the
-// same thing everywhere in this app. Not day-scoped — an anomaly from a
-// couple of days ago is still worth a human's attention, not just today's.
-app.get('/api/reconciliation', (req, res) => {
-  const minAgeHours = Math.max(0, Math.min(72, parseFloat(req.query.minAgeHours) || 3));
-  const minAgeMs = minAgeHours * 3600 * 1000;
-  const now = Date.now();
-  const packed = db.listPackedNotCancelled();
-
-  const pickedUpNotScanned = packed
-    .filter((r) => !r.first_scan_at && samedayIndicatesPickedUp(r.sameday_status))
-    .sort((a, b) => (b.packed_at || '').localeCompare(a.packed_at || ''));
-
-  const scannedNotPickedUp = packed
-    .filter((r) => r.first_scan_at && r.packed_at && !samedayIndicatesPickedUp(r.sameday_status) && now - new Date(r.packed_at).getTime() >= minAgeMs)
-    .sort((a, b) => (a.packed_at || '').localeCompare(b.packed_at || ''));
-
-  res.json({ minAgeHours, pickedUpNotScanned, scannedNotPickedUp });
-});
-
-// Full list of every AWB that exists (has a printed label) but is neither
-// packed nor cancelled — across ALL days, not just today. This is the real
-// "still owed to a courier" backlog: unlike /api/today (which is scoped to
-// today's creation date, for the scan-station picking list), this covers
-// everything regardless of when the AWB was created.
-app.get('/api/unpacked', (req, res) => {
-  const rows = db.listUnpackedNotCancelled().sort((a, b) => new Date(a.awb_created_at) - new Date(b.awb_created_at));
-  res.json({ count: rows.length, rows });
-});
-
-app.get('/api/lookup/:code', (req, res) => {
-  const row = findByCodeFlexible(req.params.code);
-  if (!row) return res.status(404).json({ found: false });
-  res.json({ found: true, row });
-});
-
-app.post('/api/scan', (req, res) => {
-  const { code } = req.body || {};
-  if (!code) return res.status(400).json({ error: 'missing code' });
-  const row = findByCodeFlexible(code);
-  if (!row) return res.status(404).json({ found: false });
-  const result = db.recordScan(row.awb, new Date().toISOString(), PACK_WINDOW_MS);
-
-  // Răspundem IMEDIAT — scanerul nu mai așteaptă Shopify.
-  // Nota + tag-ul se scriu în fundal și se broadcast-ează când sunt gata.
-  if (result.kind && result.kind !== 'already' && result.kind !== 'blocked') {
-    broadcast({ type: 'awb:update', awb: result.row });
-  }
-  res.json({ found: true, kind: result.kind, row: result.row });
-
-  // --- Shopify note + client_note (fire-and-forget, în fundal) --------------
-  if (result.kind === 'first' && result.row.order_id) {
-    const stamp = new Date().toLocaleString('ro-RO', {
-      timeZone: 'Europe/Bucharest',
-      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
-    });
-    const line = `Scanat la depozit: ${stamp}`;
-    (async () => {
-      try {
-        const { originalNote, fullNote } = await shopify.appendOrderScanNote(`gid://shopify/Order/${result.row.order_id}`, line);
-        let updated = db.setScanNote(result.row.awb, fullNote);
-        if (originalNote) updated = db.setClientNoteIfEmpty(result.row.awb, originalNote);
-        broadcast({ type: 'awb:update', awb: updated });
-      } catch (err) {
-        console.error('[shopify] appendOrderScanNote failed for', result.row.awb, err);
-        let updated = db.setScanNote(result.row.awb, line);
-        try {
-          const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
-          if (note) updated = db.setClientNoteIfEmpty(result.row.awb, note);
-        } catch (readErr) {
-          console.error('[shopify] fallback fetchOrderNote failed for', result.row.awb, readErr);
-        }
-        broadcast({ type: 'awb:update', awb: updated });
-      }
-    })();
-  } else if (result.row.order_id && !result.row.client_note) {
-    // Scane ulterioare: citim nota clientului dacă n-o avem încă (read-only, fundal)
-    (async () => {
-      try {
-        const note = await shopify.fetchOrderNote(`gid://shopify/Order/${result.row.order_id}`);
-        if (note) {
-          const updated = db.setClientNoteIfEmpty(result.row.awb, note);
-          broadcast({ type: 'awb:update', awb: updated });
-        }
-      } catch (err) {
-        console.error('[shopify] fetchOrderNote failed for', result.row.awb, err);
-      }
-    })();
-  }
-
-  // --- Produse lipsă din items_json — trage din Shopify în fundal -------------
-  // AWB-uri create manual sau prin alte fluxuri pot ajunge fără produse.
-  // La prima scanare le populăm automat din Shopify și trimitem awb:update.
-  const hasItems = (() => {
-    try { return JSON.parse(result.row.items_json || '[]').length > 0; } catch { return false; }
-  })();
-  if (!hasItems && result.row.order_id) {
-    (async () => {
-      try {
-        // fetchFulfillmentDetails filtrează produsele după AWB-ul curier,
-        // fix pentru comenzile cu mai multe colete parțiale.
-        const order = await shopify.fetchFulfillmentDetails(`gid://shopify/Order/${result.row.order_id}`, result.row.awb);
-        if (!order || !order.items || !order.items.length) return;
-        if (db.db) {
-          db.db.prepare('UPDATE awbs SET items_json = ?, total = COALESCE(NULLIF(total, 0), ?), currency = COALESCE(NULLIF(currency, \'\'), ?) WHERE awb = ?')
-            .run(JSON.stringify(order.items), order.total, order.currency, result.row.awb);
-          const updated = db.getAwb ? db.getAwb(result.row.awb) : db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(result.row.awb);
-          if (updated) broadcast({ type: 'awb:update', awb: updated });
-          console.log(`[scan] fetched missing items for ${result.row.awb} (${order.items.length} produse)`);
-        }
-      } catch (err) {
-        console.error('[shopify] fetchFulfillmentDetails for missing items failed for', result.row.awb, err);
-      }
-    })();
-  }
-});
-
-app.post('/api/note', (req, res) => {
-  const { awb, note } = req.body || {};
-  if (!awb) return res.status(400).json({ error: 'missing awb' });
-  const row = db.setNote(awb, note || '');
-  broadcast({ type: 'awb:update', awb: row });
-  res.json({ row });
-});
-
-// --- Stock-missing flag -----------------------------------------------------
-// Staff scan the AWB first (sees the product), then scan the fixed "stoc
-// lipsă" QR code taped to the packing table — scan.html recognizes that
-// marker code client-side and calls this with the AWB it was just showing.
-// The AWB stays in the normal picking list; this only flags it for
-// visibility and feeds the "Necesar produse" panel with which orders are
-// waiting on which product. Cleared automatically when the AWB is actually
-// packed (see db.js setPacked), or manually via /clear below.
-app.post('/api/stock-missing/flag', (req, res) => {
-  const { awb } = req.body || {};
-  if (!awb) return res.status(400).json({ error: 'missing awb' });
-  const row = db.flagStockMissing(awb, new Date().toISOString());
-  if (!row) return res.status(404).json({ found: false });
-  broadcast({ type: 'awb:update', awb: row });
-  res.json({ found: true, row });
-});
-
-app.post('/api/stock-missing/clear', (req, res) => {
-  const { awb } = req.body || {};
-  if (!awb) return res.status(400).json({ error: 'missing awb' });
-  const row = db.clearStockMissing(awb);
-  if (!row) return res.status(404).json({ found: false });
-  broadcast({ type: 'awb:update', awb: row });
-  res.json({ found: true, row });
-});
-
-app.post('/api/stock-missing/reset-all', (req, res) => {
-  // Șterge flagul stock_missing de pe TOATE comenzile blocate
-  const candidates = db.listStockMissing();
-  const updated = candidates.map((r) => db.clearStockMissing(r.awb)).filter(Boolean);
-  updated.forEach((row) => broadcast({ type: 'awb:update', awb: row }));
-  res.json({ ok: true, count: updated.length });
-});
-
-// --- Returns --------------------------------------------------------------
-// AWBs Sameday currently shows as "in return" (courier bringing it back)
-// that nobody has confirmed as physically received yet — not scoped to
-// today, since a return can land days after the original order.
-app.get('/api/returns', (req, res) => {
-  res.json({ rows: db.listPendingReturns() });
-});
-
-// History: returns already confirmed as physically received (most recent
-// first, capped at 200) — separate from /api/returns above, which only
-// lists the ones still waiting for confirmation.
-app.get('/api/returns/history', (req, res) => {
-  res.json({ rows: db.listReturnHistory() });
-});
-
-// Retururi grupate pe zi (ziua în care au fost scanate ca primite fizic în
-// depozit) — vezi db.listReturnDays/listReturnsForDay. Zilele sunt string
-// "YYYY-MM-DD" (fus București), la fel ca /api/packed-days.
-app.get('/api/return-days', (req, res) => {
-  res.json({ days: db.listReturnDays() });
-});
-app.get('/api/return-day/:day', (req, res) => {
-  res.json({ day: req.params.day, rows: db.listReturnsForDay(req.params.day) });
-});
-
-// Manual confirmation scan: the box physically arrived back at the
-// warehouse. Deliberately separate from /api/scan's pack-confirmation flow
-// — scanning a returned AWB here never touches `packed`, only `return_received`.
-// If the code matches no known AWB at all (a return from another channel,
-// an older order, a typo, a damaged label), it's logged as an "unknown
-// return" instead of a plain 404 — those need a human to go find out what
-// they actually are, not silently vanish as a failed scan.
-app.post('/api/scan-return', (req, res) => {
-  const { code } = req.body || {};
-  if (!code) return res.status(400).json({ error: 'missing code' });
-  const row = findByCodeFlexible(code);
-  if (!row) {
-    const entry = db.logUnknownReturn(code, new Date().toISOString());
-    broadcast({ type: 'unknown-return:new', entry });
-    return res.json({ found: false, logged: true, entry });
-  }
-  const updated = db.markReturnReceived(row.awb, new Date().toISOString());
-  broadcast({ type: 'awb:update', awb: updated });
-  res.json({ found: true, row: updated });
-});
-
-// Unknown-return entries: listing, adding a note, and marking one resolved
-// once someone has figured out / handled what it actually was.
-app.get('/api/unknown-returns', (req, res) => {
-  res.json({ rows: db.listUnknownReturns() });
-});
-
-app.post('/api/unknown-returns/:id/note', (req, res) => {
-  const { note } = req.body || {};
-  const entry = db.setUnknownReturnNote(Number(req.params.id), note || '');
-  broadcast({ type: 'unknown-return:update', entry });
-  res.json({ entry });
-});
-
-app.post('/api/unknown-returns/:id/resolve', (req, res) => {
-  const entry = db.resolveUnknownReturn(Number(req.params.id), new Date().toISOString());
-  broadcast({ type: 'unknown-return:resolved', entry });
-  res.json({ entry });
-});
-
-// History: unknown-return entries already resolved (most recent first,
-// capped at 200).
-app.get('/api/unknown-returns/history', (req, res) => {
-  res.json({ rows: db.listResolvedUnknownReturns() });
-});
-
-// --- Checklist de achiziție pentru "🚫 Produse lipsă" ----------------------
-// Cheia (agg_key) e cheia de agregare calculată în scan.html (SKU sau
-// titlu+variantă + specsKey) — un produs lipsă e comun mai multor comenzi,
-// deci bifa "achiziționat" + cantitatea cumpărată se țin per produs, nu per
-// AWB. Broadcast pe websocket, ca toate stațiile deschise să rămână
-// sincronizate când cineva bifează de pe alt calculator/telefon.
-app.get('/api/stock-purchases', (req, res) => {
-  res.json({ rows: db.listStockPurchases() });
-});
-app.post('/api/stock-purchases', (req, res) => {
-  const { key, checked, qty } = req.body || {};
-  if (!key) return res.status(400).json({ error: 'lipsește "key"' });
-  const row = db.setStockPurchase(key, !!checked, qty, new Date().toISOString());
-  broadcast({ type: 'stock-purchase:update', row });
-  res.json({ row });
-});
-app.post('/api/stock-purchases/reset', (req, res) => {
-  // Șterge toate înregistrările din tabelul stock_purchases (resetare necesar)
-  try {
-    db.db.prepare('DELETE FROM stock_purchases').run();
-  } catch (e) {
-    if (typeof db.clearAllStockPurchases === 'function') db.clearAllStockPurchases();
-    else return res.status(500).json({ error: 'Nu pot reseta — db.db inaccesibil' });
-  }
-  broadcast({ type: 'stock-purchases:reset' });
-  res.json({ ok: true });
-});
-
-// --- Pagină reset necesar (link direct, bookmark-abil) --------------------
-app.get('/reset-necesar', (req, res) => {
-  res.send(`<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="ro">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Reset Necesar — AWB Glorio</title>
-  <style>
-    body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
-    .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); padding: 2.5rem 2rem; max-width: 380px; width: 90%; text-align: center; }
-    h1 { font-size: 1.3rem; margin: 0 0 0.5rem; }
-    p { color: #666; font-size: 0.9rem; margin: 0 0 2rem; }
-    button { font-family: inherit; font-size: 1rem; font-weight: 600; padding: 0.85rem 2rem; border-radius: 10px; border: none; cursor: pointer; width: 100%; }
-    #btn-reset { background: #dc2626; color: #fff; }
-    #btn-reset:disabled { background: #ccc; cursor: default; }
-    #msg { margin-top: 1.2rem; font-size: 0.9rem; min-height: 1.2em; }
-    .ok { color: #16a34a; font-weight: 600; }
-    .err { color: #dc2626; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stație scanare AWB Glorio</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0F6E5E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Scanare">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#F6F4EF; --surface:#FFFFFF; --surface-2:#EFEBE2; --border:#DDD6C7;
+    --text:#232019; --text-dim:#6B6355; --accent:#0F6E5E; --accent-soft:#D9EEE8;
+    --amber:#B8722A; --amber-soft:#F5E4CE; --red:#B23A34; --red-soft:#F6DEDB;
+    --green:#2F7A4F; --green-soft:#DFEFE2;
+    --shadow: 0 1px 2px rgba(35,32,25,0.06), 0 8px 24px -12px rgba(35,32,25,0.12);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]):not([data-color-theme]){
+      --bg:#171511; --surface:#1F1C17; --surface-2:#26221B; --border:#38332A;
+      --text:#EDE8DD; --text-dim:#A79E8C; --accent:#4FC3AA; --accent-soft:#1B3831;
+      --amber:#E0A05C; --amber-soft:#3A2E1B; --red:#E38079; --red-soft:#3D2320;
+      --green:#7FCB9A; --green-soft:#1E3625;
+    }
+  }
+  /* ---- Teme de culoare alternative (2026-08-26) ------------------------
+     Fiecare temă suprascrie complet paleta de mai sus. Se aplică prin
+     [data-color-theme="..."] pe <html>, setat din JS (buton în topbar) și
+     ținut minte în localStorage — implicit rămâne tema "cald" (originală). */
+  :root[data-color-theme="vibrant"]{
+    --bg:#FFF9F2; --surface:#FFFFFF; --surface-2:#FFEADA; --border:#FFCE9E;
+    --text:#241408; --text-dim:#93582C; --accent:#FF6B35; --accent-soft:#FFE1CC;
+    --amber:#F2A900; --amber-soft:#FFF0C2; --red:#E63946; --red-soft:#FBD6D9;
+    --green:#2A9D8F; --green-soft:#D2F1EC;
+    --shadow: 0 1px 2px rgba(150,60,10,0.08), 0 8px 24px -12px rgba(150,60,10,0.18);
+  }
+  :root[data-color-theme="oceanic"]{
+    --bg:#EAF4FB; --surface:#FFFFFF; --surface-2:#D6EAF8; --border:#AAD4EE;
+    --text:#0B2540; --text-dim:#3F6E90; --accent:#0077B6; --accent-soft:#CCE9F8;
+    --amber:#E09F3E; --amber-soft:#FBE7C6; --red:#D62839; --red-soft:#F8D3D7;
+    --green:#2EC4B6; --green-soft:#CFF5F0;
+    --shadow: 0 1px 2px rgba(4,60,94,0.08), 0 8px 24px -12px rgba(4,60,94,0.2);
+  }
+  :root[data-color-theme="padure"]{
+    --bg:#F1EEDF; --surface:#FFFFFF; --surface-2:#E4DEBF; --border:#C7BC86;
+    --text:#1E2A1B; --text-dim:#586B47; --accent:#386641; --accent-soft:#D4E4CB;
+    --amber:#BC6C25; --amber-soft:#F1DCC0; --red:#9A3B3B; --red-soft:#F0D5D5;
+    --green:#588157; --green-soft:#D9EAD8;
+    --shadow: 0 1px 2px rgba(30,42,27,0.08), 0 8px 24px -12px rgba(30,42,27,0.2);
+  }
+  :root[data-color-theme="noapte"]{
+    --bg:#0D0F14; --surface:#161923; --surface-2:#1F2430; --border:#2E3444;
+    --text:#EDEFF5; --text-dim:#8D93A6; --accent:#00E5C7; --accent-soft:#0F3D38;
+    --amber:#FFB86B; --amber-soft:#3D2A15; --red:#FF6B81; --red-soft:#3D171E;
+    --green:#5CE1A0; --green-soft:#12332A;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+  }
+  .theme-switcher{ display:flex; align-items:center; gap:0.35rem; }
+  .theme-dot{ width:1.35rem; height:1.35rem; border-radius:50%; border:2px solid var(--border); cursor:pointer; padding:0; background:var(--dot-bg); }
+  .theme-dot.active{ border-color:var(--text); box-shadow:0 0 0 2px var(--surface), 0 0 0 3px var(--text); }
+  *{box-sizing:border-box;} html,body{height:100%;overflow:hidden;}
+  body{ margin:0; background:var(--bg); color:var(--text); font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; display:flex; flex-direction:column; }
+  .topbar{ display:flex; align-items:center; justify-content:space-between; padding:0.9rem 1.5rem; border-bottom:1px solid var(--border); flex:0 0 auto; }
+  .brand{ display:flex; align-items:baseline; gap:0.6rem; }
+  .brand .mark{ font-family:"Fraunces", serif; font-weight:700; font-size:1.15rem; }
+  .brand .eyebrow{ font-family:"IBM Plex Mono", monospace; font-size:0.72rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--accent); }
+  .count-pill{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; padding:0.3rem 0.8rem; }
+  .conn-dot{ width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; margin-right:0.4rem; background:var(--red); }
+  .conn-dot.live{ background:var(--green); }
+
+  .layout{ flex:1 1 auto; display:flex; min-height:0; }
+  .left-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--border); min-height:0; }
+  .right-panel{ flex:1 1 50%; min-width:0; display:flex; flex-direction:column; min-height:0; }
+
+  .picklist{ flex:0 0 auto; min-height:0; border-bottom:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .picklist.full-height{ flex:1 1 100%; border-bottom:none; }
+  .picklist-head{ display:flex; align-items:center; justify-content:space-between; gap:0.6rem; flex-wrap:wrap; padding:0.55rem 1.5rem; border-bottom:1px solid var(--border); }
+  .picklist-head h3{ font-family:"Fraunces", serif; font-size:0.95rem; font-weight:600; margin:0; }
+  /* 2026-09-30: pe cerința clientului, tabelul cu AWB-uri al listei "De
+     pregătit pentru curier" nu se mai afișează în stația de scanare —
+     rândurile deveniseră prea multe pentru ecran și nu mai era folosit
+     vizual acolo. Butoanele din header (Necesar produse, Produse lipsă,
+     Export CSV) și contorul rămân — ele nu depind de tabel, citesc direct
+     din `rows`/isPickable(), la fel ca înainte. Ascuns doar vizual (nu
+     șters din DOM), ca restul codului (renderPicklist, export etc.) să
+     rămână neschimbat. */
+  .picklist-scroll{ display:none; }
+  table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
+  thead th{ position:sticky; top:0; background:var(--surface-2); text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); padding:0.4rem 1rem; border-bottom:1px solid var(--border); }
+  tbody td{ padding:0.38rem 1rem; border-bottom:1px solid var(--border); vertical-align:top; }
+  .awb-cell{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; white-space:nowrap; }
+  .empty-row{ padding:1.2rem 1.5rem; color:var(--text-dim); font-size:0.86rem; text-align:center; }
+
+  .note-input{ width:100%; font-family:inherit; font-size:0.8rem; padding:0.3rem 0.5rem; border-radius:6px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .note-input:not(:placeholder-shown){ border-color:var(--amber); background:var(--amber-soft); }
+
+  .chip{ display:inline-flex; align-items:center; gap:0.3rem; font-size:0.72rem; font-weight:500; padding:0.18rem 0.5rem; border-radius:999px; white-space:nowrap; }
+  .chip.pending{ background:var(--surface-2); color:var(--text-dim); }
+  .chip.ok{ background:var(--green-soft); color:var(--green); }
+  .chip.warn{ background:var(--amber-soft); color:var(--amber); }
+  .chip.crit{ background:var(--red-soft); color:var(--red); }
+  .chip.age-ok{ background:var(--green-soft); color:var(--green); }
+  .chip.age-warn{ background:var(--amber-soft); color:var(--amber); }
+
+  .scan-input-wrap{ flex:0 0 auto; padding:1.1rem 1.5rem; border-bottom:1px solid var(--border); background:var(--surface); }
+  #scanInput{ width:100%; font-family:"IBM Plex Mono", monospace; font-size:1.4rem; padding:0.85rem 1.1rem; border-radius:10px; border:2px solid var(--accent); background:var(--surface-2); color:var(--text); outline:none; }
+  #scanInput::placeholder{ color:var(--text-dim); font-size:1.05rem; }
+
+  main{ flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding:2rem 1.5rem 1rem; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  .idle{ margin-top:3rem; text-align:center; color:var(--text-dim); max-width:32ch; }
+  .idle .glyph{ font-size:2.6rem; margin-bottom:0.75rem; opacity:0.6; }
+  .idle h2{ font-family:"Fraunces", serif; font-weight:600; font-size:1.3rem; color:var(--text); margin:0 0 0.4rem; }
+
+  .result{ width:100%; max-width:760px; }
+  .result-head{ display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem; margin-bottom:1rem; }
+  .result-head .order-tag{ font-family:"Fraunces", serif; font-weight:600; font-size:1.6rem; }
+  .result-head .price-tag{ font-family:"Fraunces", serif; font-weight:700; font-size:1.4rem; color:var(--accent); background:var(--accent-soft); border-radius:10px; padding:0.15rem 0.7rem; letter-spacing:-0.01em; }
+  .result-head .meta{ font-family:"IBM Plex Mono", monospace; font-size:0.82rem; color:var(--text-dim); }
+  .item-card{ display:flex; gap:1.1rem; background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.1rem; margin-bottom:0.9rem; box-shadow:var(--shadow); align-items:center; }
+  .item-card img{ width:108px; height:108px; object-fit:cover; border-radius:10px; background:var(--surface-2); flex:0 0 auto; border:1px solid var(--border); }
+  .item-info{ flex:1 1 auto; min-width:0; }
+  .item-info .title{ font-size:1.02rem; font-weight:500; line-height:1.35; margin:0 0 0.4rem; }
+  .item-info .sku{ font-family:"IBM Plex Mono", monospace; font-size:0.78rem; color:var(--text-dim); }
+  .specs-row{ display:flex; flex-wrap:wrap; gap:0.35rem; margin:0 0 0.5rem; }
+  .spec-chip{ display:inline-block; font-size:0.88rem; font-weight:700; padding:0.22rem 0.6rem; border-radius:6px; background:var(--accent); color:#fff; }
+  .qty-badge{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:12px; padding:0.6rem 1.1rem; min-width:64px; }
+  .qty-badge .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.7rem; line-height:1; }
+  .qty-badge .lbl{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.06em; margin-top:0.15rem; }
+  .total-bar{ display:flex; justify-content:space-between; align-items:center; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:0.7rem 1rem; margin-top:0.4rem; font-size:0.88rem; color:var(--text-dim); }
+  .total-bar b{ color:var(--text); font-family:"IBM Plex Mono", monospace; }
+
+  .not-found{ margin-top:2.5rem; text-align:center; max-width:36ch; }
+  .not-found .glyph{ font-size:2.6rem; margin-bottom:0.75rem; color:var(--red); }
+  .not-found h2{ font-family:"Fraunces", serif; font-weight:600; color:var(--red); margin:0 0 0.4rem; }
+  .not-found p{ color:var(--text-dim); font-size:0.92rem; line-height:1.5; }
+
+  .status-banner{ width:100%; max-width:760px; display:flex; align-items:center; gap:0.6rem; border-radius:10px; padding:0.7rem 1rem; margin-bottom:1rem; font-size:0.92rem; font-weight:500; }
+  .status-banner.packed{ background:var(--green-soft); color:var(--green); }
+  .status-banner.first{ background:var(--amber-soft); color:var(--amber); }
+  .status-banner.already{ background:var(--accent-soft); color:var(--accent); }
+  .status-banner.reset{ background:var(--red-soft); color:var(--red); }
+  .status-banner.cancelled{ background:var(--red-soft); color:var(--red); font-weight:700; }
+  .status-banner.returned{ background:var(--accent-soft); color:var(--accent); font-weight:700; }
+
+  .returns-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
+  .returns-bar.hidden{ display:none; }
+  .returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--amber); font-weight:600; font-size:0.88rem; }
+  .returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:180px; overflow-y:auto; }
+  .returns-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .returns-row .order-name{ flex:0 0 auto; font-weight:500; }
+  .returns-row .status-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
+  .mark-received-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; }
+  .returns-day-header{ font-family:"IBM Plex Mono", monospace; font-size:0.73rem; font-weight:600; color:var(--amber); opacity:0.7; padding:0.45rem 0.2rem 0.2rem; text-transform:uppercase; letter-spacing:0.04em; border-top:1px solid var(--border); margin-top:0.3rem; }
+  .returns-day-header:first-child{ border-top:none; margin-top:0; padding-top:0.1rem; }
+
+  .unknown-returns-bar{ flex:0 0 auto; background:var(--red-soft); border-bottom:1px solid var(--border); }
+  .unknown-returns-bar.hidden{ display:none; }
+  .unknown-returns-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--red); font-weight:600; font-size:0.88rem; }
+  .unknown-returns-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:220px; overflow-y:auto; }
+  .unknown-returns-row{ display:flex; align-items:center; gap:0.6rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .unknown-returns-row .awb-cell{ flex:0 0 auto; }
+  .unknown-returns-row .scanned-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
+  .unknown-returns-row .note-input{ flex:1 1 auto; }
+  .unknown-returns-hint{ padding:0 1.5rem 0.6rem; margin-top:-0.2rem; font-size:0.78rem; color:var(--red); opacity:0.85; }
+  .resolve-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--green); background:var(--green-soft); color:var(--green); cursor:pointer; }
+
+  .stock-missing-bar{ flex:0 0 auto; background:var(--amber-soft); border-bottom:1px solid var(--border); }
+  .stock-missing-bar.hidden{ display:none; }
+  .stock-missing-bar-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; cursor:pointer; color:var(--amber); font-weight:600; font-size:0.88rem; }
+  .stock-missing-list{ padding:0 1.5rem 0.8rem; display:flex; flex-direction:column; gap:0.4rem; max-height:220px; overflow-y:auto; }
+  .stock-missing-list-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.4rem 0.7rem; font-size:0.82rem; }
+  .stock-missing-list-row .order-name{ flex:0 0 auto; font-weight:500; }
+  .stock-missing-list-row .products-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
+  .stock-missing-list-row .flagged-at{ flex:0 0 auto; color:var(--text-dim); font-size:0.76rem; }
+
+  .scan-mode-row{ display:flex; gap:0.6rem; align-items:center; }
+  .mode-toggle{ flex:0 0 auto; font-family:inherit; font-size:0.78rem; font-weight:600; padding:0.6rem 0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .mode-toggle.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  .stock-missing-row{ background:var(--amber-soft) !important; }
+  .stock-missing-row td{ color:var(--amber); }
+  .status-banner.stockmissing{ background:var(--amber-soft); color:var(--amber); font-weight:700; }
+  .clear-stock-missing-btn{ font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--amber); background:var(--surface); color:var(--amber); cursor:pointer; margin-left:0.6rem; }
+  .needs-row .needs-blocked{ margin-top:0.3rem; font-size:0.76rem; color:var(--amber); }
+
+  .needs-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.4rem 0.7rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; white-space:nowrap; }
+  .needs-btn.stock-missing-needs-btn{ border-color:var(--amber); background:var(--amber-soft); color:var(--amber); }
+
+  .needs-modal{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; padding:0; }
+  .needs-modal.open{ display:flex; }
+  .needs-panel{ background:var(--surface); width:100%; height:100%; max-width:100%; display:flex; flex-direction:column; }
+  @media (min-width:640px){
+    .needs-panel{ width:min(560px, 92vw); height:min(88vh, 820px); border-radius:16px; box-shadow:var(--shadow); overflow:hidden; }
+    .needs-panel.return-history-panel{ width:min(720px, 94vw); }
+  }
+  .return-history-days{ flex:0 0 auto; display:flex; gap:0.4rem; flex-wrap:wrap; padding:0.7rem 1.1rem; border-bottom:1px solid var(--border); }
+  .return-history-day-btn{ font-family:"IBM Plex Mono", monospace; font-size:0.76rem; padding:0.35rem 0.7rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .return-history-day-btn.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+  .return-history-row{ display:flex; align-items:center; gap:0.7rem; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:0.6rem 0.8rem; margin-bottom:0.5rem; font-size:0.84rem; }
+  .return-history-row .order-name{ flex:0 0 auto; font-weight:500; min-width:5.5rem; }
+  .return-history-row .products-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.8rem; }
+  .return-history-row .received-at{ flex:0 0 auto; font-family:"IBM Plex Mono", monospace; color:var(--text-dim); font-size:0.78rem; }
+  .needs-header{ flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:0.6rem; padding:1rem 1.1rem; border-bottom:1px solid var(--border); background:var(--surface); }
+  .needs-header h3{ font-family:"Fraunces", serif; font-size:1.05rem; font-weight:600; margin:0; }
+  .needs-close{ flex:0 0 auto; font-family:inherit; font-size:1.3rem; line-height:1; padding:0.4rem 0.65rem; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); cursor:pointer; }
+  .needs-list{ flex:1 1 auto; overflow-y:auto; padding:0.6rem; }
+  .needs-row{ display:flex; align-items:center; gap:0.9rem; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:0.7rem; margin-bottom:0.6rem; }
+  .needs-row img{ width:56px; height:56px; object-fit:cover; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
+  .needs-row .img-placeholder{ width:56px; height:56px; border-radius:9px; background:var(--surface); flex:0 0 auto; border:1px solid var(--border); }
+  .needs-row .needs-title{ flex:1 1 auto; min-width:0; font-size:0.92rem; line-height:1.3; }
+  .needs-row .needs-qty{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--accent-soft); color:var(--accent); border-radius:10px; padding:0.4rem 0.8rem; min-width:48px; }
+  .needs-row .needs-qty .n{ font-family:"Fraunces", serif; font-weight:700; font-size:1.3rem; line-height:1; }
+  .needs-row .needs-qty .lbl{ font-size:0.6rem; text-transform:uppercase; letter-spacing:0.05em; margin-top:0.1rem; }
+  .needs-row.purchased{ opacity:0.6; }
+  .needs-purchase{ flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:0.3rem; }
+  .needs-purchase label{ display:flex; align-items:center; gap:0.35rem; font-size:0.72rem; color:var(--text-dim); cursor:pointer; white-space:nowrap; }
+  .needs-purchase input[type="checkbox"]{ width:1.05rem; height:1.05rem; accent-color:var(--accent); cursor:pointer; }
+  .needs-purchase-qty{ width:4.2rem; font-family:"IBM Plex Mono", monospace; font-size:0.8rem; padding:0.25rem 0.4rem; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); text-align:center; }
+
+  .registry{ flex:1 1 auto; min-height:0; border-top:1px solid var(--border); background:var(--surface); display:flex; flex-direction:column; }
+  .registry.hidden{ display:none; }
+  .registry-head{ display:flex; align-items:center; justify-content:space-between; padding:0.6rem 1.5rem; border-bottom:1px solid var(--border); }
+  .registry-head h3{ font-family:"Fraunces", serif; font-size:0.98rem; font-weight:600; margin:0; }
+  .registry-stats{ display:flex; gap:0.5rem; font-family:"IBM Plex Mono", monospace; font-size:0.76rem; }
+  .registry-stats .pill{ border-radius:999px; padding:0.22rem 0.65rem; border:1px solid var(--border); }
+  .registry-stats .pill.packed{ background:var(--green-soft); color:var(--green); border-color:transparent; }
+  .registry-stats .pill.pending{ background:var(--amber-soft); color:var(--amber); border-color:transparent; }
+  .registry-filter-btn{ font-size:0.72rem; padding:0.3rem 0.6rem; }
+  .registry-scroll{ overflow-y:auto; flex:1 1 auto; }
+
+  /* ── Mobile / iPhone ─────────────────────────────────────────────────── */
+  @media (max-width: 639px) {
+    /* Safe area pentru notch/home indicator iPhone */
+    body { padding-bottom: env(safe-area-inset-bottom); overflow: auto; }
+    html { overflow: auto; }
+
+    /* Topbar compact */
+    .topbar { padding: 0.6rem 1rem; }
+    .brand .mark { font-size: 1rem; }
+    .brand .eyebrow { display: none; }
+    .count-pill { font-size: 0.7rem; padding: 0.2rem 0.6rem; }
+
+    /* Layout: stivă verticală în loc de side-by-side
+       Panoul de scanare (right-panel) vine PRIMUL pe mobil */
+    .layout { flex-direction: column-reverse; height: auto; overflow: visible; }
+    .left-panel {
+      border-right: none;
+      border-top: 2px solid var(--border);
+      flex: 0 0 auto;
+      min-height: auto;
+    }
+    .right-panel { flex: 1 1 auto; min-height: 0; }
+
+    /* Butoane picklist pe 2 rânduri mai compacte */
+    .picklist-head { padding: 0.5rem 0.8rem; gap: 0.4rem; }
+    .picklist-head h3 { font-size: 0.82rem; width: 100%; }
+    .needs-btn { font-size: 0.72rem; padding: 0.35rem 0.6rem; }
+
+    /* Scan input mai mic dar tot lizibil */
+    .scan-input-wrap { padding: 0.7rem 0.8rem; }
+    #scanInput { font-size: 1.15rem; padding: 0.7rem 0.85rem; }
+
+    /* Butoanele de mod sub input — pe rând */
+    .scan-mode-row { flex-wrap: wrap; gap: 0.4rem; }
+    .mode-toggle { font-size: 0.72rem; padding: 0.45rem 0.65rem; flex: 1 1 auto; text-align: center; }
+
+    /* Panoul rezultat scanare */
+    main { padding: 0.8rem 0.8rem 0.5rem; }
+    .idle { margin-top: 1.2rem; }
+    .idle .glyph { font-size: 2rem; }
+    .idle h2 { font-size: 1.1rem; }
+
+    /* Card produs: imagine mai mică */
+    .item-card { padding: 0.75rem; gap: 0.7rem; border-radius: 10px; }
+    .item-card img { width: 72px; height: 72px; border-radius: 8px; }
+    .item-info .title { font-size: 0.92rem; }
+    .qty-badge { padding: 0.45rem 0.7rem; min-width: 50px; }
+    .qty-badge .n { font-size: 1.4rem; }
+
+    /* Statusuri */
+    .status-banner { font-size: 0.84rem; padding: 0.55rem 0.75rem; }
+    .result-head .order-tag { font-size: 1.35rem; }
+    .result-head .price-tag { font-size: 1.2rem; }
+
+    /* Barele de alerte (retururi, stoc lipsă) */
+    .returns-bar-head,
+    .unknown-returns-bar-head,
+    .stock-missing-bar-head { padding: 0.5rem 0.8rem; font-size: 0.82rem; }
+
+    /* Registry ascuns pe mobil (e inutil la stații pe telefon) */
+    .registry { display: none; }
+    .picklist.full-height { flex: 0 0 auto; }
+
+    /* Modals: full screen pe iOS cu safe area */
+    .needs-panel {
+      border-radius: 0 !important;
+      height: 100% !important;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .needs-header { padding: 0.85rem 1rem; }
+    .needs-header h3 { font-size: 0.92rem; }
+    .needs-list { padding: 0.4rem; -webkit-overflow-scrolling: touch; }
+    .needs-row { gap: 0.6rem; padding: 0.6rem; border-radius: 10px; }
+    .needs-row img,
+    .needs-row .img-placeholder { width: 48px; height: 48px; border-radius: 7px; }
+    .needs-row .needs-title { font-size: 0.84rem; }
+    .needs-row .needs-qty .n { font-size: 1.1rem; }
+    .needs-purchase label { font-size: 0.68rem; }
+  }
+</style>
 </head>
 <body>
-  <div class="card">
-    <h1>🚫 Reset Produse Lipsă</h1>
-    <p>Elimină flagul „lipsă din stoc" de pe toate comenzile blocate.<br>Comenzile redevin vizibile normal în scanare.</p>
-    <button id="btn-reset" onclick="doReset()">Resetează produsele lipsă</button>
-    <div id="msg"></div>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="mark">Glorio</span>
+    <span class="eyebrow">Stație scanare</span>
   </div>
-  <script>
-    async function doReset() {
-      const btn = document.getElementById('btn-reset');
-      const msg = document.getElementById('msg');
-      btn.disabled = true;
-      btn.textContent = 'Se resetează…';
-      msg.textContent = '';
+  <div style="display:flex; align-items:center; gap:0.9rem;">
+    <div class="theme-switcher" id="themeSwitcher">
+      <button type="button" class="theme-dot" data-color-theme="cald" style="--dot-bg:#F6F4EF;" title="Cald (implicit)"></button>
+      <button type="button" class="theme-dot" data-color-theme="vibrant" style="--dot-bg:#FF6B35;" title="Vibrant"></button>
+      <button type="button" class="theme-dot" data-color-theme="oceanic" style="--dot-bg:#0077B6;" title="Oceanic"></button>
+      <button type="button" class="theme-dot" data-color-theme="padure" style="--dot-bg:#386641;" title="Pădure"></button>
+      <button type="button" class="theme-dot" data-color-theme="noapte" style="--dot-bg:#0D0F14;" title="Noapte"></button>
+    </div>
+    <button type="button" id="returnsBarHead" class="hidden" style="display:none;align-items:center;gap:0.3rem;font-size:0.78rem;font-weight:600;padding:0.3rem 0.65rem;border-radius:8px;border:1.5px solid var(--accent);background:var(--accent-soft);color:var(--accent);cursor:pointer;white-space:nowrap;">🔄 <span id="returnsCount">0</span></button>
+    <button type="button" id="unknownReturnsBarHead" class="hidden" style="display:none;align-items:center;gap:0.3rem;font-size:0.78rem;font-weight:600;padding:0.3rem 0.65rem;border-radius:8px;border:1.5px solid var(--red);background:var(--red-soft);color:var(--red);cursor:pointer;white-space:nowrap;">⚠️ <span id="unknownReturnsCount">0</span></button>
+    <div class="count-pill"><span class="conn-dot" id="connDot"></span><span id="dbCount">— comenzi în evidență</span></div>
+  </div>
+</div>
+
+<div class="returns-bar hidden" id="returnsBar" style="display:none;">
+  <div class="returns-list" id="returnsList" style="display:none;"></div>
+</div>
+
+<div class="unknown-returns-bar hidden" id="unknownReturnsBar" style="display:none;">
+  <div class="unknown-returns-hint">De verificat manual — poate fi de la Fan Curier, Cargus, Sameday, Bookurier sau DPD (curieri pe care sistemul nu îi caută automat aici).</div>
+  <div class="unknown-returns-list" id="unknownReturnsList" style="display:none;"></div>
+</div>
+
+<div class="stock-missing-bar hidden" id="stockMissingBar">
+  <div class="stock-missing-bar-head" id="stockMissingBarHead">
+    <span>⚠️ <span id="stockMissingCount">0</span> comandă(comenzi) cu stoc lipsă — click pentru listă</span>
+  </div>
+  <div class="stock-missing-list" id="stockMissingList" style="display:none;"></div>
+</div>
+
+<div class="layout">
+  <div class="left-panel">
+    <div class="picklist">
+      <div class="picklist-head">
+        <h3>De pregătit pentru curier</h3>
+        <button type="button" class="needs-btn" id="needsBtn">📋 Necesar produse</button>
+        <button type="button" class="needs-btn stock-missing-needs-btn" id="stockMissingNeedsBtn">🚫 Produse lipsă</button>
+        <button type="button" class="needs-btn" id="picklistExportBtn">⬇️ Export CSV</button>
+        <span class="count-pill" id="picklistCount">0 comenzi</span>
+      </div>
+      <div class="picklist-scroll">
+        <table>
+          <thead><tr><th>#</th><th>Comandă</th><th>AWB</th><th>Cantitate &amp; produs</th><th>Status Sameday</th><th>Notițe</th></tr></thead>
+          <tbody id="picklistBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="registry">
+      <div class="registry-head">
+        <h3>Registru scanare — azi</h3>
+        <div class="registry-stats">
+          <button type="button" class="mode-toggle registry-filter-btn active" data-filter="all">Toate</button>
+          <button type="button" class="mode-toggle registry-filter-btn" data-filter="packed">✓ Împachetate</button>
+          <button type="button" class="mode-toggle registry-filter-btn" data-filter="pending">🔶 În așteptare</button>
+          <button type="button" class="mode-toggle" id="registryExportBtn">⬇️ Export CSV</button>
+          <span class="pill packed" id="packedCount">0 împachetate</span>
+          <span class="pill pending" id="pendingCount">0 în așteptare</span>
+        </div>
+      </div>
+      <div class="registry-scroll">
+        <table>
+          <thead><tr><th>AWB</th><th>Comandă</th><th>Prima scanare</th><th>Status</th><th>Confirmat la</th><th>Notițe</th></tr></thead>
+          <tbody id="registryBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="scan-input-wrap">
+      <div class="scan-mode-row">
+        <input id="scanInput" type="text" inputmode="none" autocomplete="off" autocorrect="off" spellcheck="false"
+          placeholder="Scanează AWB-ul de pe etichetă…" autofocus>
+        <button type="button" class="mode-toggle" id="returnModeBtn">🔄 Scanează retur primit</button>
+        <button type="button" class="mode-toggle" id="returnHistoryBtn">📅 Istoric retururi pe zile</button>
+      </div>
+    </div>
+
+    <main id="main">
+      <div class="idle" id="idleState">
+        <div class="glyph">📦</div>
+        <h2>Gata de scanare</h2>
+        <p>Scanează codul de bare AWB de pe eticheta coletului. Produsul, cantitatea și comanda apar automat. Scanează același AWB de 2 ori, la maxim 10 minute distanță, ca să-l confirmi „împachetat, predat la curier".</p>
+      </div>
+    </main>
+  </div>
+</div>
+
+<div class="needs-modal" id="needsModal">
+  <div class="needs-panel">
+    <div class="needs-header">
+      <h3>📋 Necesar produse — <span id="needsSubcount">0</span> comenzi neîmpachetate</h3>
+      <button type="button" class="needs-close" id="needsCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="needs-list" id="needsList"></div>
+  </div>
+</div>
+
+<div class="needs-modal" id="stockMissingNeedsModal">
+  <div class="needs-panel">
+    <div class="needs-header">
+      <h3>🚫 Produse lipsă — <span id="stockMissingNeedsSubcount">0</span> comenzi blocate</h3>
+      <button type="button" class="needs-btn" id="resetNecesarBtn" style="margin-right:0.4rem;border-color:var(--red);background:var(--red-soft);color:var(--red);" title="Resetează necesarul de produse">🗑️ Reset necesar</button>
+      <button type="button" class="needs-close" id="stockMissingNeedsCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="needs-list" id="stockMissingNeedsList"></div>
+  </div>
+</div>
+
+<div class="needs-modal" id="returnHistoryModal">
+  <div class="needs-panel return-history-panel">
+    <div class="needs-header">
+      <h3>📅 Istoric retururi — <span id="returnHistoryDayLabel">azi</span> (<span id="returnHistoryCount">0</span>)</h3>
+      <button type="button" class="needs-btn" id="returnHistoryExportBtn" style="margin-right:0.4rem;">⬇️ Export CSV</button>
+      <button type="button" class="needs-close" id="returnHistoryCloseBtn" aria-label="Închide">✕</button>
+    </div>
+    <div class="return-history-days" id="returnHistoryDays"></div>
+    <div class="needs-list" id="returnHistoryList"></div>
+  </div>
+</div>
+
+<script>
+  // ---- Teme de culoare ---------------------------------------------------
+  // "cald" e tema originală (nu setează atributul deloc, ca să rămână și
+  // modul întunecat automat din CSS pentru ea). Alegerea se ține minte per
+  // stație (localStorage), separat de orice alt dispozitiv.
+  const THEME_STORAGE_KEY = 'awb-glorio-color-theme';
+  function applyColorTheme(theme){
+    if (!theme || theme === 'cald') document.documentElement.removeAttribute('data-color-theme');
+    else document.documentElement.setAttribute('data-color-theme', theme);
+    document.querySelectorAll('.theme-dot').forEach(btn => {
+      btn.classList.toggle('active', (btn.dataset.colorTheme || 'cald') === (theme || 'cald'));
+    });
+  }
+  (function initColorTheme(){
+    let saved = 'cald';
+    try { saved = localStorage.getItem(THEME_STORAGE_KEY) || 'cald'; } catch (err) { /* private mode etc. */ }
+    applyColorTheme(saved);
+    document.getElementById('themeSwitcher').addEventListener('click', e => {
+      const btn = e.target.closest('.theme-dot');
+      if (!btn) return;
+      const theme = btn.dataset.colorTheme || 'cald';
+      applyColorTheme(theme);
+      try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (err) { /* ignore */ }
+    });
+  })();
+
+  const tz = 'Europe/Bucharest';
+  const REGISTRY_HIDE_AFTER_MS = 60000;
+  // Payload of the fixed "stoc lipsă" QR code — print this text as a QR code
+  // and tape it to the packing table. Scanning it right after an AWB (whose
+  // product isn't in stock) flags that AWB, instead of being looked up as
+  // an AWB itself.
+  const STOCK_MISSING_MARKER = 'GLORIO-STOC-LIPSA';
+  let rows = {}; // awb -> row object, current in-memory state
+  let returnRows = {}; // awb -> row object, AWBs Sameday shows as "in return" and not yet confirmed received
+  let unknownReturns = {}; // id -> entry, return-mode scans that matched no known AWB at all
+  let returnMode = false; // when true, the scan input confirms return receipt instead of packing
+  let lastScannedAwb = null; // most recent AWB successfully looked up — target of the next stoc-lipsă marker scan
+
+  function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
+  function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function escapeAttr(s){ return escapeHtml(s); }
+
+  // ---- Export CSV (2026-08-27) -------------------------------------------
+  // Helper generic, folosit de cele 3 butoane "⬇️ Export CSV" (De pregătit
+  // pentru curier, Registru scanare, Istoric retururi). `columns` e o listă
+  // de { label, get(row) } — separatorul e ";" (nu ",") ca Excel-ul cu
+  // locale românesc să deschidă fișierul corect, direct pe coloane, fără să
+  // ceară import manual; BOM la început ca diacriticele să nu se strice.
+  function exportCsv(filename, rows, columns){
+    const esc = (v) => {
+      const s = String(v ?? '');
+      return /[";\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const lines = [columns.map((c) => esc(c.label)).join(';')];
+    rows.forEach((row) => lines.push(columns.map((c) => esc(c.get(row))).join(';')));
+    const csv = '﻿' + lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  // Sameday's real statuses only have two "still sitting with us" states:
+  // "Alocata pentru ridicare" and "Ridicare ulterioara". Anything past that
+  // (Iesire din hub, Ridicata de la client, tranzit, livrat, etc.) means the
+  // courier already has it. Cancelled is the one exception — it doesn't
+  // imply the parcel ever left.
+  const PENDING_PICKUP_PHRASES = ['alocata pentru ridicare', 'ridicare ulterioara'];
+  function samedayTone(status, err){
+    if (err) return null;
+    const t = (status || '').toLowerCase();
+    if (!t) return null;
+    if (t.includes('anulat')) return 'crit';
+    if (PENDING_PICKUP_PHRASES.some(p => t.includes(p))) return 'warn';
+    return 'ok';
+  }
+
+  function isReturnStatus(status){
+    return (status || '').toLowerCase().includes('retur');
+  }
+
+  function samedayChip(row){
+    if (row.sameday_error) return '<span class="chip pending">Eroare API</span>';
+    if (!row.sameday_status) return '<span class="chip pending">—</span>';
+    const tone = samedayTone(row.sameday_status, false) || 'pending';
+    return `<span class="chip ${tone}" title="${escapeAttr(row.sameday_status_label || '')}">${escapeHtml(row.sameday_status)}</span>`;
+  }
+
+  // Combines the Shopify VARIANT (size/color/etc. chosen as an actual
+  // product variant) with any custom line-item PROPERTIES (specs some
+  // products carry a different way — a personalization/options app, or
+  // manual entry at checkout — that never show up in variantTitle at all).
+  // Both are shown together everywhere a product is listed, since either
+  // one missing at the packing station is exactly the kind of mix-up that
+  // can't happen.
+  function specsText(it){
+    const parts = [];
+    if (it.variant) parts.push(it.variant);
+    (it.props || []).forEach(p => parts.push(`${p.key}: ${p.value}`));
+    return parts.join(' · ');
+  }
+  function productsText(row){
+    const items = JSON.parse(row.items_json || '[]');
+    return items.map(it => { const s = specsText(it); return `${it.qty}× ${escapeHtml(it.title)}${s ? ' (' + escapeHtml(s) + ')' : ''}`; }).join(', ') || '—';
+  }
+  // Ca productsText, dar fără escapeHtml (entități gen &amp;) — folosit la
+  // export CSV, unde textul intră direct în fișier, nu în HTML.
+  function productsTextPlain(row){
+    const items = JSON.parse(row.items_json || '[]');
+    return items.map(it => { const s = specsText(it); return `${it.qty}x ${it.title}${s ? ' (' + s + ')' : ''}`; }).join(', ') || '';
+  }
+
+  // ---- Picking list --------------------------------------------------
+  const picklistBody = document.getElementById('picklistBody');
+  // 2026-08-26: un colet iese din lista "De pregătit pentru curier" când e
+  // scanat de 2 ori la stație (row.packed), când comanda a fost anulată în
+  // Shopify (row.cancelled), SAU când Sameday arată AWB-ul ca anulat
+  // ("Comanda anulata" etc. — AWB-ul e nul, nu se poate preda, indiferent
+  // de starea comenzii în Shopify; verificat manual pe export Sameday din
+  // 26.08.2026 că niciuna din comenzile astfel excluse nu mai era cu
+  // adevărat "în așteptare de ridicare"). NU se mai marchează packed pe baza
+  // statusului Sameday (asta a fost bug-ul din investigația "65 vs 53") —
+  // aici doar se ASCUND din listă, fără să atingă baza de date.
+  function isPickable(row){
+    if (row.cancelled) return false;
+    if (row.packed) return false;
+    if ((row.sameday_status || '').toLowerCase().includes('anulat')) return false;
+    return true;
+  }
+  // 2026-09-30: tabelul propriu-zis (thead/tbody) nu se mai afișează în
+  // pagină — vezi regula CSS .picklist-scroll{ display:none; }. Funcția
+  // rămâne neschimbată intenționat: completează în continuare #picklistBody
+  // (invizibil) și #picklistCount (vizibil, în header), pentru că export
+  // CSV / "Necesar produse" / "Produse lipsă" citesc tot din `rows` +
+  // isPickable(), nu din tabelul randat — simplu de reactivat vizual mai
+  // târziu doar redenumind acea regulă CSS, dacă va fi nevoie.
+  function renderPicklist(){
+    const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
+    const cnt = list.length;
+    document.getElementById('picklistCount').textContent = cnt + (cnt === 1 ? ' comandă' : ' comenzi');
+    if (!list.length){
+      picklistBody.innerHTML = '<tr><td colspan="6" class="empty-row">Toate comenzile sunt împachetate sau ridicate de curier. 🎉</td></tr>';
+      return;
+    }
+    picklistBody.innerHTML = list.map((row, i) => `
+      <tr data-awb="${escapeAttr(row.awb)}" class="${row.stock_missing ? 'stock-missing-row' : ''}">
+        <td>${i + 1}</td>
+        <td>${row.stock_missing ? '⚠️ ' : ''}${escapeHtml(row.order_name)}</td>
+        <td class="awb-cell">${escapeHtml(row.awb)}</td>
+        <td>${productsText(row)}</td>
+        <td>${samedayChip(row)}</td>
+        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+      </tr>
+    `).join('');
+  }
+  document.getElementById('picklistExportBtn').addEventListener('click', () => {
+    const list = Object.values(rows).filter(isPickable).sort((a,b) => a.awb_created_at.localeCompare(b.awb_created_at));
+    exportCsv(`de-pregatit-${bucharestToday()}.csv`, list, [
+      { label: 'Comandă', get: r => r.order_name },
+      { label: 'AWB', get: r => r.awb },
+      { label: 'Produse', get: r => productsTextPlain(r) },
+      { label: 'Status Sameday', get: r => r.sameday_status || '' },
+      { label: 'Stoc lipsă', get: r => r.stock_missing ? 'DA' : '' },
+      { label: 'Notă', get: r => r.note || '' },
+      { label: 'AWB generat la', get: r => r.awb_created_at || '' },
+    ]);
+  });
+
+  // ---- Returns ---------------------------------------------------------
+  // Loaded separately from `rows` (which only ever holds today's AWBs) —
+  // a return can land days after the AWB was originally created, so this
+  // tracks its own state across the full history, kept in sync via
+  // /api/returns on load/refresh and updated incrementally from WebSocket
+  // awb:update messages (see connectWs below).
+  const returnsBar = document.getElementById('returnsBar');
+  const returnsList = document.getElementById('returnsList');
+  async function loadReturns(){
+    const res = await fetch('/api/returns');
+    const data = await res.json();
+    returnRows = {};
+    data.rows.forEach(r => { returnRows[r.awb] = r; });
+    renderReturnsBar();
+  }
+  function bucharestDay(iso){
+    if (!iso) return null;
+    return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }); // 'YYYY-MM-DD'
+  }
+  function renderReturnsBar(){
+    const list = Object.values(returnRows).sort((a,b) => (b.sameday_checked_at||'').localeCompare(a.sameday_checked_at||''));
+    document.getElementById('returnsCount').textContent = list.length;
+    const btn = document.getElementById('returnsBarHead');
+    btn.style.display = list.length === 0 ? 'none' : 'flex';
+    // Grupăm pe zi după sameday_checked_at — ziua în care sistemul a detectat returul
+    const groups = [];
+    const seen = new Map();
+    list.forEach(row => {
+      const day = bucharestDay(row.sameday_checked_at) || '—';
+      if (!seen.has(day)) { seen.set(day, []); groups.push(day); }
+      seen.get(day).push(row);
+    });
+    returnsList.innerHTML = groups.map(day => {
+      const rows = seen.get(day);
+      return `
+        <div class="returns-day-header">${escapeHtml(day === '—' ? '—' : dayLabel(day))} — ${rows.length} ${rows.length === 1 ? 'colet' : 'colete'}</div>
+        ${rows.map(row => `
+          <div class="returns-row">
+            <span class="awb-cell">${escapeHtml(row.awb)}</span>
+            <span class="order-name">${escapeHtml(row.order_name)}</span>
+            <span class="status-txt">${escapeHtml(row.sameday_status || '')}</span>
+            <button type="button" class="mark-received-btn" data-awb="${escapeAttr(row.awb)}">✅ Am primit-o</button>
+          </div>
+        `).join('')}
+      `;
+    }).join('');
+  }
+  document.getElementById('returnsBarHead').addEventListener('click', () => {
+    returnsBar.classList.toggle('hidden');
+    returnsList.style.display = returnsBar.classList.contains('hidden') ? 'none' : 'flex';
+  });
+  document.addEventListener('click', async (e) => {
+    if (e.target.classList.contains('mark-received-btn')){
+      const awb = e.target.dataset.awb;
       try {
-        const r = await fetch('/api/stock-missing/reset-all', { method: 'POST' });
-        const data = await r.json().catch(() => ({}));
-        if (r.ok) {
-          msg.innerHTML = '<span class="ok">✅ Resetat! ' + (data.count || 0) + ' comenzi deblocate.</span>';
-          btn.textContent = 'Resetat ✓';
+        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code: awb }) });
+        const data = await res.json();
+        if (data.found){
+          delete returnRows[awb];
+          renderReturnsBar();
+        }
+      } catch (err) { console.error('mark return received failed', err); }
+    }
+  });
+
+  // ---- Unknown returns ---------------------------------------------------
+  // Return-mode scans that matched no AWB in the system at all — a box from
+  // another channel, a much older order, a typo, a damaged label. These
+  // can't be tied to an order, so they're tracked separately and need a
+  // human to go figure out what they actually are.
+  const unknownReturnsBar = document.getElementById('unknownReturnsBar');
+  const unknownReturnsList = document.getElementById('unknownReturnsList');
+  async function loadUnknownReturns(){
+    const res = await fetch('/api/unknown-returns');
+    const data = await res.json();
+    unknownReturns = {};
+    data.rows.forEach(r => { unknownReturns[r.id] = r; });
+    renderUnknownReturnsBar();
+  }
+  function renderUnknownReturnsBar(){
+    const list = Object.values(unknownReturns).sort((a,b) => b.scanned_at.localeCompare(a.scanned_at));
+    document.getElementById('unknownReturnsCount').textContent = list.length;
+    const btn = document.getElementById('unknownReturnsBarHead');
+    btn.style.display = list.length === 0 ? 'none' : 'flex';
+    unknownReturnsList.innerHTML = list.map(entry => `
+      <div class="unknown-returns-row" data-id="${entry.id}">
+        <span class="awb-cell">${escapeHtml(entry.code)}</span>
+        <span class="scanned-at">${fmtTime(entry.scanned_at)}</span>
+        <input type="text" class="note-input" data-unknown-id="${entry.id}" placeholder="Ce e coletul ăsta?…" value="${escapeAttr(entry.note || '')}">
+        <button type="button" class="resolve-btn" data-id="${entry.id}">✅ Rezolvat</button>
+      </div>
+    `).join('');
+  }
+  document.getElementById('unknownReturnsBarHead').addEventListener('click', () => {
+    unknownReturnsBar.classList.toggle('hidden');
+    unknownReturnsList.style.display = unknownReturnsBar.classList.contains('hidden') ? 'none' : 'flex';
+  });
+  document.addEventListener('change', async e => {
+    if (e.target.dataset.unknownId){
+      const id = e.target.dataset.unknownId;
+      try {
+        await fetch(`/api/unknown-returns/${id}/note`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ note: e.target.value }) });
+      } catch (err) { console.error('unknown-return note save failed', err); }
+    }
+  });
+  document.addEventListener('click', async e => {
+    if (e.target.classList.contains('clear-stock-missing-btn')){
+      const awb = e.target.dataset.awb;
+      try {
+        const res = await fetch('/api/stock-missing/clear', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb }) });
+        const data = await res.json();
+        if (data.found){
+          rows[data.row.awb] = data.row;
+          renderAll();
+          if (data.row.awb === lastScannedAwb) renderFound(data.row, null);
+        }
+      } catch (err) { console.error('clear stock-missing failed', err); }
+    }
+  });
+  document.addEventListener('click', async e => {
+    if (e.target.classList.contains('resolve-btn')){
+      const id = e.target.dataset.id;
+      try {
+        await fetch(`/api/unknown-returns/${id}/resolve`, { method:'POST' });
+        delete unknownReturns[id];
+        renderUnknownReturnsBar();
+      } catch (err) { console.error('resolve unknown return failed', err); }
+    }
+  });
+
+  // ---- Product needs (aggregated across all unpacked orders) --------------
+  // Same base set as the picking list (isPickable) — everything still owed
+  // to a customer that hasn't left the warehouse yet — summed by product so
+  // whoever is picking stock can grab it all in one pass instead of walking
+  // the shelves once per order.
+  const needsModal = document.getElementById('needsModal');
+  const needsList = document.getElementById('needsList');
+  const needsSubcount = document.getElementById('needsSubcount');
+  // Aggregation key includes the full spec (variant + custom properties),
+  // not just SKU — two line items sharing a SKU but differing in variantă
+  // (mărime/culoare) sau într-o proprietate custom (o aplicație de
+  // personalizare care nu împarte SKU-uri pe opțiune, de exemplu) NU trebuie
+  // sumate într-un singur total înșelător. Variant era omisă aici înainte
+  // ori de câte ori SKU-ul exista (vezi key-ul din computeProductNeeds /
+  // computeStockMissingNeeds mai jos) — două variante diferite cu același
+  // SKU se combinau greșit sub eticheta primei variante întâlnite.
+  function specsKey(it){
+    const parts = [];
+    if (it.variant) parts.push(`variant=${it.variant}`);
+    (it.props || []).forEach(p => parts.push(`${p.key}=${p.value}`));
+    return parts.sort().join('|');
+  }
+  function computeProductNeeds(){
+    const list = Object.values(rows).filter(isPickable);
+    const agg = new Map(); // key -> { title, specs, img, qty, orders, blockedOrders }
+    list.forEach(row => {
+      const items = JSON.parse(row.items_json || '[]');
+      items.forEach(it => {
+        const sk = specsKey(it);
+        const key = ((it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`) + '::' + sk;
+        const existing = agg.get(key);
+        if (existing) {
+          existing.qty += it.qty;
+          if (!existing.img && it.img) existing.img = it.img;
+          existing.orders.push({ name: row.order_name, qty: it.qty });
+          if (row.stock_missing && !existing.blockedOrders.includes(row.order_name)) existing.blockedOrders.push(row.order_name);
         } else {
-          msg.innerHTML = '<span class="err">Eroare: ' + (data.error || r.status) + '</span>';
-          btn.disabled = false;
-          btn.textContent = 'Resetează produsele lipsă';
+          agg.set(key, {
+            title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty,
+            orders: [{ name: row.order_name, qty: it.qty }],
+            blockedOrders: row.stock_missing ? [row.order_name] : []
+          });
         }
-      } catch(e) {
-        msg.innerHTML = '<span class="err">Eroare rețea: ' + e.message + '</span>';
-        btn.disabled = false;
-        btn.textContent = 'Resetează produsele lipsă';
-      }
+      });
+    });
+    return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
+  }
+  function renderNeeds(){
+    const { orderCount, items } = computeProductNeeds();
+    needsSubcount.textContent = orderCount;
+    if (!items.length){
+      needsList.innerHTML = '<div class="empty-row">Nimic de pregătit — toate comenzile sunt împachetate sau ridicate. 🎉</div>';
+      return;
     }
-  </script>
+    needsList.innerHTML = items.map(it => {
+      const orderChips = it.orders.map(o =>
+        `<span style="display:inline-block;background:rgba(0,0,0,0.07);border-radius:6px;padding:1px 7px;margin:2px 3px 2px 0;font-size:0.72rem;font-weight:600;white-space:nowrap;">${escapeHtml(o.name)}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
+      ).join('');
+      return `
+      <div class="needs-row">
+        ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
+        <div class="needs-title">
+          ${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
+          <div style="margin-top:5px;line-height:1.8">${orderChips}</div>
+          ${it.blockedOrders.length ? `<div class="needs-blocked">⚠️ Stoc lipsă — blocat pentru: ${it.blockedOrders.map(escapeHtml).join(', ')}</div>` : ''}
+        </div>
+        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('needsBtn').addEventListener('click', () => {
+    renderNeeds();
+    needsModal.classList.add('open');
+  });
+  document.getElementById('needsCloseBtn').addEventListener('click', () => {
+    needsModal.classList.remove('open');
+  });
+  needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
+
+  // ---- Stock-missing product needs (image + quantity only) ----------------
+  // Same aggregation idea as "Necesar produse" above, but scoped ONLY to
+  // orders currently flagged stoc lipsă — a quick "what do I actually need
+  // to go buy/restock right now" view, stripped down to just the picture
+  // and the quantity so it reads at a glance.
+  const stockMissingNeedsModal = document.getElementById('stockMissingNeedsModal');
+  const stockMissingNeedsList = document.getElementById('stockMissingNeedsList');
+  const stockMissingNeedsSubcount = document.getElementById('stockMissingNeedsSubcount');
+  // 2026-08-27: bifă "Achiziționat" + câmp de cantitate cumpărată pe fiecare
+  // produs, ca staff-ul care face achizițiile să poată bifa pe măsură ce
+  // cumpără — persistă pe server (/api/stock-purchases), sincronizat live
+  // prin WebSocket pe toate stațiile deschise. Cheia ține de produs/
+  // variantă (aceeași cheie de agregare de mai jos), nu de un AWB anume.
+  let stockPurchases = {}; // agg_key -> { checked, qty_purchased }
+  async function loadStockPurchases(){
+    try {
+      const res = await fetch('/api/stock-purchases');
+      const data = await res.json();
+      stockPurchases = {};
+      (data.rows || []).forEach(r => { stockPurchases[r.agg_key] = r; });
+    } catch (err) { console.error('load stock-purchases failed', err); }
+  }
+  function computeStockMissingNeeds(){
+    const list = Object.values(rows).filter(r => r.stock_missing);
+    const agg = new Map(); // key -> { key, title, specs, img, qty, waitingOrders }
+    list.forEach(row => {
+      const items = JSON.parse(row.items_json || '[]');
+      items.forEach(it => {
+        const sk = specsKey(it);
+        const key = ((it.sku && it.sku.trim()) || `${it.title}::${it.variant || ''}`) + '::' + sk;
+        const existing = agg.get(key);
+        if (existing) {
+          existing.qty += it.qty;
+          if (!existing.img && it.img) existing.img = it.img;
+          // fiecare comandă apare separat (chiar dacă aceeași comandă are 2 produse lipsă diferite)
+          existing.waitingOrders.push({ name: row.order_name, qty: it.qty, awb: row.awb });
+        } else {
+          agg.set(key, {
+            key, title: it.title, specs: specsText(it), img: it.img || null, qty: it.qty,
+            waitingOrders: [{ name: row.order_name, qty: it.qty, awb: row.awb }]
+          });
+        }
+      });
+    });
+    return { orderCount: list.length, items: Array.from(agg.values()).sort((a,b) => b.qty - a.qty || a.title.localeCompare(b.title)) };
+  }
+  // 2026-08-27: fiecare re-randare înlocuia tot innerHTML-ul listei — la
+  // fiecare mesaj WebSocket (poll Sameday la 30s, sau chiar bifa/cantitatea
+  // pe care tocmai o completai, care se întoarce înapoi prin broadcast),
+  // ceea ce arunca scroll-ul din listă la 0 și întrerupea tastarea într-un
+  // câmp de cantitate — de-aia "sare" scroll-ul și nu poți opri unde vrei.
+  // Fix: dacă utilizatorul are focus pe un checkbox/câmp DIN listă chiar
+  // acum, sărim peste re-randare (datele oricum ajung corect la următoarea
+  // randare, după ce dă click în altă parte); și, oricum, păstrăm poziția
+  // de scroll în loc s-o resetăm.
+  function renderStockMissingNeeds(){
+    if (stockMissingNeedsList.contains(document.activeElement)) return;
+    const scrollPos = stockMissingNeedsList.scrollTop;
+    const { orderCount, items } = computeStockMissingNeeds();
+    stockMissingNeedsSubcount.textContent = orderCount;
+    if (!items.length){
+      stockMissingNeedsList.innerHTML = '<div class="empty-row">Nimic marcat stoc lipsă în acest moment. 🎉</div>';
+      return;
+    }
+    stockMissingNeedsList.innerHTML = items.map(it => {
+      const purchase = stockPurchases[it.key] || {};
+      const checked = !!purchase.checked;
+      const qtyVal = purchase.qty_purchased === null || purchase.qty_purchased === undefined ? '' : purchase.qty_purchased;
+      const orderChips = it.waitingOrders.map(o =>
+        `<span style="display:inline-block;background:var(--amber-soft);color:var(--amber);border-radius:6px;padding:2px 8px;margin:2px 3px 2px 0;font-size:0.72rem;font-weight:600;white-space:nowrap;">${escapeHtml(o.name)}${o.qty > 1 ? ' ×' + o.qty : ''}</span>`
+      ).join('');
+      return `
+      <div class="needs-row${checked ? ' purchased' : ''}" data-key="${escapeAttr(it.key)}">
+        ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div class="img-placeholder"></div>`}
+        <div class="needs-title">
+          ${escapeHtml(it.title)}${it.specs ? ` <span style="opacity:0.65;font-weight:400;">(${escapeHtml(it.specs)})</span>` : ''}
+          <div style="margin-top:5px;line-height:1.9">${orderChips}</div>
+        </div>
+        <div class="needs-qty"><span class="n">${it.qty}</span><span class="lbl">necesar</span></div>
+        <div class="needs-purchase">
+          <label><input type="checkbox" class="purchase-check" data-key="${escapeAttr(it.key)}" ${checked ? 'checked' : ''}> Achiziționat</label>
+          <input type="number" min="0" step="1" class="needs-purchase-qty purchase-qty" data-key="${escapeAttr(it.key)}" placeholder="cant." value="${escapeAttr(qtyVal)}">
+        </div>
+      </div>
+    `;
+    }).join('');
+    stockMissingNeedsList.scrollTop = scrollPos;
+  }
+  async function saveStockPurchase(key, checked, qty){
+    try {
+      const res = await fetch('/api/stock-purchases', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, checked, qty: qty === '' ? null : qty }),
+      });
+      const data = await res.json();
+      if (data.row) stockPurchases[data.row.agg_key] = data.row;
+    } catch (err) { console.error('save stock-purchase failed', err); }
+  }
+  stockMissingNeedsList.addEventListener('change', e => {
+    if (e.target.classList.contains('purchase-check')){
+      const key = e.target.dataset.key;
+      const row = e.target.closest('.needs-row');
+      const qtyInput = row.querySelector('.purchase-qty');
+      row.classList.toggle('purchased', e.target.checked);
+      saveStockPurchase(key, e.target.checked, qtyInput.value);
+    } else if (e.target.classList.contains('purchase-qty')){
+      const key = e.target.dataset.key;
+      const row = e.target.closest('.needs-row');
+      const checkInput = row.querySelector('.purchase-check');
+      saveStockPurchase(key, checkInput.checked, e.target.value);
+    }
+  });
+  document.getElementById('stockMissingNeedsBtn').addEventListener('click', async () => {
+    await loadStockPurchases();
+    renderStockMissingNeeds();
+    stockMissingNeedsModal.classList.add('open');
+  });
+  document.getElementById('stockMissingNeedsCloseBtn').addEventListener('click', () => {
+    stockMissingNeedsModal.classList.remove('open');
+  });
+  stockMissingNeedsModal.addEventListener('click', e => { if (e.target === stockMissingNeedsModal) stockMissingNeedsModal.classList.remove('open'); });
+
+  document.getElementById('resetNecesarBtn').addEventListener('click', async () => {
+    if (!confirm('Resetezi lista de produse lipsă? Toate comenzile blocate vor fi deblocate.')) return;
+    try {
+      const res = await fetch('/api/stock-missing/reset-all', { method: 'POST' });
+      const data = await res.json();
+      alert(`✅ ${data.count || 0} comenzi deblocate.`);
+    } catch (err) { alert('Eroare la resetare: ' + err.message); }
+  });
+
+  // ---- Registry --------------------------------------------------------
+  // Only useful while the warehouse is actually staffed — outside 08:00-18:00
+  // (Bucharest time) we hide it and let the picking list use the full column,
+  // instead of re-rendering a table nobody is looking at.
+  const registryPanel = document.querySelector('.registry');
+  const picklistPanel = document.querySelector('.picklist');
+  function isWorkHours(){
+    const h = Number(new Date().toLocaleString('en-US', { timeZone: tz, hour12:false, hour:'2-digit' }));
+    return h >= 8 && h < 18;
+  }
+  const registryBody = document.getElementById('registryBody');
+  // "Azi" (today) means it — scoped to the current Bucharest calendar day.
+  // Without this, every AWB ever added to `rows` during however long this
+  // tab has been open (the initial /api/unpacked load pulls the WHOLE
+  // cross-day backlog, and awb:update over the WebSocket keeps piling on
+  // more forever, never pruning packed ones) stayed in the "packed" count
+  // permanently — so a station open since yesterday showed yesterday's
+  // packed parcels as if they'd just been scanned today. Packed rows are
+  // scoped by packed_at (when they were actually confirmed), pending ones
+  // by first_scan_at (their only timestamp).
+  function isToday(iso){
+    if (!iso) return false;
+    return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }) === new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  }
+  // 2026-08-26: pe cerința clientului ("vreau sa am posibilitatea sa vad
+  // care sunt impachetate si care sunt in asteptare"), lista nu mai ascunde
+  // rândurile "în așteptare" mai vechi de 60s (REGISTRY_HIDE_AFTER_MS rămâne
+  // definit mai sus dar nu se mai folosește aici) — înainte, doar CONTORUL
+  // de sus mai reflecta corect câte erau în așteptare, dar rândurile chiar
+  // dispăreau din tabel după un minut, deci nu se putea vedea CARE anume.
+  // Acum toate rămân vizibile toată ziua, plus 3 butoane de filtru
+  // (Toate / Împachetate / În așteptare) ca lista să rămână ușor de citit.
+  let registryFilter = 'all';
+  function renderRegistry(){
+    if (!isWorkHours()){
+      registryPanel.classList.add('hidden');
+      picklistPanel.classList.add('full-height');
+      return;
+    }
+    registryPanel.classList.remove('hidden');
+    picklistPanel.classList.remove('full-height');
+    const scanned = Object.values(rows)
+      .filter(r => r.first_scan_at && isToday(r.packed ? r.packed_at : r.first_scan_at))
+      .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
+    let packed = 0, pending = 0;
+    scanned.forEach(row => { if (row.packed) packed++; else pending++; });
+    document.getElementById('packedCount').textContent = packed + ' împachetate';
+    document.getElementById('pendingCount').textContent = pending + ' în așteptare';
+    const visibleRows = scanned.filter(row => {
+      if (registryFilter === 'packed') return row.packed;
+      if (registryFilter === 'pending') return !row.packed;
+      return true;
+    });
+    registryBody.innerHTML = visibleRows.map(row => `
+      <tr data-awb="${escapeAttr(row.awb)}">
+        <td class="awb-cell">${escapeHtml(row.awb)}</td>
+        <td>${escapeHtml(row.order_name)}</td>
+        <td>${fmtTime(row.first_scan_at)}</td>
+        <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
+        <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+        <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+      </tr>
+    `).join('');
+  }
+  setInterval(renderRegistry, 5000);
+  document.querySelectorAll('.registry-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      registryFilter = btn.dataset.filter;
+      document.querySelectorAll('.registry-filter-btn').forEach(b => b.classList.toggle('active', b === btn));
+      renderRegistry();
+    });
+  });
+  document.getElementById('registryExportBtn').addEventListener('click', () => {
+    const scanned = Object.values(rows)
+      .filter(r => r.first_scan_at && isToday(r.packed ? r.packed_at : r.first_scan_at))
+      .filter(row => registryFilter === 'packed' ? row.packed : registryFilter === 'pending' ? !row.packed : true)
+      .sort((a,b) => (b.packed_at || b.first_scan_at).localeCompare(a.packed_at || a.first_scan_at));
+    exportCsv(`registru-scanare-${bucharestToday()}.csv`, scanned, [
+      { label: 'AWB', get: r => r.awb },
+      { label: 'Comandă', get: r => r.order_name },
+      { label: 'Prima scanare', get: r => fmtTime(r.first_scan_at) },
+      { label: 'Status', get: r => r.packed ? 'Împachetat' : 'Scanat 1x' },
+      { label: 'Confirmat la', get: r => r.packed ? fmtTime(r.packed_at) : '' },
+      { label: 'Notă', get: r => r.note || '' },
+    ]);
+  });
+
+  // ---- Stock-missing list (separate from the picking list) --------------
+  // A dedicated view of every currently-flagged AWB, regardless of where it
+  // sits in the picking list — computed straight from `rows` (no separate
+  // fetch/endpoint needed, since stock_missing rides along on every awb:new/
+  // awb:update the WebSocket already delivers). Cleared entries drop off
+  // automatically the next renderAll() after their flag is cleared (manually
+  // or by getting packed).
+  const stockMissingBar = document.getElementById('stockMissingBar');
+  const stockMissingList = document.getElementById('stockMissingList');
+  function renderStockMissingBar(){
+    const list = Object.values(rows).filter(r => r.stock_missing).sort((a,b) => (b.stock_missing_at || '').localeCompare(a.stock_missing_at || ''));
+    document.getElementById('stockMissingCount').textContent = list.length;
+    stockMissingBar.classList.toggle('hidden', list.length === 0);
+    stockMissingList.innerHTML = list.map(row => `
+      <div class="stock-missing-list-row">
+        <span class="order-name">${escapeHtml(row.order_name)}</span>
+        <span class="awb-cell">${escapeHtml(row.awb)}</span>
+        <span class="products-txt">${productsText(row)}</span>
+        <span class="flagged-at">${fmtTime(row.stock_missing_at)}</span>
+        <button type="button" class="clear-stock-missing-btn" data-awb="${escapeAttr(row.awb)}">✅ Am adus stocul</button>
+      </div>
+    `).join('');
+  }
+  document.getElementById('stockMissingBarHead').addEventListener('click', () => {
+    stockMissingList.style.display = stockMissingList.style.display === 'none' ? 'flex' : 'none';
+  });
+
+  function renderAll(){
+    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
+    renderPicklist();
+    renderRegistry();
+    renderStockMissingBar();
+    if (needsModal.classList.contains('open')) renderNeeds();
+    if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+  }
+
+  // Actualizare rapidă după un scan — nu rebuild total, doar ce s-a schimbat
+  function renderAfterScan(row){
+    // 1. Contorul din header (picklist count) — recalcul rapid, fără rebuild DOM
+    const unpacked = Object.values(rows).filter(isPickable);
+    const cnt = unpacked.length;
+    document.getElementById('picklistCount').textContent = cnt + (cnt === 1 ? ' comandă' : ' comenzi');
+    document.getElementById('dbCount').textContent = Object.keys(rows).length + ' comenzi în evidență';
+    // 2. Bara stock-missing (ușoară)
+    renderStockMissingBar();
+    // 3. Modals deschise (ușoare)
+    if (needsModal.classList.contains('open')) renderNeeds();
+    if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+    // 4. Registru — update chirurgical pe un singur <tr>
+    upsertRegistryRow(row);
+  }
+
+  function rowToRegistryHtml(row){
+    return `
+      <td class="awb-cell">${escapeHtml(row.awb)}</td>
+      <td>${escapeHtml(row.order_name)}</td>
+      <td>${fmtTime(row.first_scan_at)}</td>
+      <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
+      <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+      <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
+    `;
+  }
+
+  function upsertRegistryRow(row){
+    if (!row.first_scan_at) return; // nu e în registru
+    const existing = registryBody.querySelector(`tr[data-awb="${CSS.escape(row.awb)}"]`);
+    // Verifică dacă rândul e vizibil în filtrul curent
+    const visible = (registryFilter === 'packed') ? row.packed
+                  : (registryFilter === 'pending') ? !row.packed
+                  : true;
+    if (!visible){
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing){
+      existing.innerHTML = rowToRegistryHtml(row);
+    } else {
+      // Inserează la începutul tbody (cele mai recente primele)
+      const tr = document.createElement('tr');
+      tr.dataset.awb = row.awb;
+      tr.innerHTML = rowToRegistryHtml(row);
+      registryBody.insertAdjacentElement('afterbegin', tr);
+    }
+  }
+
+  // Every ~30s Sameday poll cycle broadcasts one awb:update message PER AWB
+  // (190+ of them, arriving almost simultaneously) — calling renderAll()
+  // straight from each message rebuilds the entire picking list + registry
+  // table that many times in a couple of seconds, which is what was causing
+  // the page to feel laggy. This coalesces any burst of messages arriving
+  // within the same short window into a single re-render.
+  let renderAllTimer = null;
+  function scheduleRenderAll(){
+    if (renderAllTimer) return;
+    renderAllTimer = setTimeout(() => { renderAllTimer = null; renderAll(); }, 200);
+  }
+
+  // ---- Notes: change/Enter → POST /api/note ------------------------------
+  // Guarded against unknown-return note inputs, which share the same
+  // .note-input styling class but are handled by their own listener above
+  // (they POST to /api/unknown-returns/:id/note, not /api/note).
+  document.addEventListener('change', e => {
+    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId) commitNote(e.target);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.target.classList.contains('note-input') && !e.target.dataset.unknownId && e.key === 'Enter'){
+      e.preventDefault();
+      commitNote(e.target);
+      e.target.blur();
+    }
+  });
+  async function commitNote(inputEl){
+    const awb = inputEl.dataset.awb;
+    const note = inputEl.value;
+    try {
+      await fetch('/api/note', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb, note }) });
+    } catch (err) { console.error('note save failed', err); }
+  }
+
+  // ---- Scan input ----------------------------------------------------
+  const input = document.getElementById('scanInput');
+  const main = document.getElementById('main');
+  const idleState = document.getElementById('idleState');
+  function keepFocus(){ input.focus(); }
+  document.addEventListener('click', e => { if (!e.target.classList.contains('note-input') && !e.target.closest('#needsModal') && !e.target.closest('#stockMissingNeedsModal') && !e.target.closest('#returnHistoryModal')) keepFocus(); });
+  window.addEventListener('load', keepFocus);
+  setInterval(() => { if (!needsModal.classList.contains('open') && !stockMissingNeedsModal.classList.contains('open') && !returnHistoryModal.classList.contains('open') && document.activeElement !== input) input.focus(); }, 1500);
+
+  function renderStatusBanner(kind, text){
+    const cls = { packed:'packed', first:'first', already:'already', reset:'reset', cancelled:'cancelled', returned:'returned', stockmissing:'stockmissing' }[kind] || 'first';
+    return `<div class="status-banner ${cls}">${text}</div>`;
+  }
+
+  // ---- Return-receipt scan mode ------------------------------------------
+  // Toggled on when a returned box physically arrives — scanning it then
+  // only confirms return_received, completely separate from the normal
+  // pack-confirmation flow (never touches `packed`).
+  const returnModeBtn = document.getElementById('returnModeBtn');
+  returnModeBtn.addEventListener('click', async () => {
+    returnMode = !returnMode;
+    returnModeBtn.classList.toggle('active', returnMode);
+    returnModeBtn.textContent = returnMode ? '🔄 Mod retur ACTIV' : '🔄 Scanează retur primit';
+    input.placeholder = returnMode ? 'Scanează AWB-ul returnat…' : 'Scanează AWB-ul de pe etichetă…';
+    if (returnMode) {
+      // Deschide automat istoricul pe azi ca să vadă ce a scanat
+      returnHistoryModal.classList.add('open');
+      await loadReturnHistoryDays();
+    }
+  });
+
+  // ---- Istoric retururi pe zile (2026-08-27) -------------------------------
+  // "Scanate ca retur primit" grupate pe zi (return_received_at), ca să vezi
+  // rapid ce s-a scanat azi / ieri / alaltăieri, nu doar coada curentă de
+  // retururi neconfirmate (returnsBar de mai sus, care e altceva).
+  const returnHistoryModal = document.getElementById('returnHistoryModal');
+  const returnHistoryDaysEl = document.getElementById('returnHistoryDays');
+  const returnHistoryListEl = document.getElementById('returnHistoryList');
+  const returnHistoryDayLabel = document.getElementById('returnHistoryDayLabel');
+  const returnHistoryCount = document.getElementById('returnHistoryCount');
+  function dayLabel(day){
+    const todayD = new Date(bucharestToday() + 'T00:00:00');
+    const targetD = new Date(day + 'T00:00:00');
+    const diffDays = Math.round((todayD - targetD) / 86400000);
+    if (diffDays === 0) return 'azi';
+    if (diffDays === 1) return 'ieri';
+    if (diffDays === 2) return 'alaltăieri';
+    return targetD.toLocaleDateString('ro-RO', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  }
+  let returnHistoryCurrentDay = null;
+  let returnHistoryCurrentRows = [];
+  async function loadReturnHistoryDay(day){
+    document.querySelectorAll('.return-history-day-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.day === day));
+    returnHistoryDayLabel.textContent = dayLabel(day);
+    returnHistoryCurrentDay = day;
+    const res = await fetch(`/api/return-day/${day}`);
+    const data = await res.json();
+    const rowsForDay = data.rows || [];
+    returnHistoryCurrentRows = rowsForDay;
+    returnHistoryCount.textContent = rowsForDay.length;
+    returnHistoryListEl.innerHTML = rowsForDay.length ? rowsForDay.map(row => `
+      <div class="return-history-row">
+        <span class="awb-cell">${escapeHtml(row.awb)}</span>
+        <span class="order-name">${escapeHtml(row.order_name)}</span>
+        <span class="products-txt">${productsText(row)}</span>
+        <span class="received-at">${fmtTime(row.return_received_at)}</span>
+      </div>
+    `).join('') : '<div class="empty-row">Niciun retur confirmat în ziua asta.</div>';
+  }
+  async function loadReturnHistoryDays(){
+    const res = await fetch('/api/return-days');
+    const data = await res.json();
+    const days = data.days || [];
+    if (!days.length){
+      returnHistoryDaysEl.innerHTML = '';
+      returnHistoryListEl.innerHTML = '<div class="empty-row">Niciun retur confirmat încă.</div>';
+      returnHistoryCount.textContent = '0';
+      returnHistoryDayLabel.textContent = '—';
+      return;
+    }
+    returnHistoryDaysEl.innerHTML = days.map(day => `<button type="button" class="return-history-day-btn" data-day="${escapeAttr(day)}">${escapeHtml(dayLabel(day))}</button>`).join('');
+    await loadReturnHistoryDay(days[0]);
+  }
+  returnHistoryDaysEl.addEventListener('click', e => {
+    const btn = e.target.closest('.return-history-day-btn');
+    if (btn) loadReturnHistoryDay(btn.dataset.day);
+  });
+  document.getElementById('returnHistoryBtn').addEventListener('click', async () => {
+    returnHistoryModal.classList.add('open');
+    await loadReturnHistoryDays();
+  });
+  document.getElementById('returnHistoryCloseBtn').addEventListener('click', () => {
+    returnHistoryModal.classList.remove('open');
+  });
+  returnHistoryModal.addEventListener('click', e => { if (e.target === returnHistoryModal) returnHistoryModal.classList.remove('open'); });
+  document.getElementById('returnHistoryExportBtn').addEventListener('click', () => {
+    exportCsv(`retururi-${returnHistoryCurrentDay || bucharestToday()}.csv`, returnHistoryCurrentRows, [
+      { label: 'AWB', get: r => r.awb },
+      { label: 'Comandă', get: r => r.order_name },
+      { label: 'Produse', get: r => productsTextPlain(r) },
+      { label: 'Retur primit la', get: r => fmtTime(r.return_received_at) },
+    ]);
+  });
+  function renderFound(row, bannerHtml){
+    idleState.style.display = 'none';
+    const items = JSON.parse(row.items_json || '[]');
+    const totalQty = items.reduce((s,i) => s + i.qty, 0);
+    const stockMissingBanner = row.stock_missing
+      ? `<div class="status-banner stockmissing">⚠️ STOC LIPSĂ — marcat ${fmtTime(row.stock_missing_at)}.<button type="button" class="clear-stock-missing-btn" data-awb="${escapeAttr(row.awb)}">✅ Am adus stocul</button></div>`
+      : '';
+    main.innerHTML = `
+      ${bannerHtml || ''}
+      ${stockMissingBanner}
+      <div class="result">
+        <div class="result-head">
+          <div class="order-tag">${escapeHtml(row.order_name)}</div>
+          ${row.total != null ? `<div class="price-tag">${parseFloat(row.total).toFixed(2)} ${row.currency || 'RON'}</div>` : ''}
+          <div class="meta">AWB ${escapeHtml(row.awb)} · comandă ${fmtTime(row.order_created_at)} · AWB generat ${fmtTime(row.awb_created_at)}</div>
+        </div>
+        ${!items.length ? `<div class="item-card" style="justify-content:center;color:var(--text-dim);font-size:0.9rem;gap:0.6rem;">⏳ Se încarcă produsele din Shopify…</div>` : ''}
+        ${items.map((it, idx) => `
+          <div class="item-card">
+            ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
+            <div class="item-info">
+              <p class="title">${escapeHtml(it.title)}</p>
+              ${(it.variant || (it.props && it.props.length)) ? `<div class="specs-row">
+                ${it.variant ? `<span class="spec-chip">${escapeHtml(it.variant)}</span>` : ''}
+                ${(it.props || []).map(p => `<span class="spec-chip">${escapeHtml(p.key)}: ${escapeHtml(p.value)}</span>`).join('')}
+              </div>` : ''}
+              ${it.sku ? `<span class="sku">SKU: ${escapeHtml(it.sku)}</span>` : ''}
+              ${idx === 0 && row.client_note ? `<div style="margin-top:0.35rem; font-size:0.82rem; color:var(--amber); background:var(--amber-soft); border-radius:6px; padding:0.35rem 0.55rem;">💬 Notă client: ${escapeHtml(row.client_note).replace(/\n/g, '<br>')}</div>` : ''}
+            </div>
+            <div class="qty-badge"><span class="n">${it.qty}</span><span class="lbl">buc</span></div>
+          </div>
+        `).join('')}
+        <div class="total-bar">
+          <span>${items.length} produs${items.length === 1 ? '' : 'e'} în colet</span>
+          <span>Total bucăți: <b>${totalQty}</b></span>
+        </div>
+      </div>
+    `;
+  }
+  function renderNotFound(code){
+    idleState.style.display = 'none';
+    main.innerHTML = `
+      <div class="not-found">
+        <div class="glyph">✕</div>
+        <h2>AWB negăsit</h2>
+        <p>Codul <code>${escapeHtml(code)}</code> nu a fost găsit. Dacă a fost generat chiar acum, ar trebui să apară în câteva secunde — mai încearcă o dată.</p>
+      </div>
+    `;
+  }
+
+  // ---- Sunete scanare (Web Audio API, fără fișiere externe) ---------------
+  let _audioCtx = null;
+  function getAudioCtx(){ return _audioCtx || (_audioCtx = new (window.AudioContext || window.webkitAudioContext)()); }
+  function playTone(freq, duration, type = 'sine', vol = 0.4){
+    try {
+      const ctx = getAudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = type; osc.frequency.value = freq;
+      gain.gain.setValueAtTime(vol, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime + duration);
+    } catch(e) { /* audio blocat de browser */ }
+  }
+  function soundOk()      { playTone(880, 0.12); setTimeout(() => playTone(1320, 0.15), 100); }
+  function soundPacked()  { playTone(660, 0.1);  setTimeout(() => playTone(880, 0.1), 90); setTimeout(() => playTone(1100, 0.2), 180); }
+  function soundError()   { playTone(220, 0.3, 'sawtooth', 0.35); }
+  function soundWarning() { playTone(440, 0.2, 'square', 0.2); setTimeout(() => playTone(330, 0.2, 'square', 0.2), 220); }
+
+  // ---- Notificări browser pentru comenzi noi --------------------------------
+  let _notifGranted = false;
+  (async function initNotif(){
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') { _notifGranted = true; return; }
+    if (Notification.permission !== 'denied') {
+      const p = await Notification.requestPermission();
+      _notifGranted = p === 'granted';
+    }
+  })();
+  function notifyNewOrder(row){
+    if (!_notifGranted) return;
+    const title = `📦 Comandă nouă — ${row.order_name || row.awb}`;
+    const body = row.items_json ? (() => { try { return JSON.parse(row.items_json).map(i => `${i.qty}× ${i.title}`).join(', '); } catch(e){ return ''; } })() : '';
+    try { new Notification(title, { body, icon: '/favicon.ico', tag: row.awb }); } catch(e){}
+  }
+
+  async function handleScan(raw){
+    const code = raw.trim();
+    if (!code) return;
+    input.value = '';
+    // The fixed "stoc lipsă" QR code taped to the packing table — not an
+    // AWB at all, so it's checked BEFORE the returnMode branch and before
+    // any AWB lookup. It flags whichever AWB was last successfully scanned.
+    if (code === STOCK_MISSING_MARKER){
+      if (!lastScannedAwb){
+        idleState.style.display = 'none';
+        main.innerHTML = `
+          <div class="not-found">
+            <div class="glyph">⚠️</div>
+            <h2>Scanează întâi AWB-ul</h2>
+            <p>Codul de „stoc lipsă" trebuie scanat imediat după AWB-ul comenzii care nu poate fi împachetată.</p>
+          </div>
+        `;
+        return;
+      }
+      try {
+        const res = await fetch('/api/stock-missing/flag', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ awb: lastScannedAwb }) });
+        const data = await res.json();
+        if (data.found){
+          rows[data.row.awb] = data.row;
+          renderAll();
+          renderFound(data.row, null);
+        }
+      } catch (err) { console.error('flag stock-missing failed', err); }
+      return;
+    }
+    if (returnMode){
+      try {
+        const res = await fetch('/api/scan-return', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+        const data = await res.json();
+        if (data.found){
+          delete returnRows[data.row.awb];
+          renderReturnsBar();
+          renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
+          // Actualizează lista din modal (ziua curentă) după fiecare scanare
+          const today = bucharestToday();
+          if (returnHistoryModal.classList.contains('open')) {
+            await loadReturnHistoryDay(returnHistoryCurrentDay || today);
+          }
+        } else if (data.logged){
+          unknownReturns[data.entry.id] = data.entry;
+          renderUnknownReturnsBar();
+          idleState.style.display = 'none';
+          main.innerHTML = `
+            <div class="not-found">
+              <div class="glyph">⚠️</div>
+              <h2>Retur neidentificat</h2>
+              <p>Codul <code>${escapeHtml(code)}</code> nu există în sistem — a fost adăugat în lista de retururi neidentificate, jos, pentru verificare manuală.</p>
+              <p style="margin-top:0.4rem; font-size:0.82rem;">Verifică manual — poate fi de la Fan Curier, Cargus, Sameday, Bookurier sau DPD.</p>
+            </div>
+          `;
+        }
+      } catch (err) {
+        console.error('return scan failed', err);
+      }
+      return;
+    }
+    try {
+      const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+      if (res.status === 404){ lastScannedAwb = null; soundError(); renderNotFound(code); return; }
+      const data = await res.json();
+      rows[data.row.awb] = data.row;
+      lastScannedAwb = data.row.awb;
+      renderAfterScan(data.row);
+      const noteLine = data.row.scan_note ? `<br><span style="opacity:0.8">📝 Notă din Shopify:<br>${escapeHtml(data.row.scan_note).replace(/\n/g, '<br>')}</span>` : '';
+      if (data.kind === 'first'){
+        soundOk();
+        renderFound(data.row, renderStatusBanner('first', '🔶 Scanare 1/2 — mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
+      } else if (data.kind === 'packed'){
+        soundPacked();
+        renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
+      } else if (data.kind === 'already'){
+        soundWarning();
+        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
+      } else if (data.kind === 'reset'){
+        soundWarning();
+        renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 10 minute de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
+      } else if (data.kind === 'cancelled'){
+        soundError();
+        renderFound(data.row, renderStatusBanner('cancelled', '🚫 COMANDĂ ANULATĂ — NU împacheta! A fost scoasă din lista de pregătit.'));
+      } else if (data.kind === 'restocked'){
+        // 2026-08-27: scanarea unui AWB marcat "stoc lipsă" șterge flagul și
+        // repornește ciclul normal (ca o primă scanare) — mai e nevoie de
+        // ÎNCĂ o scanare, în fereastra normală, ca să confirme împachetat.
+        soundOk();
+        renderFound(data.row, renderStatusBanner('first', '📦 Stocul a revenit — flag șters. Scanare 2/3, mai scanează o dată în max 10 minute ca să confirmi „împachetat".' + noteLine));
+      } else if (data.kind === 'blocked'){
+        // 2026-08-26: db.recordScan nu mai întoarce 'blocked' pentru un AWB
+        // marcat "stoc lipsă" — scanarea îl trece la 'restocked' (vezi
+        // comentariul din db.js). Ramura asta rămâne doar ca plasă de
+        // siguranță, în caz că o versiune veche de server mai e încă live
+        // undeva.
+        renderFound(data.row, noteLine ? renderStatusBanner('first', noteLine) : '');
+      }
+    } catch (err) {
+      console.error('scan failed', err);
+    }
+  }
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter'){ e.preventDefault(); handleScan(input.value); }
+  });
+
+  // ---- Initial load + WebSocket live updates ------------------------------
+  // Loads EVERY AWB that's neither packed nor cancelled, regardless of when
+  // it was created — not just today's — so the picking list surfaces the
+  // whole backlog still owed to a courier, not only what printed today.
+  //
+  // 2026-08-26: this used to be the ONLY source that populates `rows`, and
+  // it resets rows = {} every time (on load AND on every websocket "refresh"
+  // message). Since /api/unpacked only ever returns UNPACKED rows, any AWB
+  // already packed earlier today — before this tab's current session —
+  // never made it back into `rows`, so "Registru scanare — azi" undercounted
+  // "împachetate" (a reload right after packing #13/#14 today would drop
+  // both from the count, showing 12 instead of 14 even though the DB had it
+  // right). Fetching today's already-packed rows too and merging them in
+  // fixes that — isPickable() still keeps them out of the picking list
+  // (row.packed === true), only the registry benefits.
+  function bucharestToday(){
+    return new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  }
+  async function loadUnpacked(){
+    const res = await fetch('/api/unpacked');
+    const data = await res.json();
+    rows = {};
+    data.rows.forEach(r => { rows[r.awb] = r; });
+    try {
+      const packedRes = await fetch(`/api/packed-day/${bucharestToday()}`);
+      const packedData = await packedRes.json();
+      (packedData.rows || []).forEach(r => { if (!r.cancelled) rows[r.awb] = r; });
+    } catch (err) { console.error('load packed-today failed', err); }
+    renderAll();
+  }
+
+  function connectWs(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { document.getElementById('connDot').classList.add('live'); };
+    ws.onclose = () => { document.getElementById('connDot').classList.remove('live'); setTimeout(connectWs, 2000); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'awb:new' || msg.type === 'awb:update'){
+        rows[msg.awb.awb] = msg.awb;
+        if (msg.type === 'awb:new') notifyNewOrder(msg.awb);
+        // Dacă update-ul e pentru AWB-ul afișat curent și acum are produse, re-randăm ecranul
+        if (msg.type === 'awb:update' && msg.awb.awb === lastScannedAwb) {
+          try {
+            const updItems = JSON.parse(msg.awb.items_json || '[]');
+            if (updItems.length > 0 && main.querySelector('.item-card')) {
+              // Păstrăm banner-ul existent și re-randăm cu produsele noi
+              const existingBanner = main.querySelector('.status-banner, .status-banner.stockmissing');
+              renderFound(msg.awb, existingBanner ? existingBanner.outerHTML : null);
+            }
+          } catch {}
+        }
+        scheduleRenderAll();
+        // Keep the returns bar in sync without a full re-fetch: add/remove
+        // this one row locally based on its current status.
+        if (msg.awb.return_received || !isReturnStatus(msg.awb.sameday_status)) {
+          if (returnRows[msg.awb.awb]) { delete returnRows[msg.awb.awb]; renderReturnsBar(); }
+        } else {
+          returnRows[msg.awb.awb] = msg.awb;
+          renderReturnsBar();
+        }
+      } else if (msg.type === 'unknown-return:new' || msg.type === 'unknown-return:update'){
+        unknownReturns[msg.entry.id] = msg.entry;
+        renderUnknownReturnsBar();
+      } else if (msg.type === 'unknown-return:resolved'){
+        delete unknownReturns[msg.entry.id];
+        renderUnknownReturnsBar();
+      } else if (msg.type === 'stock-purchase:update'){
+        if (msg.row) stockPurchases[msg.row.agg_key] = msg.row;
+        if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+      } else if (msg.type === 'stock-purchases:reset'){
+        stockPurchases = {};
+        if (stockMissingNeedsModal.classList.contains('open')) renderStockMissingNeeds();
+      } else if (msg.type === 'refresh'){
+        loadUnpacked();
+        loadReturns();
+        loadUnknownReturns();
+      }
+    };
+  }
+
+  loadUnpacked();
+  loadReturns();
+  loadUnknownReturns();
+  connectWs();
+
+  // Înregistrare Service Worker (PWA)
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+</script>
 </body>
-</html>`);
-});
-
-// --- Sameday polling (courier status for open AWBs) ----------------------
-// Kill switch: set SAMEDAY_POLL_ENABLED=false in Railway to pause this
-// entirely (e.g. while investigating a block/lockout on the Sameday side)
-// without touching anything else — AWB tracking via the Shopify webhook
-// keeps working either way, this only feeds the courier-status column.
-if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
-  console.warn('[sameday] polling disabled via SAMEDAY_POLL_ENABLED=false');
-} else {
-  sameday.startPoller(
-    db,
-    (awb, result) => applySamedayUpdate(awb, result),
-    SAMEDAY_POLL_MS
-  );
-}
-
-// --- Shopify backfill safety net -----------------------------------------
-// Webhooks are the primary path (seconds of latency); this just guards
-// against a missed delivery (server restart, transient network blip).
-async function backfillToday() {
-  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' });
-  const startIso = new Date(`${todayKey}T00:00:00+03:00`).toISOString(); // Bucharest is UTC+2/+3; adjust below if needed
-  let cursor = null;
-  let added = 0;
-  for (let page = 0; page < 20; page++) {
-    const data = await shopify.shopifyGraphql(
-      `query($cursor: String) {
-        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
-          edges { node {
-            id name createdAt updatedAt note phone
-            shippingAddress { phone }
-            totalPriceSet { shopMoney { amount currencyCode } }
-            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
-          } }
-          pageInfo { hasNextPage endCursor }
-        }
-      }`,
-      { cursor }
-    );
-    const edges = data.orders.edges;
-    if (!edges.length) break;
-    let sawOld = false;
-    for (const { node: o } of edges) {
-      if (new Date(o.updatedAt) < new Date(startIso)) { sawOld = true; continue; }
-      for (const f of o.fulfillments) {
-        if (f.status !== 'SUCCESS') continue;
-        const tracking = f.trackingInfo[0];
-        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
-        if (new Date(f.createdAt).toLocaleDateString('en-CA', { timeZone: 'Europe/Bucharest' }) !== todayKey) continue;
-        const existing = db.getAwb(tracking.number);
-        if (existing) continue;
-        db.upsertAwb({
-          awb: tracking.number,
-          order_name: o.name,
-          order_created_at: o.createdAt,
-          awb_created_at: f.createdAt,
-          total: parseFloat(o.totalPriceSet.shopMoney.amount),
-          currency: o.totalPriceSet.shopMoney.currencyCode,
-          order_id: o.id ? o.id.split('/').pop() : null,
-          client_note: o.note || '',
-          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
-          items: o.lineItems.edges.map((e) => ({
-            title: e.node.title,
-            qty: e.node.quantity,
-            sku: e.node.sku,
-            variant: e.node.variantTitle || '',
-            props: shopify.extractProperties(e.node.customAttributes),
-            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
-          })),
-        });
-        added++;
-      }
-    }
-    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
-    cursor = data.orders.pageInfo.endCursor;
-  }
-  if (added) {
-    console.log(`[backfill] added ${added} AWB(s) missed by webhooks`);
-    broadcast({ type: 'refresh' }); // simplest: tell clients to re-fetch today
-  }
-  return added;
-}
-
-// Same crawl as backfillToday(), but over the last `daysBack` days instead of
-// just today, and without the "must be Sameday-created today" restriction —
-// used for the one-time manual catch-up via /admin/backfill-old.
-async function backfillRange(daysBack, debug) {
-  const cutoffMs = Date.now() - daysBack * 24 * 3600 * 1000;
-  let cursor = null;
-  let added = 0;
-  const stats = { ordersScanned: 0, fulfillmentsSuccess: 0, samedayMatches: 0, alreadyInDb: 0, pages: 0 };
-  for (let page = 0; page < 60; page++) {
-    stats.pages++;
-    const data = await shopify.shopifyGraphql(
-      `query($cursor: String) {
-        orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
-          edges { node {
-            id name createdAt updatedAt note phone
-            shippingAddress { phone }
-            totalPriceSet { shopMoney { amount currencyCode } }
-            fulfillments { status createdAt trackingInfo(first: 1) { number company } }
-            lineItems(first: 20) { edges { node { title quantity sku variantTitle image { url } variant { image { url } } customAttributes { key value } } } }
-          } }
-          pageInfo { hasNextPage endCursor }
-        }
-      }`,
-      { cursor }
-    );
-    const edges = data.orders.edges;
-    if (!edges.length) break;
-    let sawOld = false;
-    for (const { node: o } of edges) {
-      stats.ordersScanned++;
-      if (new Date(o.updatedAt).getTime() < cutoffMs) { sawOld = true; continue; }
-      for (const f of o.fulfillments) {
-        if (f.status !== 'SUCCESS') continue;
-        if (new Date(f.createdAt).getTime() < cutoffMs) continue;
-        stats.fulfillmentsSuccess++;
-        const tracking = f.trackingInfo[0];
-        if (!tracking || !isSupportedCourierName(tracking.company)) continue;
-        stats.samedayMatches++;
-        const existing = db.getAwb(tracking.number);
-        if (existing) { stats.alreadyInDb++; continue; }
-        db.upsertAwb({
-          awb: tracking.number,
-          order_name: o.name,
-          order_created_at: o.createdAt,
-          awb_created_at: f.createdAt,
-          total: parseFloat(o.totalPriceSet.shopMoney.amount),
-          currency: o.totalPriceSet.shopMoney.currencyCode,
-          order_id: o.id ? o.id.split('/').pop() : null,
-          client_note: o.note || '',
-          phone: (o.shippingAddress && o.shippingAddress.phone) || o.phone || '',
-          items: o.lineItems.edges.map((e) => ({
-            title: e.node.title,
-            qty: e.node.quantity,
-            sku: e.node.sku,
-            variant: e.node.variantTitle || '',
-            props: shopify.extractProperties(e.node.customAttributes),
-            img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
-          })),
-        });
-        added++;
-      }
-    }
-    if (!data.orders.pageInfo.hasNextPage || sawOld) break;
-    cursor = data.orders.pageInfo.endCursor;
-  }
-  if (added) console.log(`[backfill-old] added ${added} AWB(s) from the last ${daysBack} day(s)`);
-  return debug ? { added, stats } : added;
-}
-
-if (process.env.SHOPIFY_SHOP && process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
-  backfillToday().catch((err) => console.error('[backfill] startup run failed', err));
-  setInterval(() => backfillToday().catch((err) => console.error('[backfill] error', err)), BACKFILL_INTERVAL_MS);
-} else {
-  console.warn('[backfill] SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set — skipping Shopify backfill (webhook-only mode)');
-}
-
-server.listen(PORT, () => {
-  console.log(`AWB Glorio server listening on :${PORT}`);
-});
-
-// Last-resort safety net: log and keep running instead of crashing the
-// whole process on an unexpected error (e.g. from a background poll tick).
-process.on('uncaughtException', (err) => console.error('[fatal] uncaughtException', err));
-process.on('unhandledRejection', (err) => console.error('[fatal] unhandledRejection', err));
+</html>
