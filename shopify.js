@@ -113,6 +113,41 @@ const ORDER_QUERY = `
   }
 `;
 
+// Query care aduce și fulfillments (cu trackingInfo + produsele lor) în
+// același apel. Folosit în loc de ORDER_QUERY când vrem să filtrăm produsele
+// după AWB-ul curier — esențial pentru comenzile cu fulfillment-uri parțiale.
+const ORDER_WITH_FULFILLMENTS_QUERY = `
+  query OrderWithFulfillments($id: ID!) {
+    order(id: $id) {
+      name
+      note
+      createdAt
+      phone
+      shippingAddress { phone }
+      totalPriceSet { shopMoney { amount currencyCode } }
+      fulfillments(first: 15) {
+        trackingInfo { number }
+        fulfillmentLineItems(first: 30) {
+          edges {
+            node {
+              quantity
+              lineItem {
+                title
+                sku
+                variantTitle
+                customAttributes { key value }
+                image { url }
+                variant { image { url } }
+                originalUnitPriceSet { shopMoney { amount } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 // Some products carry their real specification (color, size, engraving text,
 // etc.) not as a Shopify VARIANT at all, but as custom line-item PROPERTIES
 // — set by a personalization app, a custom options app, or manual entry at
@@ -154,6 +189,69 @@ async function fetchOrderDetails(orderGid) {
       img: (e.node.image && e.node.image.url) || (e.node.variant && e.node.variant.image && e.node.variant.image.url) || null,
     })),
   };
+}
+
+// Variantă a fetchOrderDetails care filtrează produsele după fulfillment-ul
+// cu tracking-ul = awb. Necesară pentru comenzile cu mai multe colete (AWB-uri
+// diferite per fulfillment parțial) — altfel scanerul ar arăta TOATE produsele
+// din comandă indiferent de care colet e scanat.
+//
+// Logica:
+//   1. Aduce toate fulfillment-urile comenzii + produsele fiecăruia.
+//   2. Găsește fulfillment-ul al cărui trackingInfo.number === awb.
+//   3. Returnează doar produsele din acel fulfillment (cu qty-ul din fulfillment,
+//      nu qty-ul total al liniei — e.g. o linie cu 2 buc dar fulfillment-ul
+//      a livrat doar 1 arată 1 buc).
+//   4. Totalul afișat = suma (qty × preț unitar) din fulfillment-ul respectiv,
+//      nu totalul întregii comenzi.
+//   5. Dacă nu găsește niciun fulfillment cu tracking-ul dat (caz rar),
+//      cade back pe toate lineItems comenzii (comportamentul vechi).
+async function fetchFulfillmentDetails(orderGid, awb) {
+  const data = await shopifyGraphql(ORDER_WITH_FULFILLMENTS_QUERY, { id: orderGid });
+  const o = data.order;
+  if (!o) return null;
+
+  const phone = (o.shippingAddress && o.shippingAddress.phone) || o.phone || '';
+  const currency = o.totalPriceSet.shopMoney.currencyCode;
+
+  // Caută fulfillment-ul cu tracking = awb (comparație case-insensitive,
+  // pentru că unele curiere returnează tracking-ul cu litere mari/mici diferit)
+  const fulfillment = (o.fulfillments || []).find((f) =>
+    (f.trackingInfo || []).some((t) => (t.number || '').toUpperCase() === awb.toUpperCase())
+  );
+
+  if (fulfillment) {
+    const items = fulfillment.fulfillmentLineItems.edges.map((e) => ({
+      title: e.node.lineItem.title,
+      qty: e.node.quantity, // qty livrat în ACEST fulfillment, nu qty-ul total al liniei
+      sku: e.node.lineItem.sku,
+      variant: e.node.lineItem.variantTitle || '',
+      props: extractProperties(e.node.lineItem.customAttributes),
+      img:
+        (e.node.lineItem.image && e.node.lineItem.image.url) ||
+        (e.node.lineItem.variant && e.node.lineItem.variant.image && e.node.lineItem.variant.image.url) ||
+        null,
+    }));
+    // Totalul acestui colet = suma prețurilor unitare × cantitate (fără transport)
+    const total = fulfillment.fulfillmentLineItems.edges.reduce((sum, e) => {
+      const price = parseFloat((e.node.lineItem.originalUnitPriceSet && e.node.lineItem.originalUnitPriceSet.shopMoney && e.node.lineItem.originalUnitPriceSet.shopMoney.amount) || 0);
+      return sum + price * e.node.quantity;
+    }, 0);
+    return {
+      name: o.name,
+      note: o.note || '',
+      createdAt: o.createdAt,
+      phone,
+      total,
+      currency,
+      items,
+    };
+  }
+
+  // Fallback: niciun fulfillment nu se potrivește — returnează toate produsele comenzii
+  // (comportamentul original, pentru comenzile cu un singur colet)
+  console.warn(`[shopify] fetchFulfillmentDetails: no fulfillment found for AWB ${awb} in order ${orderGid} — falling back to all line items`);
+  return fetchOrderDetails(orderGid);
 }
 
 // Looks up an order's GID by its Shopify order name (e.g. "#16265") — used
@@ -221,4 +319,4 @@ async function fetchOrderNote(orderGid) {
   return (data.order && data.order.note) || '';
 }
 
-module.exports = { verifyWebhookHmac, fetchOrderDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote, extractProperties };
+module.exports = { verifyWebhookHmac, fetchOrderDetails, fetchFulfillmentDetails, shopifyGraphql, findOrderIdByName, appendOrderScanNote, fetchOrderNote, extractProperties };
