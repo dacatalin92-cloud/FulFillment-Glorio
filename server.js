@@ -225,7 +225,9 @@ async function handleFulfillmentPayload(payload) {
   if (!awb) return;
 
   const orderGid = `gid://shopify/Order/${payload.order_id}`;
-  const order = await shopify.fetchOrderDetails(orderGid);
+  // fetchFulfillmentDetails filtrează produsele după fulfillment-ul cu tracking = awb
+  // — fix pentru comenzile cu mai multe colete (fulfillment-uri parțiale).
+  const order = await shopify.fetchFulfillmentDetails(orderGid, awb);
   if (!order) return;
 
   const row = db.upsertAwb({
@@ -1115,7 +1117,9 @@ app.post('/api/scan', (req, res) => {
   if (!hasItems && result.row.order_id) {
     (async () => {
       try {
-        const order = await shopify.fetchOrderDetails(`gid://shopify/Order/${result.row.order_id}`);
+        // fetchFulfillmentDetails filtrează produsele după AWB-ul curier,
+        // fix pentru comenzile cu mai multe colete parțiale.
+        const order = await shopify.fetchFulfillmentDetails(`gid://shopify/Order/${result.row.order_id}`, result.row.awb);
         if (!order || !order.items || !order.items.length) return;
         if (db.db) {
           db.db.prepare('UPDATE awbs SET items_json = ?, total = COALESCE(NULLIF(total, 0), ?), currency = COALESCE(NULLIF(currency, \'\'), ?) WHERE awb = ?')
@@ -1125,7 +1129,7 @@ app.post('/api/scan', (req, res) => {
           console.log(`[scan] fetched missing items for ${result.row.awb} (${order.items.length} produse)`);
         }
       } catch (err) {
-        console.error('[shopify] fetchOrderDetails for missing items failed for', result.row.awb, err);
+        console.error('[shopify] fetchFulfillmentDetails for missing items failed for', result.row.awb, err);
       }
     })();
   }
