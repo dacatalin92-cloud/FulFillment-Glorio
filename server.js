@@ -70,7 +70,7 @@ const PACK_WINDOW_MS = 10 * 60 * 1000;
 // seconds is a safe middle ground: still 4x faster than the original 2
 // minutes, without hammering Sameday's API or the DB nonstop.
 const SAMEDAY_POLL_MS = 30 * 1000;
-const DPD_POLL_MS = 5 * 60 * 1000; // 5 minute — mai rar ca Sameday, DPD nu actualizează la fel de des
+const DPD_POLL_MS = 8 * 1000; // 8 secunde — verificare status DPD
 const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
 // Payload of the fixed "stoc lipsă" QR code, printed once and taped to the
 // packing table (see scan.html) — not a real AWB, just a marker staff scan
@@ -1488,8 +1488,8 @@ async function pollDpdOnce() {
     } catch (err) {
       console.error(`[dpd] getStatus eșuat pentru ${row.awb}:`, err.message || err);
     }
-    // Throttle: 500ms între cereri, ca să nu supraîncărcăm API-ul DPD
-    await new Promise((r) => setTimeout(r, 500));
+    // Throttle: 100ms între cereri (la 4s poll interval, ciclul trebuie să fie rapid)
+    await new Promise((r) => setTimeout(r, 100));
   }
   if (changed) console.log(`[dpd] poll complet — ${changed}/${rows.length} AWB-uri actualizate`);
 }
@@ -1499,14 +1499,14 @@ if (process.env.DPD_POLL_ENABLED === 'false') {
 } else if (!process.env.DPD_USERNAME || !process.env.DPD_PASSWORD) {
   console.warn('[dpd] DPD_USERNAME / DPD_PASSWORD lipsesc din env — polling DPD dezactivat');
 } else {
-  // Prima rulare după 45s (lăsăm serverul să se inițializeze complet)
+  // Prima rulare după 10s (lăsăm serverul să se inițializeze), apoi la fiecare 4s
   setTimeout(() => {
     pollDpdOnce().catch((err) => console.error('[dpd] poll error', err));
     setInterval(() => {
       pollDpdOnce().catch((err) => console.error('[dpd] poll error', err));
     }, DPD_POLL_MS);
-  }, 45000);
-  console.log('[dpd] polling pornit — interval 5 minute');
+  }, 10000);
+  console.log('[dpd] polling pornit — interval 8 secunde');
 }
 
 // --- Shopify backfill safety net -----------------------------------------
