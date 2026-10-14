@@ -153,6 +153,8 @@
   .returns-row .order-name{ flex:0 0 auto; font-weight:500; }
   .returns-row .status-txt{ flex:1 1 auto; color:var(--text-dim); font-size:0.78rem; }
   .mark-received-btn{ flex:0 0 auto; font-family:inherit; font-size:0.76rem; font-weight:600; padding:0.3rem 0.6rem; border-radius:6px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); cursor:pointer; }
+  .returns-day-header{ font-family:"IBM Plex Mono", monospace; font-size:0.73rem; font-weight:600; color:var(--amber); opacity:0.7; padding:0.45rem 0.2rem 0.2rem; text-transform:uppercase; letter-spacing:0.04em; border-top:1px solid var(--border); margin-top:0.3rem; }
+  .returns-day-header:first-child{ border-top:none; margin-top:0; padding-top:0.1rem; }
 
   .unknown-returns-bar{ flex:0 0 auto; background:var(--red-soft); border-bottom:1px solid var(--border); }
   .unknown-returns-bar.hidden{ display:none; }
@@ -628,19 +630,37 @@
     data.rows.forEach(r => { returnRows[r.awb] = r; });
     renderReturnsBar();
   }
+  function bucharestDay(iso){
+    if (!iso) return null;
+    return new Date(iso).toLocaleDateString('en-CA', { timeZone: tz }); // 'YYYY-MM-DD'
+  }
   function renderReturnsBar(){
-    const list = Object.values(returnRows);
+    const list = Object.values(returnRows).sort((a,b) => (b.sameday_checked_at||'').localeCompare(a.sameday_checked_at||''));
     document.getElementById('returnsCount').textContent = list.length;
     const btn = document.getElementById('returnsBarHead');
     btn.style.display = list.length === 0 ? 'none' : 'flex';
-    returnsList.innerHTML = list.map(row => `
-      <div class="returns-row">
-        <span class="awb-cell">${escapeHtml(row.awb)}</span>
-        <span class="order-name">${escapeHtml(row.order_name)}</span>
-        <span class="status-txt">${escapeHtml(row.sameday_status || '')}</span>
-        <button type="button" class="mark-received-btn" data-awb="${escapeAttr(row.awb)}">✅ Am primit-o</button>
-      </div>
-    `).join('');
+    // Grupăm pe zi după sameday_checked_at — ziua în care sistemul a detectat returul
+    const groups = [];
+    const seen = new Map();
+    list.forEach(row => {
+      const day = bucharestDay(row.sameday_checked_at) || '—';
+      if (!seen.has(day)) { seen.set(day, []); groups.push(day); }
+      seen.get(day).push(row);
+    });
+    returnsList.innerHTML = groups.map(day => {
+      const rows = seen.get(day);
+      return `
+        <div class="returns-day-header">${escapeHtml(day === '—' ? '—' : dayLabel(day))} — ${rows.length} ${rows.length === 1 ? 'colet' : 'colete'}</div>
+        ${rows.map(row => `
+          <div class="returns-row">
+            <span class="awb-cell">${escapeHtml(row.awb)}</span>
+            <span class="order-name">${escapeHtml(row.order_name)}</span>
+            <span class="status-txt">${escapeHtml(row.sameday_status || '')}</span>
+            <button type="button" class="mark-received-btn" data-awb="${escapeAttr(row.awb)}">✅ Am primit-o</button>
+          </div>
+        `).join('')}
+      `;
+    }).join('');
   }
   document.getElementById('returnsBarHead').addEventListener('click', () => {
     returnsBar.classList.toggle('hidden');
@@ -1160,11 +1180,16 @@
   // only confirms return_received, completely separate from the normal
   // pack-confirmation flow (never touches `packed`).
   const returnModeBtn = document.getElementById('returnModeBtn');
-  returnModeBtn.addEventListener('click', () => {
+  returnModeBtn.addEventListener('click', async () => {
     returnMode = !returnMode;
     returnModeBtn.classList.toggle('active', returnMode);
     returnModeBtn.textContent = returnMode ? '🔄 Mod retur ACTIV' : '🔄 Scanează retur primit';
     input.placeholder = returnMode ? 'Scanează AWB-ul returnat…' : 'Scanează AWB-ul de pe etichetă…';
+    if (returnMode) {
+      // Deschide automat istoricul pe azi ca să vadă ce a scanat
+      returnHistoryModal.classList.add('open');
+      await loadReturnHistoryDays();
+    }
   });
 
   // ---- Istoric retururi pe zile (2026-08-27) -------------------------------
@@ -1363,6 +1388,11 @@
           delete returnRows[data.row.awb];
           renderReturnsBar();
           renderFound(data.row, renderStatusBanner('returned', '📦 Retur confirmat — coletul a fost primit înapoi în depozit.'));
+          // Actualizează lista din modal (ziua curentă) după fiecare scanare
+          const today = bucharestToday();
+          if (returnHistoryModal.classList.contains('open')) {
+            await loadReturnHistoryDay(returnHistoryCurrentDay || today);
+          }
         } else if (data.logged){
           unknownReturns[data.entry.id] = data.entry;
           renderUnknownReturnsBar();
