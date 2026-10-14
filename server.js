@@ -8,6 +8,7 @@ const { WebSocketServer } = require('ws');
 const db = require('./db');
 const sameday = require('./sameday');
 const shopify = require('./shopify');
+const dpd = require('./dpd');
 
 // 2026-10-07: scanerul citește de pe eticheta DPD un cod de bare de 28 de
 // cifre care NU e AWB-ul real — e un cod compus: "1000" (prefix fix) +
@@ -31,6 +32,12 @@ function extractDpdAwbFromScan(code) {
   const m = c.match(/^1000(\d{10,14})\d+$/);
   if (m) return m[1];
   return null;
+}
+
+// AWB-urile DPD sunt pur numerice (10-14 cifre). Bookurier încep cu "BOK",
+// Sameday cu "1ONB" sau similar. Această funcție distinge DPD de ceilalți.
+function isDpdAwb(awb) {
+  return /^\d{10,14}$/.test(String(awb || ''));
 }
 
 function findByCodeFlexible(code) {
@@ -63,6 +70,7 @@ const PACK_WINDOW_MS = 10 * 60 * 1000;
 // seconds is a safe middle ground: still 4x faster than the original 2
 // minutes, without hammering Sameday's API or the DB nonstop.
 const SAMEDAY_POLL_MS = 30 * 1000;
+const DPD_POLL_MS = 5 * 60 * 1000; // 5 minute — mai rar ca Sameday, DPD nu actualizează la fel de des
 const BACKFILL_INTERVAL_MS = 15 * 60 * 1000; // safety net in case a webhook is ever missed
 // Payload of the fixed "stoc lipsă" QR code, printed once and taped to the
 // packing table (see scan.html) — not a real AWB, just a marker staff scan
@@ -962,6 +970,27 @@ app.get('/admin/reconcile-with-shopify-result', (req, res) => {
   res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
 });
 
+// --- Anulare manuală AWB -------------------------------------------------
+// Folosit când AWB-ul e anulat în xConnector/Bookurier/DPD dar sistemul nu
+// primește nicio notificare automată (nu există webhook de la acești curieri).
+// Usage: /admin/cancel-awb?secret=...&awb=<AWB>
+// Efectul: setează cancelled = 1 în DB și trimite awb:update la toți clienții.
+app.get('/admin/cancel-awb', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const awb = (req.query.awb || '').trim();
+  if (!awb) return res.status(400).json({ error: 'missing awb parameter' });
+  const row = db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(awb);
+  if (!row) return res.status(404).json({ error: 'AWB not found', awb });
+  if (row.cancelled) return res.json({ ok: true, already: true, awb, note: 'already cancelled' });
+  db.db.prepare('UPDATE awbs SET cancelled = 1 WHERE awb = ?').run(awb);
+  const updated = db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(awb);
+  broadcast({ type: 'awb:update', awb: updated });
+  console.log(`[admin] manually cancelled AWB ${awb} (order ${row.order_name})`);
+  res.json({ ok: true, awb, order_name: row.order_name });
+});
+
 // --- Re-backfill items per fulfillment -----------------------------------
 // Endpoint nou (2026-10-14) care re-fetchuiește produsele pentru AWB-urile
 // deja în DB, folosind noua logică fetchFulfillmentDetails (filtrată după AWB,
@@ -1414,6 +1443,70 @@ if (process.env.SAMEDAY_POLL_ENABLED === 'false') {
     (awb, result) => applySamedayUpdate(awb, result),
     SAMEDAY_POLL_MS
   );
+}
+
+// --- DPD polling (status AWB-uri DPD) ------------------------------------
+// Identic ca Sameday, dar pentru AWB-urile numerice DPD. Statusul e stocat
+// în coloana sameday_status (refolosită pentru toți curierii — denumire
+// nefericită, dar nu necesită migrare DB). Dacă statusul conține "anulat"/
+// "cancel", AWB-ul e marcat automat cancelled=1 exact ca la Shopify webhook.
+//
+// Credențiale necesare în Railway: DPD_USERNAME + DPD_PASSWORD.
+// Kill switch: DPD_POLL_ENABLED=false dezactivează polling-ul.
+// Debug:       DPD_DEBUG=1 logă răspunsul brut al API-ului DPD (util la
+//              prima rulare, ca să verifici structura exactă a răspunsului).
+async function pollDpdOnce() {
+  if (!process.env.DPD_USERNAME || !process.env.DPD_PASSWORD) return;
+  // Excludem AWB-urile deja anulate sau împachetate; filtrăm după format DPD
+  const rows = db.listUnpackedNotCancelled().filter((r) => isDpdAwb(r.awb));
+  if (!rows.length) return;
+
+  let changed = 0;
+  for (const row of rows) {
+    try {
+      const status = await dpd.getStatus(row.awb);
+      if (!status) continue; // null = 404 de la DPD, AWB nou, normal
+
+      // Skip dacă statusul nu s-a schimbat față de ce avem deja
+      const existing = db.getAwb ? db.getAwb(row.awb) : null;
+      if (existing && existing.sameday_status === status) continue;
+
+      // Salvăm statusul în coloana sameday_status (reutilizată pentru toți curierii)
+      const updatedRow = db.updateSameday(row.awb, { status });
+      broadcast({ type: 'awb:update', awb: updatedRow });
+      changed++;
+
+      // Auto-anulare dacă DPD raportează că AWB-ul a fost anulat
+      if (dpd.isAnulat(status)) {
+        db.db.prepare('UPDATE awbs SET cancelled = 1 WHERE awb = ?').run(row.awb);
+        const cancelledRow = db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(row.awb);
+        if (cancelledRow) broadcast({ type: 'awb:update', awb: cancelledRow });
+        console.log(`[dpd] AWB ${row.awb} (${row.order_name}) auto-anulat — status DPD: "${status}"`);
+      } else {
+        console.log(`[dpd] status ${row.awb}: "${status}"`);
+      }
+    } catch (err) {
+      console.error(`[dpd] getStatus eșuat pentru ${row.awb}:`, err.message || err);
+    }
+    // Throttle: 500ms între cereri, ca să nu supraîncărcăm API-ul DPD
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (changed) console.log(`[dpd] poll complet — ${changed}/${rows.length} AWB-uri actualizate`);
+}
+
+if (process.env.DPD_POLL_ENABLED === 'false') {
+  console.warn('[dpd] polling dezactivat via DPD_POLL_ENABLED=false');
+} else if (!process.env.DPD_USERNAME || !process.env.DPD_PASSWORD) {
+  console.warn('[dpd] DPD_USERNAME / DPD_PASSWORD lipsesc din env — polling DPD dezactivat');
+} else {
+  // Prima rulare după 45s (lăsăm serverul să se inițializeze complet)
+  setTimeout(() => {
+    pollDpdOnce().catch((err) => console.error('[dpd] poll error', err));
+    setInterval(() => {
+      pollDpdOnce().catch((err) => console.error('[dpd] poll error', err));
+    }, DPD_POLL_MS);
+  }, 45000);
+  console.log('[dpd] polling pornit — interval 5 minute');
 }
 
 // --- Shopify backfill safety net -----------------------------------------
