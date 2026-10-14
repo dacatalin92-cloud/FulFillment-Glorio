@@ -1280,6 +1280,7 @@
           ${row.total != null ? `<div class="price-tag">${parseFloat(row.total).toFixed(2)} ${row.currency || 'RON'}</div>` : ''}
           <div class="meta">AWB ${escapeHtml(row.awb)} · comandă ${fmtTime(row.order_created_at)} · AWB generat ${fmtTime(row.awb_created_at)}</div>
         </div>
+        ${!items.length ? `<div class="item-card" style="justify-content:center;color:var(--text-dim);font-size:0.9rem;gap:0.6rem;">⏳ Se încarcă produsele din Shopify…</div>` : ''}
         ${items.map((it, idx) => `
           <div class="item-card">
             ${it.img ? `<img src="${escapeAttr(it.img)}" alt="">` : `<div style="width:108px;height:108px;border-radius:10px;background:var(--surface-2);flex:0 0 auto;"></div>`}
@@ -1498,6 +1499,17 @@
       if (msg.type === 'awb:new' || msg.type === 'awb:update'){
         rows[msg.awb.awb] = msg.awb;
         if (msg.type === 'awb:new') notifyNewOrder(msg.awb);
+        // Dacă update-ul e pentru AWB-ul afișat curent și acum are produse, re-randăm ecranul
+        if (msg.type === 'awb:update' && msg.awb.awb === lastScannedAwb) {
+          try {
+            const updItems = JSON.parse(msg.awb.items_json || '[]');
+            if (updItems.length > 0 && main.querySelector('.item-card')) {
+              // Păstrăm banner-ul existent și re-randăm cu produsele noi
+              const existingBanner = main.querySelector('.status-banner, .status-banner.stockmissing');
+              renderFound(msg.awb, existingBanner ? existingBanner.outerHTML : null);
+            }
+          } catch {}
+        }
         scheduleRenderAll();
         // Keep the returns bar in sync without a full re-fetch: add/remove
         // this one row locally based on its current status.
