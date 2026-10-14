@@ -1105,6 +1105,30 @@ app.post('/api/scan', (req, res) => {
       }
     })();
   }
+
+  // --- Produse lipsă din items_json — trage din Shopify în fundal -------------
+  // AWB-uri create manual sau prin alte fluxuri pot ajunge fără produse.
+  // La prima scanare le populăm automat din Shopify și trimitem awb:update.
+  const hasItems = (() => {
+    try { return JSON.parse(result.row.items_json || '[]').length > 0; } catch { return false; }
+  })();
+  if (!hasItems && result.row.order_id) {
+    (async () => {
+      try {
+        const order = await shopify.fetchOrderDetails(`gid://shopify/Order/${result.row.order_id}`);
+        if (!order || !order.items || !order.items.length) return;
+        if (db.db) {
+          db.db.prepare('UPDATE awbs SET items_json = ?, total = COALESCE(NULLIF(total, 0), ?), currency = COALESCE(NULLIF(currency, \'\'), ?) WHERE awb = ?')
+            .run(JSON.stringify(order.items), order.total, order.currency, result.row.awb);
+          const updated = db.getAwb ? db.getAwb(result.row.awb) : db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(result.row.awb);
+          if (updated) broadcast({ type: 'awb:update', awb: updated });
+          console.log(`[scan] fetched missing items for ${result.row.awb} (${order.items.length} produse)`);
+        }
+      } catch (err) {
+        console.error('[shopify] fetchOrderDetails for missing items failed for', result.row.awb, err);
+      }
+    })();
+  }
 });
 
 app.post('/api/note', (req, res) => {
