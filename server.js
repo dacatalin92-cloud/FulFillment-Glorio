@@ -962,6 +962,63 @@ app.get('/admin/reconcile-with-shopify-result', (req, res) => {
   res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
 });
 
+// --- Re-backfill items per fulfillment -----------------------------------
+// Endpoint nou (2026-10-14) care re-fetchuiește produsele pentru AWB-urile
+// deja în DB, folosind noua logică fetchFulfillmentDetails (filtrată după AWB,
+// nu după toată comanda). Necesar pentru AWB-urile create înainte de fix, care
+// au în items_json toate produsele comenzii în loc de cele din coletul lor.
+//
+// Opțional: ?awb=BOK123 — re-fetchuiește doar un AWB specific.
+// Fără parametru: re-fetchuiește TOATE AWB-urile active cu order_id.
+// Usage: /admin/rebackfill-fulfillment-items?secret=...&awb=BOK3732254
+//        /admin/rebackfill-fulfillment-items?secret=...   (toate)
+let rebackfillFulfillmentRunning = false;
+app.get('/admin/rebackfill-fulfillment-items', (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  if (rebackfillFulfillmentRunning) {
+    return res.status(409).json({ error: 'already running — check Deploy Logs for [rebackfill-fulfillment] progress' });
+  }
+  const targetAwb = req.query.awb || null;
+  res.json({ hint: 'Running in background — watch Deploy Logs for [rebackfill-fulfillment] progress.' });
+  rebackfillFulfillmentRunning = true;
+  (async () => {
+    try {
+      let rows;
+      if (targetAwb) {
+        const r = db.db.prepare('SELECT awb, order_id FROM awbs WHERE awb = ? AND order_id IS NOT NULL').get(targetAwb);
+        rows = r ? [r] : [];
+      } else {
+        rows = db.db.prepare("SELECT awb, order_id FROM awbs WHERE order_id IS NOT NULL AND packed_at IS NULL").all();
+      }
+      console.log(`[rebackfill-fulfillment] ${rows.length} AWB(s) to process`);
+      let ok = 0, fail = 0;
+      for (const row of rows) {
+        try {
+          const order = await shopify.fetchFulfillmentDetails(`gid://shopify/Order/${row.order_id}`, row.awb);
+          if (!order || !order.items || !order.items.length) { fail++; continue; }
+          db.db.prepare('UPDATE awbs SET items_json = ?, total = ?, currency = ? WHERE awb = ?')
+            .run(JSON.stringify(order.items), order.total, order.currency, row.awb);
+          const updated = db.db.prepare('SELECT * FROM awbs WHERE awb = ?').get(row.awb);
+          if (updated) broadcast({ type: 'awb:update', awb: updated });
+          ok++;
+          if (ok % 10 === 0) console.log(`[rebackfill-fulfillment] progress: ${ok} done, ${fail} failed`);
+          await new Promise(r => setTimeout(r, 200)); // throttle Shopify API
+        } catch (err) {
+          console.error(`[rebackfill-fulfillment] failed for ${row.awb}:`, err.message);
+          fail++;
+        }
+      }
+      console.log(`[rebackfill-fulfillment] done — ${ok} updated, ${fail} failed`);
+    } catch (err) {
+      console.error('[rebackfill-fulfillment] outer error:', err);
+    } finally {
+      rebackfillFulfillmentRunning = false;
+    }
+  })();
+});
+
 // --- REST API -----------------------------------------------------------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
