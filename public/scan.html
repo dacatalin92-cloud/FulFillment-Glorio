@@ -481,6 +481,7 @@
   let lastScannedAwb = null; // most recent AWB successfully looked up — target of the next stoc-lipsă marker scan
 
   function fmtTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleTimeString('ro-RO', { timeZone: tz, hour:'2-digit', minute:'2-digit' }); }
+  function fmtDateTime(iso){ if(!iso) return '—'; return new Date(iso).toLocaleString('ro-RO', { timeZone: tz, day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }); }
   function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function escapeAttr(s){ return escapeHtml(s); }
 
@@ -1012,9 +1013,9 @@
       <tr data-awb="${escapeAttr(row.awb)}">
         <td class="awb-cell">${escapeHtml(row.awb)}</td>
         <td>${escapeHtml(row.order_name)}</td>
-        <td>${fmtTime(row.first_scan_at)}</td>
+        <td>${fmtDateTime(row.first_scan_at)}</td>
         <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
-        <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+        <td>${row.packed ? fmtDateTime(row.packed_at) : '—'}</td>
         <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
       </tr>
     `).join('');
@@ -1035,9 +1036,9 @@
     exportCsv(`registru-scanare-${bucharestToday()}.csv`, scanned, [
       { label: 'AWB', get: r => r.awb },
       { label: 'Comandă', get: r => r.order_name },
-      { label: 'Prima scanare', get: r => fmtTime(r.first_scan_at) },
+      { label: 'Prima scanare', get: r => fmtDateTime(r.first_scan_at) },
       { label: 'Status', get: r => r.packed ? 'Împachetat' : 'Scanat 1x' },
-      { label: 'Confirmat la', get: r => r.packed ? fmtTime(r.packed_at) : '' },
+      { label: 'Confirmat la', get: r => r.packed ? fmtDateTime(r.packed_at) : '' },
       { label: 'Notă', get: r => r.note || '' },
     ]);
   });
@@ -1098,9 +1099,9 @@
     return `
       <td class="awb-cell">${escapeHtml(row.awb)}</td>
       <td>${escapeHtml(row.order_name)}</td>
-      <td>${fmtTime(row.first_scan_at)}</td>
+      <td>${fmtDateTime(row.first_scan_at)}</td>
       <td>${row.packed ? '<b style="color:var(--green)">✓ Împachetat</b>' : '<span style="color:var(--amber)">Scanat 1×</span>'}</td>
-      <td>${row.packed ? fmtTime(row.packed_at) : '—'}</td>
+      <td>${row.packed ? fmtDateTime(row.packed_at) : '—'}</td>
       <td><input type="text" class="note-input" data-awb="${escapeAttr(row.awb)}" placeholder="Notă…" value="${escapeAttr(row.note || '')}"></td>
     `;
   }
@@ -1428,7 +1429,7 @@
         renderFound(data.row, renderStatusBanner('packed', '✅ Împachetat — predat la curier!' + noteLine));
       } else if (data.kind === 'already'){
         soundWarning();
-        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtTime(data.row.packed_at)}.` + noteLine));
+        renderFound(data.row, renderStatusBanner('already', `ℹ️ Deja împachetat, confirmat la ${fmtDateTime(data.row.packed_at)}.` + noteLine));
       } else if (data.kind === 'reset'){
         soundWarning();
         renderFound(data.row, renderStatusBanner('reset', '⏱️ Au trecut peste 10 minute de la prima scanare — cronometrul a repornit, scanează din nou pentru confirmare.' + noteLine));
