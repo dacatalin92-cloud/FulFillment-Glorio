@@ -970,6 +970,35 @@ app.get('/admin/reconcile-with-shopify-result', (req, res) => {
   res.json(global.__lastReconcileShopifyResult || { hint: 'no run recorded yet in this process' });
 });
 
+// --- DPD API test (diagnostic) -------------------------------------------
+// Apelează DPD API raw pentru un AWB dat și returnează răspunsul complet.
+// Util pentru a vedea structura exactă (câmpuri, status, referințe) fără a
+// căuta prin Deploy Logs. Usage: /admin/dpd-test?secret=...&awb=<AWB>
+app.get('/admin/dpd-test', async (req, res) => {
+  if (!process.env.SHOPIFY_CLIENT_SECRET || req.query.secret !== process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const awb = (req.query.awb || '').trim();
+  if (!awb) return res.status(400).json({ error: 'missing awb parameter' });
+  const u = process.env.DPD_USERNAME;
+  const p = process.env.DPD_PASSWORD;
+  if (!u || !p) return res.status(500).json({ error: 'DPD_USERNAME / DPD_PASSWORD lipsesc din env' });
+  const base = process.env.DPD_API_BASE || 'https://api.dpd.ro/v1';
+  const auth = 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
+  try {
+    const r = await fetch(`${base}/parcels/${encodeURIComponent(awb)}`, {
+      headers: { 'Authorization': auth, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    const text = await r.text();
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    res.json({ httpStatus: r.status, awb, base, body });
+  } catch (err) {
+    res.status(500).json({ error: err.message, awb });
+  }
+});
+
 // --- Anulare manuală AWB -------------------------------------------------
 // Folosit când AWB-ul e anulat în xConnector/Bookurier/DPD dar sistemul nu
 // primește nicio notificare automată (nu există webhook de la acești curieri).
