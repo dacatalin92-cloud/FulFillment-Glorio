@@ -1277,13 +1277,24 @@ app.post('/api/note', (req, res) => {
 // visibility and feeds the "Necesar produse" panel with which orders are
 // waiting on which product. Cleared automatically when the AWB is actually
 // packed (see db.js setPacked), or manually via /clear below.
+//
+// 2026-10-15: Dacă AWB-ul era deja marcat "împachetat" (din greșeală),
+// flagul de stoc lipsă îl scoate înapoi în lista de neîmpachetat —
+// resetăm packed=0, packed_at=NULL, first_scan_at=NULL ca să fie nevoie
+// de scanare din nou când stocul revine.
 app.post('/api/stock-missing/flag', (req, res) => {
   const { awb } = req.body || {};
   if (!awb) return res.status(400).json({ error: 'missing awb' });
+  // Resetează starea "împachetat" dacă era marcat din greșeală
+  const wasPacked = db.db.prepare('SELECT packed FROM awbs WHERE awb = ?').get(awb);
+  if (wasPacked && wasPacked.packed) {
+    db.db.prepare('UPDATE awbs SET packed = 0, packed_at = NULL, first_scan_at = NULL WHERE awb = ?').run(awb);
+    console.log(`[stock-missing] AWB ${awb} era împachetat — resetat la neîmpachetat înainte de a fl aga stoc lipsă`);
+  }
   const row = db.flagStockMissing(awb, new Date().toISOString());
   if (!row) return res.status(404).json({ found: false });
   broadcast({ type: 'awb:update', awb: row });
-  res.json({ found: true, row });
+  res.json({ found: true, row, wasUnpacked: !!(wasPacked && wasPacked.packed) });
 });
 
 app.post('/api/stock-missing/clear', (req, res) => {
