@@ -577,6 +577,23 @@
     if ((row.sameday_status || '').toLowerCase().includes('anulat')) return false;
     return true;
   }
+  // Filtru mai strict pentru "Necesar produse": doar comenzile neîmpachetate
+  // care au AWB creat, NU au fost încă ridicate de curier și NU sunt mai vechi
+  // de 10 zile. "Ridicat de curier" = statusul Sameday există și nu e nici
+  // "alocata pentru ridicare" / "ridicare ulterioara" (= încă la noi), nici
+  // "anulat" (deja exclus de isPickable). Comenzile cu curier non-Sameday
+  // (Bookurier, DPD, GLS) nu au sameday_status → sunt incluse implicit.
+  const NEEDS_MAX_AGE_MS = 10 * 24 * 60 * 60 * 1000; // 10 zile
+  function isNeedsPickable(row){
+    if (!isPickable(row)) return false;
+    if (!row.awb_created_at) return false;
+    if (Date.now() - new Date(row.awb_created_at).getTime() > NEEDS_MAX_AGE_MS) return false;
+    // Dacă statusul Sameday arată că AWB-ul a trecut deja prin curier (nu e
+    // "pending" și nu e gol), exclude comanda din necesar — a fost ridicată.
+    const t = (row.sameday_status || '').toLowerCase();
+    if (t && !PENDING_PICKUP_PHRASES.some(p => t.includes(p))) return false;
+    return true;
+  }
   // 2026-09-30: tabelul propriu-zis (thead/tbody) nu se mai afișează în
   // pagină — vezi regula CSS .picklist-scroll{ display:none; }. Funcția
   // rămâne neschimbată intenționat: completează în continuare #picklistBody
@@ -769,7 +786,7 @@
     return parts.sort().join('|');
   }
   function computeProductNeeds(){
-    const list = Object.values(rows).filter(isPickable);
+    const list = Object.values(rows).filter(isNeedsPickable);
     const agg = new Map(); // key -> { title, specs, img, qty, orders, blockedOrders }
     list.forEach(row => {
       const items = JSON.parse(row.items_json || '[]');
