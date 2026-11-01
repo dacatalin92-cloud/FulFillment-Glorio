@@ -34,9 +34,17 @@ function extractDpdAwbFromScan(code) {
   return null;
 }
 
-// AWB-urile DPD sunt pur numerice (10-14 cifre). Bookurier încep cu "BOK",
-// Sameday cu "1ONB" sau similar. Această funcție distinge DPD de ceilalți.
+// AWB-urile GLS sunt 12 cifre numerice și încep cu "0" (ex: 062544763055).
+// Trebuie identificate ÎNAINTE de isDpdAwb, altfel ar fi confundate cu DPD.
+function isGlsAwb(awb) {
+  const s = String(awb || '');
+  return /^\d{12}$/.test(s) && s.startsWith('0');
+}
+
+// AWB-urile DPD sunt pur numerice (10-14 cifre), dar nu GLS (care e 12 cifre
+// cu "0" prefix). Bookurier încep cu "BOK", Sameday cu "1ONB" sau similar.
 function isDpdAwb(awb) {
+  if (isGlsAwb(awb)) return false; // GLS: 12 cifre cu "0" prefix — nu DPD
   return /^\d{10,14}$/.test(String(awb || ''));
 }
 
@@ -129,7 +137,7 @@ function broadcast(msg) {
 // lor — inofensiv, codul care citește acel câmp (isPickable,
 // samedayIndicatesPickedUp etc.) tratează un status gol ca "nimic
 // special", nu ca eroare.
-const SUPPORTED_COURIERS = ['sameday', 'bookurier', 'dpd'];
+const SUPPORTED_COURIERS = ['sameday', 'bookurier', 'dpd', 'gls'];
 function isSupportedCourierName(company) {
   const c = (company || '').toLowerCase();
   return SUPPORTED_COURIERS.some((name) => c.includes(name));
