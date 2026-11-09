@@ -412,6 +412,7 @@
   <div class="needs-panel">
     <div class="needs-header">
       <h3>📋 Necesar produse — <span id="needsSubcount">0</span> comenzi neîmpachetate</h3>
+      <button type="button" class="needs-btn" id="refreshNeedsBtn" style="margin-right:0.4rem;" title="Reîncarcă lista">🔄 Refresh</button>
       <button type="button" class="needs-close" id="needsCloseBtn" aria-label="Închide">✕</button>
     </div>
     <div class="needs-list" id="needsList"></div>
@@ -840,6 +841,7 @@
   document.getElementById('needsCloseBtn').addEventListener('click', () => {
     needsModal.classList.remove('open');
   });
+  document.getElementById('refreshNeedsBtn').addEventListener('click', () => { renderNeeds(); });
   needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
 
   // ---- Stock-missing product needs (image + quantity only) ----------------
