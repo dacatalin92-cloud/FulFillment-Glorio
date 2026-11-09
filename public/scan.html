@@ -841,7 +841,16 @@
   document.getElementById('needsCloseBtn').addEventListener('click', () => {
     needsModal.classList.remove('open');
   });
-  document.getElementById('refreshNeedsBtn').addEventListener('click', () => { renderNeeds(); });
+  document.getElementById('refreshNeedsBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('refreshNeedsBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Se încarcă…';
+    try { await loadUnpacked(); } finally {
+      btn.disabled = false;
+      btn.textContent = '🔄 Refresh';
+      renderNeeds();
+    }
+  });
   needsModal.addEventListener('click', e => { if (e.target === needsModal) needsModal.classList.remove('open'); });
 
   // ---- Stock-missing product needs (image + quantity only) ----------------
