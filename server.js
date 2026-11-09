@@ -1086,6 +1086,9 @@ app.get('/admin/rebackfill-fulfillment-items', (req, res) => {
 });
 
 // --- REST API -----------------------------------------------------------
+// Internal read-only status bridge; token is kept only in server environments.
+app.post('/api/integrations/solicitari/orders', express.json({ limit: '32kb' }), require('./solicitari-status').statusHandler(db));
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
